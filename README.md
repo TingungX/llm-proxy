@@ -27,6 +27,7 @@
   - [目录](#目录)
   - [功能特性](#功能特性)
     - [基本全面支持 Codex Desktop](#基本全面支持-codex-desktop)
+    - [其他 AI 客户端](#其他-ai-客户端)
     - [核心功能](#核心功能)
   - [快速开始](#快速开始)
     - [使用示例](#使用示例)
@@ -48,20 +49,25 @@
 
 ## 功能特性
 
-### 全面支持主流 AI 编程工具
+### 基本全面支持 Codex Desktop
 
-LLM Proxy 与主流 AI 编程工具背后的通信协议完全兼容，可以直接作为它们访问非原生模型的透明网关：
+LLM Proxy 深度兼容 Codex Desktop 通信协议（OpenAI Responses API），并提供完整的工具转换支持：
 
-| 工具 | 使用协议 | 接入路径 | 说明 |
-|------|----------|----------|------|
-| **Codex Desktop** | OpenAI Responses API | `/v1/responses` | 自动转换 Responses → Chat Completions，完整支持工具转换 |
-| **Claude Code** | Anthropic Messages API | `/v1/messages` | Anthropic 格式原封不动透传，或转 OpenAI Chat 发给上游 |
-| **OpenCode** | OpenAI Chat Completions | `/v1/chat/completions` | OpenAI 格式直接透传，或转 Anthropic 发给上游 |
-| 任何 OpenAI 兼容客户端 | OpenAI Chat Completions | `/v1/chat/completions` | 标准 OpenAI 代理，零配置 |
+Codex Desktop 使用 **OpenAI Responses API** 协议，LLM Proxy 在 `/v1/responses` 路径自动完成 Responses → Chat Completions 格式转换，并完整支持 apply_patch、namespace、web_search 等工具转换。
 
-只需将工具的 `api_base` 指向本代理即可。**一个代理同时满足所有工具的后端模型接入需求。**
+参考 [`config.toml.example`](config.toml.example) 快速配置 Codex Desktop 接入本代理。
 
-参考 [`config.toml.example`](config.toml.example)（Codex Desktop）和 [`config.example.json`](config.example.json)（配置模板）快速上手。
+### 其他 AI 客户端
+
+以下 AI 编程工具同样兼容，直接接入即可使用：
+
+| 工具 | 使用协议 | 接入路径 |
+|------|----------|----------|
+| **Claude Code** | Anthropic Messages API | `/v1/messages` |
+| **OpenCode** | OpenAI Chat Completions | `/v1/chat/completions` |
+| 任何 OpenAI 兼容客户端 | OpenAI Chat Completions | `/v1/chat/completions` |
+
+将工具的 `api_base` 指向本代理即可。**一个代理同时满足所有工具的后端模型接入需求。**
 
 ### 核心功能
 
@@ -69,7 +75,7 @@ LLM Proxy 与主流 AI 编程工具背后的通信协议完全兼容，可以直
 |------|------|
 | **多协议双向转换** | Anthropic Messages ↔ OpenAI Chat Completions 全双向、OpenAI Responses → Chat Completions |
 | **多上游聚合** | 一个代理接入 DeepSeek、MiniMax、GLM、OpenCode 等多个模型提供商 |
-| **内置 RTK** | 实时用量统计与请求日志，支持小时/日级聚合、可视化热力图 |
+| **RTK（输入压缩 / Beta）** | 内置输入压缩工具（Rust Token Killer），压缩 tool_result 中的 CLI 输出噪声、截断长代码块、折叠空行以节省 input token；默认关闭，可在端点配置编辑中手动启用（启用后可能降低模型表现） |
 | **端点认证与隔离** | 基于 API Key 的端点隔离，每个端点独立配置可用模型 |
 | **模型路由与 Fallback** | 开启后，模型 family failover 链，429/503 自动切换 |
 | **请求跟踪** | 每请求唯一 Request ID，结构化日志，Web 管理面板筛选查询 |

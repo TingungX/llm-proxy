@@ -37,20 +37,25 @@ Supported protocol conversions:
 
 ## Features
 
-### Full Support for Mainstream AI Coding Tools
+### Codex Desktop Support
 
-LLM Proxy is fully compatible with the communication protocols used by mainstream AI coding tools, acting as a transparent gateway to non-native models:
+LLM Proxy deeply integrates with Codex Desktop's OpenAI Responses API, with full tool conversion support:
 
-| Tool | Protocol | Route | Notes |
-|------|----------|-------|-------|
-| **Codex Desktop** | OpenAI Responses API | `/v1/responses` | Auto-converts Responses ↔ Chat Completions, full tool conversion support |
-| **Claude Code** | Anthropic Messages API | `/v1/messages` | Pass-through or convert to OpenAI Chat for upstream |
-| **OpenCode** | OpenAI Chat Completions | `/v1/chat/completions` | Pass-through or convert to Anthropic for upstream |
-| Any OpenAI-compatible client | OpenAI Chat Completions | `/v1/chat/completions` | Standard OpenAI proxy, zero config |
+Codex Desktop uses the **OpenAI Responses API** protocol. LLM Proxy automatically converts Responses → Chat Completions at `/v1/responses`, with full support for apply_patch, namespace, web_search, and other tool conversions.
 
-Just point your tool's `api_base` to this proxy. **One proxy serves all your tools.**
+See [`config.toml.example`](config.toml.example) to configure Codex Desktop with this proxy.
 
-See [`config.toml.example`](config.toml.example) (Codex Desktop) and [`config.example.json`](config.example.json) (configuration template) to get started.
+### Other AI Clients
+
+The following AI coding tools are also compatible — just plug them in:
+
+| Tool | Protocol | Route |
+|------|----------|-------|
+| **Claude Code** | Anthropic Messages API | `/v1/messages` |
+| **OpenCode** | OpenAI Chat Completions | `/v1/chat/completions` |
+| Any OpenAI-compatible client | OpenAI Chat Completions | `/v1/chat/completions` |
+
+Point your tool's `api_base` to this proxy. **One proxy serves all your tools.**
 
 ### Core Features
 
@@ -58,7 +63,7 @@ See [`config.toml.example`](config.toml.example) (Codex Desktop) and [`config.ex
 |---------|-------------|
 | **Multi-Protocol Bidirectional Conversion** | Anthropic Messages ↔ OpenAI Chat Completions (full bidirectional), OpenAI Responses → Chat Completions |
 | **Multi-Upstream Aggregation** | One proxy for DeepSeek, MiniMax, GLM (iFlytek), OpenCode, and more |
-| **Built-in RTK** | Real-time usage statistics and request logging with hourly/daily aggregation and heatmap visualization |
+| **RTK (Input Compression / Beta)** | Built-in input compression tool (Rust Token Killer), strips CLI output noise from tool_results, truncates long code blocks, collapses blank lines to save input tokens; disabled by default, enable in endpoint config editor (may reduce model quality) |
 | **Endpoint Authentication** | API-Key-based isolation, each endpoint independently configures available models |
 | **Model Routing & Fallback** | When enabled, model family failover chain, auto-switch on 429/503 |
 | **Request Tracking** | Unique Request ID per call, structured logging, web admin panel filtering |
