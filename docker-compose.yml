@@ -1,0 +1,27 @@
+services:
+  llm-proxy:
+    build: .
+    container_name: llm-proxy
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./usage.db:/app/usage.db
+      - ./config.json:/app/config.json:ro
+    environment:
+      # 显式声明 DB 路径
+      - LLM_PROXY_DB_PATH=/app/usage.db
+      # 如需走代理，在此传递（与 http_client.py 配合）
+      # - HTTPS_PROXY=http://host.docker.internal:7890
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:4000/api/config', timeout=5).raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    # 不限制资源——llm-proxy 是 IO 密集型
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"

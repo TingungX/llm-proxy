@@ -1,0 +1,22 @@
+# LLM Proxy — Codex Desktop 配置模板
+# 复制到 Codex 的 config.toml 即可使用
+#
+# 位置：
+#   macOS: ~/.config/codex/config.toml 或 ~/Library/Application Support/codex/config.toml
+#   或项目根目录 .codex/config.toml
+
+[models]
+deepseek-v4-pro = { provider = "custom", api_base = "http://localhost:4000/v1/responses", api_key = "YOUR_ENDPOINT_KEY" }
+deepseek-v4-flash = { provider = "custom", api_base = "http://localhost:4000/v1/responses", api_key = "YOUR_ENDPOINT_KEY" }
+GLM-5 = { provider = "custom", api_base = "http://localhost:4000/v1/responses", api_key = "YOUR_ENDPOINT_KEY" }
+"Minimax-M2.7" = { provider = "custom", api_base = "http://localhost:4000/v1/responses", api_key = "YOUR_ENDPOINT_KEY" }
+"minimax-m3" = { provider = "custom", api_base = "http://localhost:4000/v1/responses", api_key = "YOUR_ENDPOINT_KEY" }
+
+# 自定义上游（OpenCode 聚合）也可以通过相同代理地址
+og-deepseek-v4-pro = { provider = "custom", api_base = "http://localhost:4000/v1/responses", api_key = "YOUR_ENDPOINT_KEY" }
+og-deepseek-v4-flash = { provider = "custom", api_base = "http://localhost:4000/v1/responses", api_key = "YOUR_ENDPOINT_KEY" }
+og-glm-5 = { provider = "custom", api_base = "http://localhost:4000/v1/responses", api_key = "YOUR_ENDPOINT_KEY" }
+og-glm-5-1 = { provider = "custom", api_base = "http://localhost:4000/v1/responses", api_key = "YOUR_ENDPOINT_KEY" }
+og-kimi-k2-6 = { provider = "custom", api_base = "http://localhost:4000/v1/responses", api_key = "YOUR_ENDPOINT_KEY" }
+og-mimo-v2-5 = { provider = "custom", api_base = "http://localhost:4000/v1/responses", api_key = "YOUR_ENDPOINT_KEY" }
+

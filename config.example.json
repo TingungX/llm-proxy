@@ -1,0 +1,46 @@
+{
+  "models": {
+    "deepseek-v4-pro": {
+      "api_base": "https://api.deepseek.com/",
+      "api_key": "YOUR_API_KEY_HERE",
+      "upstream_model": "deepseek-v4-pro",
+      "context_window": 1000000,
+      "display_name": "DeepSeek V4 Pro",
+      "upstream_paths": {
+        "openai/chat-completions": "/v1/chat/completions"
+      },
+      "upstream_protocols": ["openai"],
+      "upstream_protocol": "openai"
+    },
+    "deepseek-v4-flash": {
+      "api_base": "https://api.deepseek.com",
+      "api_key": "YOUR_API_KEY_HERE",
+      "upstream_model": "deepseek-v4-flash",
+      "context_window": 1000000,
+      "display_name": "DeepSeek V4 Flash",
+      "upstream_paths": {
+        "openai/chat-completions": "/v1/chat/completions"
+      },
+      "upstream_protocol": "openai"
+    },
+    "minimax-m3": {
+      "api_base": "https://api.minimaxi.com",
+      "api_key": "YOUR_API_KEY_HERE",
+      "upstream_model": "minimax-m3",
+      "context_window": 1000000,
+      "display_name": "MiniMax M3",
+      "vision_support": true,
+      "upstream_paths": {
+        "anthropic/messages": "anthropic/v1/messages",
+        "openai/chat-completions": "/v1/chat/completions"
+      },
+      "upstream_protocols": ["openai/chat-completions", "anthropic"],
+      "upstream_protocol": "openai"
+    }
+  },
+  "error_handling": {
+    "failover_enabled": true,
+    "no_retry_enabled": true
+  }
+}
+

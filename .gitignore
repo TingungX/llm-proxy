@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+
+# Config (contains API keys)
+config.json
+config.docker.json
+*.bak.*
+
+# Data (runtime-generated)
+data/usage-archive/*.jsonl
+usage.db
+llm_proxy.db
+
+# Vite / Frontend build
+/.vite/
+node_modules/
+static/dist/
+static/node_modules/
+static/.vite/
+
+# Env
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Coverage
+.coverage
+
+# AI dev files
+CLAUDE.md
+.superpowers/
+.opencode/
+.claude/
+
+# Local process state
+.llm-proxy.pid

@@ -1,0 +1,8 @@
+/* Vite-resolved CSS entry: imports main + logs. Vite handles @import natively. */
+@import '../css/main.css';
+@import '../css/logs.css';
+
+/* Preact-specific resets */
+* {
+  box-sizing: border-box;
+}
