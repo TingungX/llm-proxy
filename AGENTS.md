@@ -4,18 +4,17 @@ LLM Proxy — 基于 FastAPI 的 LLM API 聚合网关，支持多模型、多协
 
 ## Dev 数据库接入
 
-## Dev 数据库接入
+dev server 接入的是**稳定服务器**（main 分支 root）的数据，不是临时假数据：
 
-dev server 可接入生产 DB 数据进行调试：
-
-- **DB 来源**：生产环境的 `usage.db`
-- **config 来源**：生产环境的 `config.json`
+- **DB 来源**：`/Users/tingung/Projects/github/llm-proxy/usage.db`（main 分支 worktree 根目录）
+- **config 来源**：`/Users/tingung/Projects/github/llm-proxy/config.json`（main 分支根，11 个模型）
 - **接入步骤**：
   1. 停止 dev server（`lsof -ti:4001 | xargs kill -9`）
   2. 备份当前 dev DB：`cp usage.db usage.db.bak.dev-$(date +%Y%m%d-%H%M%S)`
-  3. 复制生产 DB：`cp /path/to/production/usage.db usage.db`
+  3. 复制 main DB：`cp /Users/tingung/Projects/github/llm-proxy/usage.db usage.db`
   4. 同样处理 `config.json`
   5. 启动 dev server（`python3 -m uvicorn llm_proxy.main:app --port 4001`）
+- **当前数据规模**（2026-06-12 同步）：~7400+ records / 95M+ token / 4+ 端点 / 11+ 模型
 - **不要**直接 git add/rm `usage.db`、`*.bak.dev-*`
 
 ## 验证（改代码后必跑）
@@ -27,10 +26,17 @@ python -m pytest tests/ -v && python tests/smoke_test.py
 ## 命令
 
 ```bash
-uvicorn llm_proxy.main:app --reload  # 开发
+# 开发（dev server, port 4001）
+uvicorn llm_proxy.main:app --port 4001 --reload
+
+# 生产（Docker, port 4000，已部署）
+docker build -t llm-proxy .
+docker rm -f llm-proxy 2>/dev/null
+docker run -d -p 4000:4000 --name llm-proxy llm-proxy
+
+# 测试
 python -m pytest tests/ -v                                       # 单元测试
 python tests/smoke_test.py                                       # 冒烟测试
-docker build -t llm-proxy . && docker run -p 4000:4000 llm-proxy
 ```
 
 ## 前端规范
@@ -152,11 +158,14 @@ llm_proxy/main.py:app (FastAPI)
 ├─ handlers/          Pipeline/Handler — 请求处理管道
 │   ├─ base.py        PipelineContext + HandlerStep + Pipeline + PipelineStop
 │   ├─ *_handler.py   各路由 Pipeline 组装
-│   └─ shared/        可复用步骤（auth / model_resolve / protocol_select / vision_fallback / responses_convert / proxy）
+│   └─ shared/        可复用步骤（auth / model_resolve / protocol_select / vision_fallback / compression / paths / responses_convert / proxy）
 ├─ protocol/          协议转换层（独立，无路由感知）
-│   ├─ detector.py    协议检测
-│   ├─ sse.py         SSE 透传
-│   ├─ errors.py      错误格式化（make_anthropic_error / make_openai_error）
+│   ├─ capabilities.py  协议可达性表 + 上游选择算法
+│   ├─ constants.py     Stop Reason 映射常量
+│   ├─ detector.py     协议检测
+│   ├─ sse.py          SSE 透传
+│   ├─ errors.py       错误格式化（make_anthropic_error / make_openai_error）
+│   ├─ think_tag.py    Think 标签检测与提取（MiniMax M3）
 │   ├─ anthropic_openai/  Anthropic ↔ OpenAI 转换通道（Python 实现）
 │   │   ├─ request.py     Anthropic→Chat 请求转换
 │   │   ├─ response.py    Chat→Anthropic 响应转换
@@ -168,11 +177,11 @@ llm_proxy/main.py:app (FastAPI)
 │       ├─ stream.py      StreamState + ThinkTagStateMachine（已合并）
 │       ├─ tool_replacement.py  apply_patch ↔ 标准文件工具
 │       └─ usage.py       用量格式转换
-├─ services/          纯业务逻辑（tool_call_fix / vision_service）
+├─ services/          纯业务逻辑（tool_call_fix / vision_service / input_compressor）
 ├─ infra/             基础设施层
+│   ├─ archive.py     JSONL 用量归档（后台线程写入）
 │   ├─ db.py          SQLite 操作
 │   ├─ http_client.py 全局 HTTP 客户端
-│   ├─ sidecar.py     Sidecar 进程管理（仅 Anthropic 上游 sidecar 场景）
 │   └─ url_utils.py   URL 工具
 ├─ middleware/        中间件（request_id / access_log / catch_all_exceptions）
 ├─ state.py           State 类 + get_state() + init_state()
@@ -187,14 +196,17 @@ llm_proxy/main.py:app (FastAPI)
 所有请求处理走 Pipeline：
 
 ```python
-# handlers/xxx_handler.py
-class XxxHandler:
+# handlers/responses_handler.py  (实际示例)
+class ResponsesHandler:
     def __init__(self):
         self.pipeline = Pipeline([
             AuthStep(),
             ModelResolveStep(),
-            # ... 其他步骤
-            ProxyStep(),
+            ProtocolSelectStep(),    # 协议选择（含 tool 降级）
+            VisionFallbackStep(),    # 图像→文本降级
+            CompressionStep(),       # 输入压缩（节省 token）
+            ResponsesConvertStep(),  # Responses→Chat 格式转换
+            ProxyStep(),             # 代理转发
         ])
 
     async def handle(self, request: Request) -> JSONResponse | StreamingResponse:
@@ -232,7 +244,7 @@ class XxxHandler:
 | 模块 | 正确 import |
 |------|------------|
 | 数据库 | `from llm_proxy.infra import db` |
-| Sidecar | `from llm_proxy.infra.sidecar import SidecarManager` |
+| 用量归档 | `from llm_proxy.infra.archive import archive_record` |
 | URL 工具 | `from llm_proxy.infra.url_utils import ...` |
 | 错误格式化 | `from llm_proxy.protocol.errors import ...` |
 | 状态 | `from llm_proxy.state import get_state, init_state` |
@@ -253,7 +265,7 @@ class XxxHandler:
 
 `(api_base, api_key, upstream_model, config_key, upstream_protocol, failover_family)`
 - 权限/用量用 `config_key`，请求体用 `upstream_model`
-- `upstream_protocol` 为空时运行时自动推断
+- 实际协议选择走 `protocols_map` + `select_upstream()`（`protocol/capabilities.py`），而非此处返回值
 
 ## 路由逻辑
 
@@ -274,38 +286,48 @@ class XxxHandler:
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | POST | `/v1/messages` | Anthropic 格式：同协议透传 / Python 跨协议转换 |
-| POST | `/v1/chat/completions` | OpenAI 同协议透传 |
-| POST | `/v1/responses` | Responses→Chat Completions 格式转换（仅 OpenAI 上游） |
+| POST | `/v1/chat/completions` | OpenAI 格式：同协议透传 / Chat→Responses 跨协议转换（含 tool_call_fix） |
+| POST | `/v1/responses` | Responses API 格式：同协议透传 / Responses→Chat 格式转换（含 apply_patch 展开）|
+| POST | `/v1/messages/count_tokens` | Token 计数（转发上游） |
+| GET | `/v1/models` | 模型列表 |
 | GET/PUT | `/api/config` | PUT 会**删除 family_routing 字段**（已迁移到端点表） |
-| GET/POST/PUT/DEL | `/api/endpoints` | 端点 CRUD |
+| GET/POST/PUT/DEL | `/api/endpoints` | 端点 CRUD（含 `/:endpoint_id` 子路由） |
 | GET | `/api/usage[?days=&group_by=&granularity=]` | 用量查询（明细7天，聚合90天） |
+| GET | `/api/usage/summary` | 用量汇总统计 |
 | POST | `/api/latency` | 延迟测试 |
+| PUT | `/api/models/{model_id}` | 更新单个模型配置 |
+| DELETE | `/api/models/{model_id}` | 删除单个模型 |
+| POST | `/api/detect-protocol` | 检测上游协议 |
+| POST | `/api/providers/{model_id}/detect` | 检测指定模型的上游协议 |
+| GET | `/api/logs/list` | 日志列表查询（支持分页/筛选/时间范围） |
+| GET | `/api/logs/summary` | 日志数据汇总统计 |
+| GET | `/api/logs/filter-options` | 日志筛选选项（端点/模型/状态） |
 
 ## 配置结构
 
 ```json
 {
-  "models": { "模型ID": { "api_base": "...", "api_key": "...", "upstream_model": "...", "upstream_protocol": "anthropic|openai" } },
+  "models": { "模型ID": { "api_base": "...", "api_key": "...", "upstream_model": "...", "upstream_protocols": ["anthropic|openai"], "upstream_paths": {"anthropic/messages": "..."}, "vision_support": false, "context_window": 1000000, "display_name": "..." } },
   "error_handling": { "failover_enabled": true, "no_retry_enabled": true },
-  "sidecar": { "bin_path": "anthropic-proxy-rs", "start_port": 18000 }
+  "compression": { "enabled": true, "max_input_tokens": 80000 }
 }
 ```
 
 - `family_routing` 仅存端点表（`PUT /api/config` 自动删除）
 - 模型 api_base 不含 `/v1/...` 后缀
-- 协议检测顺序：端点上配置 → 模型配置 → 运行时自动探测（Anthropic 优先）
+- 协议检测顺序：端点上配置 → 模型配置（`upstream_protocols` 数组）→ 运行时自动探测（Anthropic 优先）
+- 模型级 `upstream_protocol`（标量）已被 `upstream_protocols`（数组）取代，但标量仍兼容
+- 模型级别可选字段：`upstream_paths`（per-protocol 路径映射）、`vision_support`、`context_window`、`allow_proxy`
 
-## Sidecar 进程
+## ~~Sidecar 进程~~（已弃用）
 
-- 自动为 `upstream_protocol="openai"` 的模型启动 `anthropic-proxy-rs`
-- 环境变量：`UPSTREAM_BASE_URL`, `UPSTREAM_API_KEY`, `PORT`
-- `state.reload()` 自动启停 sidecar（配置更新后）
+Sidecar 已由 `protocol/anthropic_openai/` Python 原生转换通道替代，`infra/sidecar.py` 已删除。config.json 中残留的 `sidecar` key 会被 `config_loader.py` 发出 `DeprecationWarning` 并忽略。
 
 ## 错误处理
 
 - 全局中间件 `catch_all_exceptions` 兜底所有异常，**识别 `PipelineStop` 并返回其响应**
 - Pipeline 步骤用 `raise PipelineStop(make_xxx_error(...))` 中断并返回错误
-- failover 触发：429 / 503；链：opus → sonnet → haiku
+- failover 触发：429 / 503（`_is_rate_error` 检测）；链由 `family_routing` 配置的 `failover` 字段动态决定
 - `x-should-retry: false` 阻止 SDK 重试
 
 ## 日志体系

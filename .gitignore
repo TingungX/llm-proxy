@@ -48,3 +48,7 @@ CLAUDE.md
 
 # Local process state
 .llm-proxy.pid
+.worktrees/
+
+# Empty placeholder
+data.db
