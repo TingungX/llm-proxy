@@ -368,17 +368,22 @@ def _add_standard_file_tools(ir_tools: list[IRToolDef], reverse_tool_map: dict[s
 def response_from_ir(ir: IRResponse) -> dict[str, Any]:
     """IRResponse → OpenAI Responses API 响应体。"""
     output: list[dict] = []
+    # 收集所有 text blocks 合并到一个 message item（Responses API 规范：
+    # 同一 response 的 output 中，assistant role 的 message 应只有一个）
+    text_parts: list[dict] = []
     for block in ir.content_blocks:
         if isinstance(block, IRTextBlock):
             if block.text:
+                text_parts.append({"type": "output_text", "text": block.text, "annotations": []})
+        elif isinstance(block, IRThinkingBlock):
+            # thinking 必须先于 text 输出，先 flush text parts
+            if text_parts:
                 output.append({
                     "type": "message",
                     "role": "assistant",
-                    "content": [
-                        {"type": "output_text", "text": block.text, "annotations": []}
-                    ],
+                    "content": text_parts,
                 })
-        elif isinstance(block, IRThinkingBlock):
+                text_parts = []
             if block.thinking:
                 output.append({
                     "type": "reasoning",
@@ -386,6 +391,14 @@ def response_from_ir(ir: IRResponse) -> dict[str, Any]:
                     "summary": [{"type": "summary_text", "text": block.thinking}],
                 })
         elif isinstance(block, IRToolUseBlock):
+            # tool_use 也需要先 flush text parts
+            if text_parts:
+                output.append({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": text_parts,
+                })
+                text_parts = []
             output.append({
                 "type": "function_call",
                 "id": block.id or f"call_{uuid.uuid4().hex[:24]}",
@@ -393,6 +406,14 @@ def response_from_ir(ir: IRResponse) -> dict[str, Any]:
                 "name": block.name,
                 "arguments": safe_json_dumps(block.input, default="{}"),
             })
+
+    # flush 剩余的 text parts
+    if text_parts:
+        output.append({
+            "type": "message",
+            "role": "assistant",
+            "content": text_parts,
+        })
 
     # status
     status = "completed"
@@ -687,8 +708,7 @@ def _tools_ir_to_responses(
     return result
 
 
-# 反向构造 apply_patch 工具调用的辅助（暴露给流式层用）
-_ = (parse_apply_patch_to_simple, reverse_tool_args_to_apply_patch, ReverseConversionError)
+
 
 
 # ════════════════════════════════════════════════════════════════════

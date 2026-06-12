@@ -7,7 +7,6 @@ import logging
 import uuid
 from typing import Any, AsyncIterator
 
-from llm_proxy.protocol.constants import STOP_REASON_MAP
 from llm_proxy.protocol.ir._common import (
     build_usage,
     clean_schema,
@@ -58,7 +57,8 @@ def to_ir(body: dict[str, Any]) -> IRRequest:
 
         # 提取 reasoning_content
         reasoning_content = msg.get("reasoning_content")
-        converted = _convert_message_to_ir(role, content, reasoning_content)
+        tool_call_id = msg.get("tool_call_id") if role == "tool" else None
+        converted = _convert_message_to_ir(role, content, reasoning_content, tool_call_id=tool_call_id)
         messages.extend(converted)
 
     # 提取 system_prompt（保留 Chat 的 system 角色约定）
@@ -131,7 +131,8 @@ def to_ir(body: dict[str, Any]) -> IRRequest:
 
 
 def _convert_message_to_ir(
-    role: str, content: Any, reasoning_content: str | None = None
+    role: str, content: Any, reasoning_content: str | None = None,
+    *, tool_call_id: str | None = None,
 ) -> list[IRMessage]:
     """Chat 消息 → IRMessage。"""
     # 处理 tool_calls
@@ -191,13 +192,22 @@ def _convert_message_to_ir(
 
     # 独立 tool_call_id / name（Chat tool 消息）
     if role == "tool":
-        tool_call_id = None
-        # 工具消息通常没有 content 块，而是纯字符串
+        # tool_call_id 在 message 顶层，已通过函数参数传入
         if isinstance(content, str):
             return [IRMessage(role="tool", content=[IRToolResultBlock(
-                tool_use_id="",  # Chat 工具消息 id 在 message["tool_call_id"] 上，不在 content
+                tool_use_id=tool_call_id or "",
                 content=content,
             )])]
+        # content 为 list 时，把 tool_call_id 注入到第一个 IRToolResultBlock
+        if blocks:
+            for b in blocks:
+                if isinstance(b, IRToolResultBlock) and not b.tool_use_id:
+                    b.tool_use_id = tool_call_id or ""
+        else:
+            blocks.append(IRToolResultBlock(
+                tool_use_id=tool_call_id or "",
+                content="",
+            ))
         return [IRMessage(role="tool", content=blocks)]
 
     return [IRMessage(role=role, content=blocks if blocks else "")]
@@ -388,8 +398,6 @@ def _map_stop_reason_to_ir(finish_reason: str | None) -> str:
     return inv.get(finish_reason, "end_turn")
 
 
-# 重新导出避免未使用警告
-_ = STOP_REASON_MAP
 
 
 # ── 请求出：IR → Chat ─────────────────────────────────────────────
@@ -473,12 +481,22 @@ def _message_ir_to_chat(msg: IRMessage) -> list[dict[str, Any]]:
     content = msg.content
 
     if role == "tool":
-        # tool 消息
+        # tool 消息：每个 IRToolResultBlock 生成一条独立的 tool 消息
+        # Chat 格式要求每个 tool result 有自己的 tool_call_id
+        result: list[dict[str, Any]] = []
         if isinstance(content, list):
             for block in content:
                 if isinstance(block, IRToolResultBlock):
-                    return [{"role": "tool", "tool_call_id": block.tool_use_id, "content": block.content}]
-        return [{"role": "tool", "content": str(content) if not isinstance(content, str) else content}]
+                    result.append({
+                        "role": "tool",
+                        "tool_call_id": block.tool_use_id,
+                        "content": block.content,
+                    })
+        if not result:
+            # 降级：无 IRToolResultBlock 时保留纯字符串内容
+            fallback = str(content) if not isinstance(content, str) else content
+            result.append({"role": "tool", "content": fallback})
+        return result
 
     if isinstance(content, str):
         if role == "system":

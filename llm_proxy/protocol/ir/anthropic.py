@@ -39,6 +39,7 @@ from llm_proxy.protocol.ir.types import (
     IRStreamEvent,
     IRTextBlock,
     IRThinkingBlock,
+    IRRedactedThinkingBlock,
     IRToolDef,
     IRToolResultBlock,
     IRToolUseBlock,
@@ -160,7 +161,12 @@ def _convert_message_to_ir(role: str, content: Any) -> list[IRMessage]:
         return [IRMessage(role=role, content=str(content))]
 
     # 数组 content — 按 block 类型分发
+    # 收集非 tool_result blocks 和 tool_result messages，最后统一拆分
+    # 原因：一条 Anthropic user message 可能包含多个 tool_result，
+    # 必须全部处理完再拆分，不能遇到第一个就 return
     blocks: list[IRContentBlock] = []
+    tool_messages: list[IRMessage] = []
+
     for block in content:
         if not isinstance(block, dict):
             continue
@@ -191,7 +197,7 @@ def _convert_message_to_ir(role: str, content: Any) -> list[IRMessage]:
                 input=block.get("input", {}) or {},
             ))
         elif block_type == "tool_result":
-            # tool_result 产生独立的 tool role 消息
+            # tool_result 产生独立的 tool role 消息，先收集
             tool_use_id = block.get("tool_use_id", "")
             result_content = block.get("content", "")
             if isinstance(result_content, list):
@@ -204,17 +210,19 @@ def _convert_message_to_ir(role: str, content: Any) -> list[IRMessage]:
                 result_content = json.dumps(result_content, ensure_ascii=False)
 
             is_error = block.get("is_error", False)
-            # 立即 yield 一条 tool 消息
-            yield_msg = IRMessage(role="tool", content=[
+            tool_msg = IRMessage(role="tool", content=[
                 IRToolResultBlock(
                     tool_use_id=tool_use_id,
                     content=result_content or "",
                     is_error=is_error,
                 )
             ])
-            yield_msg.name = None
-            # 注入到 messages（处理方式：跳出循环再追加）
-            return _merge_with_blocks(blocks, [yield_msg], role)
+            tool_msg.name = None
+            tool_messages.append(tool_msg)
+
+    # 统一拆分：先放 blocks 消息（如有），再放 tool_messages
+    if tool_messages:
+        return _merge_with_blocks(blocks, tool_messages, role)
 
     if blocks:
         return [IRMessage(role=role, content=blocks)]
@@ -292,9 +300,8 @@ def response_to_ir(body: dict[str, Any]) -> IRResponse:
                 input=block.get("input", {}) or {},
             ))
         elif block_type == "redacted_thinking":
-            content_blocks.append(IRThinkingBlock(
-                thinking="",
-                signature=block.get("data", ""),
+            content_blocks.append(IRRedactedThinkingBlock(
+                data=block.get("data", ""),
             ))
 
     if not content_blocks:
@@ -434,6 +441,11 @@ def _message_ir_to_anthropic(msg: IRMessage) -> dict[str, Any]:
             if block.signature is not None:
                 tb["signature"] = block.signature
             blocks.append(tb)
+        elif isinstance(block, IRRedactedThinkingBlock):
+            blocks.append({
+                "type": "redacted_thinking",
+                "data": block.data,
+            })
         elif isinstance(block, IRToolUseBlock):
             blocks.append({
                 "type": "tool_use",

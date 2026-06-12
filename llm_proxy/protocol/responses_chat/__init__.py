@@ -13,7 +13,7 @@ import warnings as _warnings
 _warnings.warn(
     "protocol.responses_chat is legacy; prefer protocol.ir for new code paths. "
     "See protocol/ir/__init__.py and AGENTS.md for migration notes.",
-    DeprecationWarning,
+    PendingDeprecationWarning,
     stacklevel=2,
 )
 
@@ -46,4 +46,3 @@ __all__ = [
     "convert_responses_to_chat_response",
     "stream_responses_to_chat",
 ]
-
