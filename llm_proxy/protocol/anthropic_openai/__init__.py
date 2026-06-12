@@ -8,7 +8,20 @@
   response — Chat → Anthropic 响应转换
   stream   — Chat SSE → Anthropic SSE 流式转换
   rectifier — Thinking signature 整流器
+
+.. deprecated::
+    旧通道。新代码请走 ``llm_proxy.protocol.ir``（IR 抽象层）。
+    保留是为了不破坏现有 ProxyStep 的 if/elif 路由；后续可逐步迁移。
 """
+
+import warnings as _warnings
+
+_warnings.warn(
+    "protocol.anthropic_openai is legacy; prefer protocol.ir for new code paths. "
+    "See protocol/ir/__init__.py and AGENTS.md for migration notes.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 from llm_proxy.protocol.anthropic_openai.request import anthropic_to_chat
 from llm_proxy.protocol.anthropic_openai.response import chat_to_anthropic

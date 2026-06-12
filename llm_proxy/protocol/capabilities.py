@@ -20,10 +20,19 @@ _PROTOCOL_ALIASES: dict[str, str] = {
 # 显式实现的跨协议转换对 (source_client_protocol, target_upstream_protocol)
 # 顺序就是"多可达时的优先级"：第一个匹配的胜出
 # 同协议透传是隐含的，不列在这里
+#
+# 注解说明当前每对使用的实现路径：
+#   - anthropic → chat:        anthropic_openai/
+#   - responses → chat:        responses_chat/
+#   - chat → responses:        responses_chat/ (反向)
+#   - anthropic → responses:   protocol/ir/ (新)
+#   - responses → anthropic:   protocol/ir/ (新)
 IMPLEMENTED_CONVERSIONS: tuple[tuple[str, str], ...] = (
     ("anthropic", "openai/chat-completions"),
     ("openai/responses", "openai/chat-completions"),
     ("openai/chat-completions", "openai/responses"),
+    ("anthropic", "openai/responses"),
+    ("openai/responses", "anthropic"),
 )
 
 
@@ -118,4 +127,3 @@ def select_upstream(client: str, available) -> str:
 
     # 3. 不可达
     raise NoReachableProtocol(client_n, available_n)
-

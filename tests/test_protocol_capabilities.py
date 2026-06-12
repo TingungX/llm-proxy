@@ -30,10 +30,11 @@ from llm_proxy.protocol.capabilities import (
     ("anthropic", "openai/chat-completions", True),
     ("openai/responses", "openai/chat-completions", True),
     ("openai/chat-completions", "openai/responses", True),
+    # v2：Anthropic ↔ Responses 通过 IR 抽象层实现
+    ("anthropic", "openai/responses", True),
+    ("openai/responses", "anthropic", True),
     # 未实现的跨协议对
-    ("anthropic", "openai/responses", False),
     ("openai/chat-completions", "anthropic", False),
-    ("openai/responses", "anthropic", False),
     # 别名：客户端用 "openai" 视为 "openai/chat-completions"
     ("openai", "openai/chat-completions", True),  # 别名同协议
     ("openai", "anthropic", False),  # 别名 vs 真正的 anthropic
@@ -79,11 +80,8 @@ def test_select_cross_protocol_responses_falls_back_to_chat():
 # ─── select_upstream: 不可达 ───────────────────────────────────────
 
 def test_select_unreachable_anthropic_to_responses():
-    """client=anthropic, available={responses} → NoReachableProtocol（anthropic→responses 未实现）"""
-    with pytest.raises(NoReachableProtocol) as exc_info:
-        select_upstream("anthropic", {"openai/responses"})
-    assert exc_info.value.client == "anthropic"
-    assert exc_info.value.available == {"openai/responses"}
+    """v2：anthropic→responses 走 IR 可达。占位：保留以防回归。"""
+    assert select_upstream("anthropic", {"openai/responses"}) == "openai/responses"
 
 
 def test_select_unreachable_chat_to_anthropic():
@@ -155,8 +153,12 @@ def test_no_reachable_protocol_strips_client_from_available():
 # ─── IMPLEMENTED_CONVERSIONS 表完整性 ─────────────────────────────
 
 def test_implemented_conversions_count():
-    """表的大小应保持稳定（加新转换时显式更新）"""
-    assert len(IMPLEMENTED_CONVERSIONS) == 3
+    """表的大小应保持稳定（加新转换时显式更新）。
+
+    v1: 3 对 (Anthropic↔Chat, Responses↔Chat, Chat↔Responses)
+    v2: +2 对 (Anthropic↔Responses) = 5 对
+    """
+    assert len(IMPLEMENTED_CONVERSIONS) == 5
 
 
 def test_implemented_conversions_no_duplicates():
@@ -168,4 +170,3 @@ def test_implemented_conversions_no_self_loops():
     """同协议对不应出现在转换表里（隐含可达）"""
     for src, tgt in IMPLEMENTED_CONVERSIONS:
         assert src != tgt, f"self-loop detected: ({src}, {tgt})"
-
