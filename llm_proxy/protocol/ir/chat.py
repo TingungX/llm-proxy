@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from typing import Any
+from typing import Any, AsyncIterator
 
 from llm_proxy.protocol.constants import STOP_REASON_MAP
 from llm_proxy.protocol.ir._common import (
@@ -16,7 +16,16 @@ from llm_proxy.protocol.ir._common import (
     safe_json_loads,
     supports_reasoning_effort,
 )
-from llm_proxy.protocol.think_tag import strip_think_tags
+from llm_proxy.protocol.ir._stream import (
+    DONE_SENTINEL,
+    IncrementalJSONParser,
+    extract_usage_tokens,
+    map_finish_to_stop_reason,
+    parse_sse_line,
+    sse_format_data_only,
+)
+from llm_proxy.protocol.ir.types import IRStreamEvent
+from llm_proxy.protocol.think_tag import ThinkTagStateMachine, strip_think_tags
 from llm_proxy.protocol.ir.types import (
     IRContentBlock,
     IRImageBlock,
@@ -529,3 +538,334 @@ def _message_ir_to_chat(msg: IRMessage) -> list[dict[str, Any]]:
 
     result.append(msg_dict)
     return result
+
+
+# ════════════════════════════════════════════════════════════════════
+# 流式（Streaming）
+# ════════════════════════════════════════════════════════════════════
+
+
+async def parse_stream_to_ir(
+    resp,
+    model: str,
+) -> AsyncIterator[IRStreamEvent]:
+    """OpenAI Chat Completions SSE → IRStreamEvent 序列。
+
+    状态机职责：
+    - 跟踪 text / thinking block 的开闭
+    - 累积 tool_calls 的 arguments 片段
+    - 提取 usage（流末尾的 chunk 携带）
+    - 转换 finish_reason → IR stop_reason
+    """
+    # 状态（闭包内）
+    message_started = False
+    text_open = False
+    thinking_open = False
+    think_sm = ThinkTagStateMachine()
+    # tool index → {id, name, args_parser, started}
+    tool_state: dict[int, dict] = {}
+    pending_finish_reason: str | None = None
+    latest_usage: dict | None = None
+
+    def ensure_tool_state(idx: int, default_id: str = "") -> dict:
+        if idx not in tool_state:
+            tool_state[idx] = {
+                "id": default_id,
+                "name": "",
+                "args": IncrementalJSONParser(),
+                "started": False,
+            }
+        return tool_state[idx]
+
+    async for raw_line in resp.aiter_lines():
+        parsed = parse_sse_line(raw_line)
+        if parsed is None:
+            continue
+        if parsed is DONE_SENTINEL:
+            break
+
+        chunk = parsed
+        if not isinstance(chunk, dict):
+            continue
+
+        # 首个有效 chunk：emit message_start
+        if not message_started:
+            yield IRStreamEvent(
+                type="message_start",
+                data={
+                    "id": chunk.get("id", ""),
+                    "model": chunk.get("model", model),
+                },
+            )
+            message_started = True
+
+        # Usage 提取
+        if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
+            latest_usage = chunk["usage"]
+
+        choices = chunk.get("choices") or []
+        if not choices:
+            continue
+        choice = choices[0]
+        delta = choice.get("delta") or {}
+        finish_reason = choice.get("finish_reason")
+
+        # ── reasoning_content（DeepSeek/o1 原生字段）──
+        rc = delta.get("reasoning_content")
+        if rc:
+            if not thinking_open:
+                yield IRStreamEvent(type="thinking_start", data={})
+                thinking_open = True
+            yield IRStreamEvent(type="thinking_delta", data={"thinking": rc})
+
+        # ── content（含 <think> 标签）──
+        if "content" in delta and delta["content"] is not None:
+            content = delta["content"]
+            if not isinstance(content, str):
+                content = str(content)
+            reasoning_parts, content_parts = think_sm.feed(content)
+            for r in reasoning_parts:
+                if not thinking_open:
+                    yield IRStreamEvent(type="thinking_start", data={})
+                    thinking_open = True
+                yield IRStreamEvent(type="thinking_delta", data={"thinking": r})
+            for c in content_parts:
+                if thinking_open:
+                    yield IRStreamEvent(type="thinking_end", data={})
+                    thinking_open = False
+                if not text_open:
+                    yield IRStreamEvent(type="text_start", data={})
+                    text_open = True
+                yield IRStreamEvent(type="text_delta", data={"text": c})
+
+        # ── tool_calls ──
+        for tc in delta.get("tool_calls") or []:
+            idx = tc.get("index", 0)
+            ts = ensure_tool_state(idx, default_id=tc.get("id", ""))
+            if tc.get("id"):
+                ts["id"] = tc["id"]
+            func = tc.get("function") or {}
+            if func.get("name"):
+                ts["name"] = func["name"]
+                if not ts["started"]:
+                    yield IRStreamEvent(
+                        type="tool_use_start",
+                        data={"id": ts["id"] or f"call_{uuid.uuid4().hex[:24]}", "name": ts["name"]},
+                    )
+                    ts["started"] = True
+            if "arguments" in func and func["arguments"]:
+                args_delta = func["arguments"]
+                ts["args"].feed(args_delta)
+                if ts["started"]:
+                    yield IRStreamEvent(
+                        type="tool_use_delta",
+                        data={"id": ts["id"], "arguments_delta": args_delta},
+                    )
+
+        if finish_reason:
+            pending_finish_reason = finish_reason
+
+    # ── 流末尾：闭合所有未关闭 block ──
+    # 残留 think tag buffer
+    if think_sm.buf or think_sm.leading_ws:
+        remaining, _ = think_sm.drain()
+        if remaining:
+            # 默认作为 content 输出
+            if not text_open:
+                yield IRStreamEvent(type="text_start", data={})
+                text_open = True
+            yield IRStreamEvent(type="text_delta", data={"text": remaining})
+
+    if thinking_open:
+        yield IRStreamEvent(type="thinking_end", data={})
+    if text_open:
+        yield IRStreamEvent(type="text_end", data={})
+
+    # 闭合所有 tool_use block
+    for idx in sorted(tool_state.keys()):
+        ts = tool_state[idx]
+        if not ts["started"]:
+            continue
+        final_input = ts["args"].finalize()
+        yield IRStreamEvent(
+            type="tool_use_end",
+            data={"id": ts["id"], "input": final_input},
+        )
+
+    # Usage
+    if latest_usage:
+        yield IRStreamEvent(type="usage", data=extract_usage_tokens(latest_usage))
+
+    # Message stop
+    yield IRStreamEvent(
+        type="message_stop",
+        data={"stop_reason": map_finish_to_stop_reason(pending_finish_reason)},
+    )
+
+
+async def format_ir_as_sse(
+    events: AsyncIterator[IRStreamEvent],
+    model: str,
+    *,
+    reverse_tool_map: dict | None = None,
+    namespace_map: dict | None = None,
+) -> AsyncIterator[bytes]:
+    """IRStreamEvent 序列 → OpenAI Chat SSE 字节流。
+
+    Chat 流式无复杂状态机：每个 IR 事件 → 一个 Chat chunk。
+    """
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+
+    async for event in events:
+        etype = event.type
+        data = event.data or {}
+
+        if etype == "message_start":
+            # Chat 风格首个 chunk：role delta
+            yield sse_format_data_only({
+                "id": data.get("id") or chunk_id,
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": data.get("model") or model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": ""},
+                    "finish_reason": None,
+                }],
+            })
+
+        elif etype == "thinking_start":
+            # Chat 风格无 thinking 块；改为发送 reasoning_content 起点
+            # 但 reasoning_content 需配对 delta；不主动预发，让 delta 事件直接发
+            pass
+
+        elif etype == "thinking_delta":
+            text = data.get("thinking", "")
+            if text:
+                yield sse_format_data_only({
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"reasoning_content": text},
+                        "finish_reason": None,
+                    }],
+                })
+
+        elif etype == "thinking_end":
+            pass  # Chat 不发显式结束
+
+        elif etype == "text_start":
+            # text_start 不单独发（首个 text_delta 自然带 delta.content）
+            pass
+
+        elif etype == "text_delta":
+            text = data.get("text", "")
+            if text:
+                yield sse_format_data_only({
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": text},
+                        "finish_reason": None,
+                    }],
+                })
+
+        elif etype == "text_end":
+            pass
+
+        elif etype == "tool_use_start":
+            tool_id = data.get("id", f"call_{uuid.uuid4().hex[:24]}")
+            tool_name = data.get("name", "")
+            yield sse_format_data_only({
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": tool_id,
+                        "type": "function",
+                        "function": {"name": tool_name, "arguments": ""},
+                    }]},
+                    "finish_reason": None,
+                }],
+            })
+
+        elif etype == "tool_use_delta":
+            args_delta = data.get("arguments_delta", "")
+            yield sse_format_data_only({
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"tool_calls": [{
+                        "index": 0,
+                        "function": {"arguments": args_delta},
+                    }]},
+                    "finish_reason": None,
+                }],
+            })
+
+        elif etype == "tool_use_end":
+            # Chat 风格不发显式 end；input 已在 delta 中累积
+            pass
+
+        elif etype == "usage":
+            usage = data or {}
+            chat_usage = {
+                "prompt_tokens": int(usage.get("input_tokens", 0)),
+                "completion_tokens": int(usage.get("output_tokens", 0)),
+            }
+            chat_usage["total_tokens"] = chat_usage["prompt_tokens"] + chat_usage["completion_tokens"]
+            yield sse_format_data_only({
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": model,
+                "choices": [],
+                "usage": chat_usage,
+            })
+
+        elif etype == "message_stop":
+            stop_reason = data.get("stop_reason", "end_turn")
+            # "tool_use" → "tool_calls"
+            if stop_reason == "tool_use":
+                finish = "tool_calls"
+            elif stop_reason == "max_tokens":
+                finish = "length"
+            else:
+                finish = "stop"
+            yield sse_format_data_only({
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": finish,
+                }],
+            })
+            yield b"data: [DONE]\n\n"
+
+        elif etype == "error":
+            err = data or {}
+            yield sse_format_data_only({
+                "error": {
+                    "message": err.get("message", "Stream error"),
+                    "type": err.get("code", "api_error"),
+                }
+            })
+
+        elif etype == "keepalive":
+            yield b": keepalive\n\n"

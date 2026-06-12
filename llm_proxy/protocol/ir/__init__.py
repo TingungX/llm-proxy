@@ -12,6 +12,13 @@
 
     # 响应方向：upstream → IR → client
     client_resp = convert_response("openai/responses", "anthropic", upstream_body)
+
+流式：
+    converter = REGISTRY["openai/chat-completions"]
+    ir_events = converter.parse_stream_to_ir(upstream_resp, model)
+    sse_bytes = converter.format_ir_as_sse(ir_events, model,
+                                           reverse_tool_map=ir.extensions.get("reverse_tool_map"),
+                                           namespace_map=ir.extensions.get("namespace_map"))
 """
 
 from __future__ import annotations
@@ -65,6 +72,31 @@ class ProtocolConverter:
         raise NotImplementedError
 
     def response_from_ir(self, ir: IRResponse) -> dict:  # pragma: no cover - abstract
+        raise NotImplementedError
+
+    # ── 流式（异步）──
+
+    async def parse_stream_to_ir(  # pragma: no cover - abstract
+        self,
+        resp,                # httpx 流式响应
+        model: str,          # 上游模型名（id 兜底用）
+    ):
+        """解析上游 SSE 字节流 → IRStreamEvent 序列（异步生成器）。"""
+        raise NotImplementedError
+
+    async def format_ir_as_sse(  # pragma: no cover - abstract
+        self,
+        events,              # AsyncIterator[IRStreamEvent]
+        model: str,          # 客户端模型名
+        *,
+        reverse_tool_map: dict | None = None,
+        namespace_map: dict | None = None,
+    ):
+        """IRStreamEvent 序列 → 客户端 SSE 字节流（异步生成器）。
+
+        reverse_tool_map / namespace_map 仅 Responses 协议使用：
+        解析时存于 IRRequest.extensions，发送时透传过来。
+        """
         raise NotImplementedError
 
 
@@ -164,4 +196,3 @@ __all__ = [
     "convert_response",
     "ALIASES",
 ]
-

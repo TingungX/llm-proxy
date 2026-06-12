@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from typing import Any
+from typing import Any, AsyncIterator
 
 from llm_proxy.protocol.constants import STOP_REASON_MAP
 from llm_proxy.protocol.ir._common import (
@@ -23,12 +23,20 @@ from llm_proxy.protocol.ir._common import (
     strip_leading_anthropic_billing_header,
     supports_reasoning_effort,
 )
+from llm_proxy.protocol.ir._stream import (
+    DONE_SENTINEL,
+    IncrementalJSONParser,
+    extract_usage_tokens,
+    parse_sse_line,
+    sse_format,
+)
 from llm_proxy.protocol.ir.types import (
     IRContentBlock,
     IRImageBlock,
     IRMessage,
     IRRequest,
     IRResponse,
+    IRStreamEvent,
     IRTextBlock,
     IRThinkingBlock,
     IRToolDef,
@@ -448,3 +456,376 @@ def _message_ir_to_anthropic(msg: IRMessage) -> dict[str, Any]:
 
     return {"role": role, "content": blocks}
 
+
+# ════════════════════════════════════════════════════════════════════
+# 流式（Streaming）
+# ════════════════════════════════════════════════════════════════════
+
+
+async def parse_stream_to_ir(
+    resp,
+    model: str,
+) -> AsyncIterator[IRStreamEvent]:
+    """Anthropic Messages SSE → IRStreamEvent 序列。
+
+    状态机职责：
+    - 跟踪 message_start 是否已发
+    - 跟踪当前 block index/type（Anthropic 风格：每个 block 有 index）
+    - 累积 tool_use 的 input_json_delta 片段
+    - 收集 message_delta 中的 stop_reason / usage
+    """
+    message_started = False
+    message_id = ""
+    message_model = model
+
+    # 当前活跃 block 状态
+    # block_index → {"type": "thinking"|"text"|"tool_use", "tool_id": str, "args": IncrementalJSONParser}
+    blocks: dict[int, dict] = {}
+
+    pending_stop_reason: str | None = None
+    latest_usage: dict | None = None
+
+    async for raw_line in resp.aiter_lines():
+        # Anthropic SSE 用 "event: X" + "data: Y" 配对
+        # parse_sse_line 不会处理 event 头（只返回 None），所以需要先缓存 event 名
+        # 这里简化：read full event pair
+        line = raw_line.rstrip("\r")
+        if not line or line.startswith(":"):
+            continue
+
+        if line.startswith("event: "):
+            # 把 event name 累积下来，与下一个 data 配对
+            # 简化处理：用一个小 list 缓存单 event 流
+            # 但 aiter_lines 是 line-by-line，所以我们需要手动累积
+            # 改成：直接解析 data: 行（event 名通常也编码在 data 里）
+            # 为简化，这里使用一个延迟策略：等下一行
+            current_event = line[7:].strip()
+            continue
+
+        if line.startswith("data: "):
+            data_str = line[6:].lstrip(" ")
+            if data_str == "[DONE]":
+                break
+            try:
+                event = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+        else:
+            continue
+
+        event_type = event.get("type", "")
+
+        if event_type == "message_start":
+            msg = event.get("message", {})
+            message_id = msg.get("id", message_id)
+            message_model = msg.get("model", message_model)
+            if not message_started:
+                yield IRStreamEvent(
+                    type="message_start",
+                    data={"id": message_id, "model": message_model},
+                )
+                message_started = True
+
+        elif event_type == "content_block_start":
+            block_index = event.get("index", 0)
+            block = event.get("content_block", {})
+            block_type = block.get("type", "")
+            if block_type == "thinking":
+                blocks[block_index] = {"type": "thinking", "open": True}
+                yield IRStreamEvent(type="thinking_start", data={"index": block_index})
+            elif block_type == "text":
+                blocks[block_index] = {"type": "text", "open": True}
+                yield IRStreamEvent(type="text_start", data={"index": block_index})
+            elif block_type == "tool_use":
+                blocks[block_index] = {
+                    "type": "tool_use",
+                    "open": True,
+                    "id": block.get("id", f"toolu_{uuid.uuid4().hex[:24]}"),
+                    "name": block.get("name", ""),
+                    "args": IncrementalJSONParser(),
+                }
+                yield IRStreamEvent(
+                    type="tool_use_start",
+                    data={
+                        "id": blocks[block_index]["id"],
+                        "name": blocks[block_index]["name"],
+                    },
+                )
+            elif block_type == "redacted_thinking":
+                # 不可读取，直接 emit end 即可
+                blocks[block_index] = {"type": "thinking", "open": False, "redacted": True}
+                yield IRStreamEvent(type="thinking_start", data={"index": block_index, "redacted": True})
+                yield IRStreamEvent(type="thinking_end", data={"index": block_index})
+
+        elif event_type == "content_block_delta":
+            block_index = event.get("index", 0)
+            delta = event.get("delta", {})
+            delta_type = delta.get("type", "")
+            block = blocks.get(block_index)
+            if not block:
+                continue
+            if delta_type == "thinking_delta":
+                thinking_text = delta.get("thinking", "")
+                if thinking_text:
+                    yield IRStreamEvent(
+                        type="thinking_delta",
+                        data={"thinking": thinking_text, "index": block_index},
+                    )
+            elif delta_type == "text_delta":
+                text = delta.get("text", "")
+                if text:
+                    yield IRStreamEvent(
+                        type="text_delta",
+                        data={"text": text, "index": block_index},
+                    )
+            elif delta_type == "input_json_delta":
+                fragment = delta.get("partial_json", "")
+                if fragment and block["type"] == "tool_use":
+                    block["args"].feed(fragment)
+                    yield IRStreamEvent(
+                        type="tool_use_delta",
+                        data={"id": block["id"], "arguments_delta": fragment},
+                    )
+
+        elif event_type == "content_block_stop":
+            block_index = event.get("index", 0)
+            block = blocks.get(block_index)
+            if not block:
+                continue
+            if block["type"] == "thinking" and block.get("open"):
+                yield IRStreamEvent(type="thinking_end", data={"index": block_index})
+                block["open"] = False
+            elif block["type"] == "text" and block.get("open"):
+                yield IRStreamEvent(type="text_end", data={"index": block_index})
+                block["open"] = False
+            elif block["type"] == "tool_use" and block.get("open"):
+                final_input = block["args"].finalize()
+                yield IRStreamEvent(
+                    type="tool_use_end",
+                    data={"id": block["id"], "input": final_input},
+                )
+                block["open"] = False
+
+        elif event_type == "message_delta":
+            delta = event.get("delta", {})
+            if "stop_reason" in delta:
+                pending_stop_reason = delta["stop_reason"]
+            usage_raw = event.get("usage")
+            if isinstance(usage_raw, dict) and usage_raw:
+                latest_usage = usage_raw
+
+        elif event_type == "message_stop":
+            # 闭合所有仍 open 的 block（Anthropic 异常情况下可能没发 content_block_stop）
+            for idx, b in blocks.items():
+                if not b.get("open"):
+                    continue
+                if b["type"] == "thinking":
+                    yield IRStreamEvent(type="thinking_end", data={"index": idx})
+                elif b["type"] == "text":
+                    yield IRStreamEvent(type="text_end", data={"index": idx})
+                elif b["type"] == "tool_use":
+                    final_input = b["args"].finalize()
+                    yield IRStreamEvent(
+                        type="tool_use_end",
+                        data={"id": b["id"], "input": final_input},
+                    )
+                b["open"] = False
+
+    # ── 流末尾：emit usage + message_stop ──
+    if latest_usage:
+        yield IRStreamEvent(type="usage", data=extract_usage_tokens(latest_usage))
+
+    yield IRStreamEvent(
+        type="message_stop",
+        data={"stop_reason": pending_stop_reason or "end_turn"},
+    )
+
+
+async def format_ir_as_sse(
+    events: AsyncIterator[IRStreamEvent],
+    model: str,
+    *,
+    reverse_tool_map: dict | None = None,
+    namespace_map: dict | None = None,
+) -> AsyncIterator[bytes]:
+    """IRStreamEvent 序列 → Anthropic Messages SSE 字节流。
+
+    Anthropic 流式结构：
+    - message_start
+    - content_block_start ×N（每块一个）
+    - content_block_delta ×N
+    - content_block_stop ×N
+    - message_delta（含 stop_reason, usage）
+    - message_stop
+
+    状态：message_id, current_model, block_index 计数, 各 block 的内容累积。
+    """
+    message_id = ""
+    current_model = model
+    seq = 0
+
+    # 用于重建 text/thinking/tool_use 内容
+    current_block_index = 0
+    current_block_type: str | None = None  # "text" / "thinking" / "tool_use"
+    current_block_id: str = ""  # for tool_use
+    current_block_name: str = ""
+    current_block_json: list[str] = []  # for tool_use: 累积 input_json 片段
+    current_text_buf: str = ""
+    current_thinking_buf: str = ""
+
+    pending_stop_reason: str | None = None
+    pending_usage: dict | None = None
+
+    def next_block() -> int:
+        nonlocal current_block_index
+        idx = current_block_index
+        current_block_index += 1
+        return idx
+
+    def close_current_block():
+        """闭合当前 block（如有 open），返回是否 emit 了 stop 事件。"""
+        nonlocal current_block_type
+        if current_block_type is None:
+            return False
+        idx = current_block_index - 1
+        if current_block_type == "text":
+            # text block stop（无需 content，因为 message 里已累加）
+            return False  # 已在 text_delta 中自然结束
+        elif current_block_type == "thinking":
+            return False
+        elif current_block_type == "tool_use":
+            # tool_use 块：通过 tool_use_end 事件触发 stop
+            return False
+        current_block_type = None
+        return False
+
+    async for event in events:
+        etype = event.type
+        data = event.data or {}
+
+        if etype == "message_start":
+            message_id = data.get("id") or f"msg_{uuid.uuid4().hex[:24]}"
+            current_model = data.get("model") or model
+            yield sse_format("message_start", {
+                "message": {
+                    "id": message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": current_model,
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                },
+            })
+
+        elif etype == "thinking_start":
+            idx = next_block()
+            current_block_type = "thinking"
+            current_thinking_buf = ""
+            yield sse_format("content_block_start", {
+                "index": idx,
+                "content_block": {"type": "thinking", "thinking": ""},
+            })
+
+        elif etype == "thinking_delta":
+            text = data.get("thinking", "")
+            if text:
+                idx = current_block_index - 1
+                current_thinking_buf += text
+                yield sse_format("content_block_delta", {
+                    "index": idx,
+                    "delta": {"type": "thinking_delta", "thinking": text},
+                })
+
+        elif etype == "thinking_end":
+            if current_block_type == "thinking":
+                idx = current_block_index - 1
+                yield sse_format("content_block_stop", {"index": idx})
+                current_block_type = None
+
+        elif etype == "text_start":
+            idx = next_block()
+            current_block_type = "text"
+            current_text_buf = ""
+            yield sse_format("content_block_start", {
+                "index": idx,
+                "content_block": {"type": "text", "text": ""},
+            })
+
+        elif etype == "text_delta":
+            text = data.get("text", "")
+            if text:
+                idx = current_block_index - 1
+                current_text_buf += text
+                yield sse_format("content_block_delta", {
+                    "index": idx,
+                    "delta": {"type": "text_delta", "text": text},
+                })
+
+        elif etype == "text_end":
+            if current_block_type == "text":
+                idx = current_block_index - 1
+                yield sse_format("content_block_stop", {"index": idx})
+                current_block_type = None
+
+        elif etype == "tool_use_start":
+            idx = next_block()
+            current_block_type = "tool_use"
+            current_block_id = data.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
+            current_block_name = data.get("name", "")
+            current_block_json = []
+            yield sse_format("content_block_start", {
+                "index": idx,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": current_block_id,
+                    "name": current_block_name,
+                    "input": {},
+                },
+            })
+
+        elif etype == "tool_use_delta":
+            args_delta = data.get("arguments_delta", "")
+            if args_delta:
+                idx = current_block_index - 1
+                current_block_json.append(args_delta)
+                yield sse_format("content_block_delta", {
+                    "index": idx,
+                    "delta": {"type": "input_json_delta", "partial_json": args_delta},
+                })
+
+        elif etype == "tool_use_end":
+            if current_block_type == "tool_use":
+                idx = current_block_index - 1
+                yield sse_format("content_block_stop", {"index": idx})
+                current_block_type = None
+
+        elif etype == "usage":
+            pending_usage = extract_usage_tokens(data)
+
+        elif etype == "message_stop":
+            pending_stop_reason = data.get("stop_reason", "end_turn")
+            # 发 message_delta（含 stop_reason + usage）
+            delta_payload: dict[str, Any] = {
+                "delta": {
+                    "stop_reason": pending_stop_reason,
+                    "stop_sequence": None,
+                },
+                "usage": pending_usage or {"input_tokens": 0, "output_tokens": 0},
+            }
+            yield sse_format("message_delta", delta_payload)
+            yield sse_format("message_stop", {"type": "message_stop"})
+
+        elif etype == "error":
+            err = data or {}
+            yield sse_format("error", {
+                "type": "error",
+                "error": {
+                    "type": err.get("code", "api_error"),
+                    "message": err.get("message", "Stream error"),
+                },
+            })
+
+        elif etype == "keepalive":
+            yield b": keepalive\n\n"
