@@ -7,80 +7,108 @@
   <img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License AGPL-3.0">
 </p>
 
-**LLM Proxy** — 一个基于 FastAPI 的 LLM API 聚合网关，支持多模型、多协议的**双向格式转换**。你可以用任一种协议格式请求，代理自动转换为目标上游所需的协议格式。
-
-目前支持的协议转换：
-
-| 请求格式 | 可转换的上游格式 | 请求路由 |
-|----------|------------------|----------|
-| Anthropic Messages | Anthropic Messages / OpenAI Chat Completions | `/v1/messages` |
-| OpenAI Chat Completions | OpenAI Chat Completions / Anthropic Messages | `/v1/chat/completions` |
-| OpenAI Responses | OpenAI Chat Completions | `/v1/responses` |
-
-→ **Anthropic , OpenAI Chat Completions 和 OpenAI Responses 三种请求格式均可由指定路径路由到任意格式的上游模型。**
+**LLM Proxy** — 一个基于 FastAPI 的 LLM API 聚合网关，支持多模型、多协议的双向格式转换。Anthropic Messages、OpenAI Chat Completions、OpenAI Responses API 三种请求格式均可路由到任意格式的上游模型。
 
 ---
 
 ## 目录
 
-- [LLM Proxy](#llm-proxy)
-  - [目录](#目录)
-  - [功能特性](#功能特性)
-    - [基本全面支持 Codex Desktop](#基本全面支持-codex-desktop)
-    - [其他 AI 客户端](#其他-ai-客户端)
-    - [核心功能](#核心功能)
-  - [快速开始](#快速开始)
-    - [使用示例](#使用示例)
-  - [部署方式](#部署方式)
-    - [Docker（推荐）](#docker推荐)
-    - [macOS launchd](#macos-launchd)
-    - [Linux systemd](#linux-systemd)
-  - [配置说明](#配置说明)
-  - [API 文档](#api-文档)
-    - [代理 API](#代理-api)
-    - [管理 API](#管理-api)
-  - [管理面板](#管理面板)
-    - [前端开发](#前端开发)
-  - [测试](#测试)
-  - [项目结构](#项目结构)
-  - [许可证](#许可证)
+- [协议互转矩阵](#协议互转矩阵)
+- [功能特性](#功能特性)
+- [架构](#架构)
+- [快速开始](#快速开始)
+- [部署方式](#部署方式)
+- [配置说明](#配置说明)
+- [API 文档](#api-文档)
+- [管理面板](#管理面板)
+- [测试](#测试)
+- [项目结构](#项目结构)
+- [许可证](#许可证)
+
+---
+
+## 协议互转矩阵
+
+| 客户端格式 | 上游支持格式 | 路由入口 | 转换路径 |
+|------------|------------|----------|----------|
+| Anthropic Messages | Anthropic / Chat / Responses | `/v1/messages` | 同协议透传 / IR 中转 |
+| OpenAI Chat Completions | Chat / Responses / Anthropic | `/v1/chat/completions` | 同协议透传 / IR 中转 |
+| OpenAI Responses API | Responses / Chat / Anthropic | `/v1/responses` | 同协议透传 / IR 中转 |
+
+所有三种请求格式均可经由 IR 抽象层中转到任意目标格式。任意两个协议间的单次请求仅经过一次 IR 转换（`client → IR → upstream`），不产生级联转换损耗。
 
 ---
 
 ## 功能特性
 
-### 基本全面支持 Codex Desktop
+### Codex Desktop 深度兼容
 
-LLM Proxy 深度兼容 Codex Desktop 通信协议（OpenAI Responses API），并提供完整的工具转换支持：
+LLM Proxy 全面兼容 Codex Desktop 的 OpenAI Responses API 通信协议：
 
-Codex Desktop 使用 **OpenAI Responses API** 协议，LLM Proxy 在 `/v1/responses` 路径自动完成 Responses → Chat Completions 格式转换，并完整支持 apply_patch、namespace、web_search 等工具转换。
+- **工具转换**：`apply_patch` (custom) 自动展开为 4 个标准文件工具（`write_to_file` / `replace_in_file` / `append_to_file` / `delete_file`），上游返回后反向还原为 `custom_tool_call` 事件
+- **非标准工具降级**：`namespace` 递归展开、`web_search` 降级为标准 function、其他 `custom` 工具透传
+- **think 标签自动提取**：上游返回的 `<think>` 标签内容自动提取为 reasoning / thinking blocks
+- **协议转换**：无论上游是 Chat Completions 还是 Anthropic Messages，自动完成双向转换
 
-参考 [`config.toml.example`](config.toml.example) 快速配置 Codex Desktop 接入本代理。
+参考 [`config.toml.example`](config.toml.example) 快速配置 Codex Desktop 接入。
 
 ### 其他 AI 客户端
 
-以下 AI 编程工具同样兼容，直接接入即可使用：
+| 工具 | 协议 | 接入路径 |
+|------|------|----------|
+| Claude Code | Anthropic Messages | `/v1/messages` |
+| OpenCode / 任何 OpenAI 兼容客户端 | OpenAI Chat Completions | `/v1/chat/completions` |
+| 任何 OpenAI Responses 兼容客户端 | OpenAI Responses API | `/v1/responses` |
 
-| 工具 | 使用协议 | 接入路径 |
-|------|----------|----------|
-| **Claude Code** | Anthropic Messages API | `/v1/messages` |
-| **OpenCode** | OpenAI Chat Completions | `/v1/chat/completions` |
-| 任何 OpenAI 兼容客户端 | OpenAI Chat Completions | `/v1/chat/completions` |
-
-将工具的 `api_base` 指向本代理即可。**一个代理同时满足所有工具的后端模型接入需求。**
+将工具的 `api_base` 指向本代理即可。
 
 ### 核心功能
 
 | 功能 | 说明 |
 |------|------|
-| **多协议双向转换** | Anthropic Messages ↔ OpenAI Chat Completions 全双向、OpenAI Responses → Chat Completions |
+| **全协议互转** | Anthropic / Chat / Responses 三种协议任意互转，通过 IR 抽象层一次中转 |
+| **统一 IR 抽象层** | `protocol/ir/` 零外部依赖的中间表示层，ProtocolConverter 注册表模式，新增协议只需实现一个子类 |
+| **旧通道兼容** | `anthropic_openai/` 和 `responses_chat/` 旧通道保留并行，逐步迁移 |
 | **多上游聚合** | 一个代理接入 DeepSeek、MiniMax、GLM、OpenCode 等多个模型提供商 |
-| **RTK（输入压缩 / Beta）** | 内置输入压缩工具（Rust Token Killer），压缩 tool_result 中的 CLI 输出噪声、截断长代码块、折叠空行以节省 input token；默认关闭，可在端点配置编辑中手动启用（启用后可能降低模型表现） |
+| **RTK 输入压缩** | 内置输入压缩工具（Rust Token Killer），压缩 tool_result 中的 CLI 输出噪声 |
 | **端点认证与隔离** | 基于 API Key 的端点隔离，每个端点独立配置可用模型 |
-| **模型路由与 Fallback** | 开启后，模型 family failover 链，429/503 自动切换 |
+| **模型路由与 Fallback** | 模型 family failover 链，429/503 自动切换 |
 | **请求跟踪** | 每请求唯一 Request ID，结构化日志，Web 管理面板筛选查询 |
-| **工具格式兼容** | namespace、apply_patch 等非标准工具类型自动转换 |
 | **管理面板** | Preact + Vite 构建的 Web 控制台，管理端点/模型/用量/日志 |
+
+---
+
+## 架构
+
+```
+请求 (Anthropic / Chat / Responses)
+  │
+  ▼
+Handler Pipeline (Auth → ModelResolve → ProtocolSelect → ... → Proxy)
+  │
+  ├── 同协议 ──→ 透传到上游
+  │
+  └── 跨协议 ──→ 协议转换层
+                    │
+                    ├── 新路径 (IRProxyStep)
+                    │   └── client_body → IRRequest → upstream_body
+                    │   └── upstream SSE → IRStreamEvent → client SSE
+                    │
+                    └── 旧路径 (ProxyStep)
+                        └── anthropic_openai / responses_chat 直接转换
+```
+
+协议转换层的核心是 `protocol/ir/`：
+
+```
+                    ┌─────────────┐
+   Anthropic ──────→│             │──────→ Anthropic
+   Chat     ──────→│  IR 抽象层  │──────→ Chat
+   Responses──────→│ (dataclass) │──────→ Responses
+                    └─────────────┘
+```
+
+转换路径：**请求方向** `client_body → to_ir() → IRRequest → to_upstream() → upstream_body`；**响应方向** `upstream_body → response_to_ir() → IRResponse → response_from_ir() → client_body`。IR 类型用 dataclass 定义，零外部依赖，协议特有字段通过 `extensions` dict 透传。
 
 ---
 
@@ -104,20 +132,28 @@ python -m uvicorn llm_proxy.main:app --port 4000
 
 ### 使用示例
 
-**Anthropic 格式：**
+**Anthropic 格式（跨协议到 OpenAI Chat）：**
 ```bash
 curl http://localhost:4000/v1/messages \
   -H "x-api-key: your-endpoint-key" \
   -H "Content-Type: application/json" \
-  -d '{"model": "claude-sonnet-4-5", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 100}'
+  -d '{"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 100}'
 ```
 
-**OpenAI 格式：**
+**OpenAI Chat 格式：**
 ```bash
 curl http://localhost:4000/v1/chat/completions \
   -H "x-api-key: your-endpoint-key" \
   -H "Content-Type: application/json" \
   -d '{"model": "gpt-5", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 100}'
+```
+
+**OpenAI Responses 格式（跨协议到 Chat）：**
+```bash
+curl http://localhost:4000/v1/responses \
+  -H "x-api-key: your-endpoint-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "deepseek-v4-pro", "input": "Hello", "max_output_tokens": 100}'
 ```
 
 ---
@@ -133,8 +169,6 @@ cd static && npm ci && npm run build && cd ..
 # 启动
 docker-compose up -d
 ```
-
-Docker 内置健康检查（每 30s 通过 `GET /api/config` 验证），开箱即用。
 
 ### macOS launchd
 
@@ -210,8 +244,10 @@ sudo systemctl enable --now llm-proxy
 | `api_base` | 上游 API 地址（不含 `/v1/...`） |
 | `api_key` | 上游 API Key |
 | `upstream_model` | 实际发给上游的模型名 |
-| `upstream_protocol` | `anthropic` 或 `openai`，为空时自动探测 |
+| `upstream_protocol` | 标量字段（兼容保留）；建议用 `upstream_protocols` 数组 |
+| `upstream_protocols` | 数组，如 `["anthropic", "openai"]`，协议选择根据可达性表自动决定 |
 | `upstream_paths` | 各协议对应的上游路径（可选） |
+| `vision_support` | 是否支持图片输入 |
 
 端点（API Key 认证、模型白名单、family routing）通过管理面板或 API 配置，存储在 SQLite 中，支持运行态热更新。
 
@@ -223,11 +259,11 @@ sudo systemctl enable --now llm-proxy
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/v1/messages` | Anthropic Messages 格式 |
-| POST | `/v1/chat/completions` | OpenAI Chat Completions 格式 |
-| POST | `/v1/responses` | OpenAI Responses 格式（转为 Chat Completions） |
-
-所有请求需携带 `x-api-key` 或 `Authorization: Bearer` 头进行认证。
+| POST | `/v1/messages` | Anthropic Messages 格式（同协议透传 / 跨协议转换） |
+| POST | `/v1/chat/completions` | OpenAI Chat Completions 格式（同协议透传 / 跨协议转换） |
+| POST | `/v1/responses` | OpenAI Responses 格式（含 apply_patch/namespace 工具转换） |
+| POST | `/v1/messages/count_tokens` | Token 计数 |
+| GET | `/v1/models` | 模型列表 |
 
 ### 管理 API
 
@@ -236,8 +272,9 @@ sudo systemctl enable --now llm-proxy
 | GET/PUT | `/api/config` | 读写配置 |
 | GET/POST/PUT/DEL | `/api/endpoints` | 端点 CRUD |
 | GET | `/api/usage[?days=&group_by=&granularity=]` | 用量查询 |
-| GET | `/api/logs` | 日志查询 |
+| GET | `/api/logs/list` | 日志查询 |
 | POST | `/api/latency` | 延迟测试 |
+| POST | `/api/detect-protocol` | 检测上游协议 |
 
 ---
 
@@ -266,7 +303,13 @@ npm run test     # 测试
 ## 测试
 
 ```bash
+# 全量测试
 python -m pytest tests/ -v
+
+# 仅 IR 抽象层测试
+python -m pytest tests/test_ir_conversions.py tests/test_ir_streaming.py -v
+
+# 冒烟测试
 python tests/smoke_test.py
 ```
 
@@ -276,23 +319,54 @@ python tests/smoke_test.py
 
 ```
 llm-proxy/
-├── llm_proxy/           # Python 后端
-│   ├── main.py          # FastAPI 入口
-│   ├── state.py         # 运行态管理
-│   ├── config_loader.py # 配置加载
-│   ├── routes/          # HTTP 路由（薄层）
-│   ├── handlers/        # Pipeline 处理管道
-│   ├── protocol/        # 协议双向转换（Python 实现）
-│   ├── services/        # 业务服务
-│   ├── infra/           # 基础设施（SQLite/HTTP 客户端）
-│   └── middleware/      # 中间件（request_id/access_log）
-├── static/              # 前端（Preact + TypeScript + Vite）
-├── tests/               # 测试
-├── docs/                # 文档
-├── config.example.json  # 配置模板
-├── Dockerfile
-├── docker-compose.yml
-└── start.sh / proxy.py  # 启动入口
+├── llm_proxy/
+│   ├── main.py                    # FastAPI 入口
+│   ├── state.py                   # 运行态管理
+│   ├── config_loader.py           # 配置加载
+│   ├── logging_config.py          # 统一日志格式
+│   ├── routes/                    # HTTP 路由（薄层）
+│   ├── handlers/                  # Pipeline 处理管道
+│   │   ├── base.py                # PipelineContext + HandlerStep + Pipeline
+│   │   ├── *_handler.py           # 各路由 Pipeline 组装
+│   │   └── shared/                # 可复用步骤
+│   │       ├── auth.py
+│   │       ├── model_resolve.py
+│   │       ├── protocol_select.py
+│   │       ├── proxy.py           # 旧 ProxyStep（引用旧通道）
+│   │       └── ir_proxy.py        # 新 IRProxyStep（引用 IR 层）
+│   ├── protocol/                  # 协议转换层
+│   │   ├── capabilities.py        # 协议可达性表 + 上游选择算法
+│   │   ├── ir/                    # ★ IR 抽象层（新增）
+│   │   │   ├── __init__.py        #   ProtocolConverter 基类 + REGISTRY
+│   │   │   ├── types.py           #   IRRequest/IRResponse/IRMessage/IRContentBlock
+│   │   │   ├── _common.py         #   共享工具函数
+│   │   │   ├── _stream.py         #   流式工具函数
+│   │   │   ├── anthropic.py       #   Anthropic ↔ IR
+│   │   │   ├── chat.py            #   Chat ↔ IR
+│   │   │   └── responses.py       #   Responses ↔ IR
+│   │   ├── anthropic_openai/      # Anthropic ↔ Chat（旧通道，保留兼容）
+│   │   ├── responses_chat/        # Responses ↔ Chat（旧通道，保留兼容）
+│   │   ├── errors.py              # 错误格式化
+│   │   ├── sse.py                 # SSE 透传
+│   │   └── think_tag.py           # Think 标签检测
+│   ├── services/                  # 业务服务
+│   │   ├── tool_call_fix.py       # Tool call 修复
+│   │   ├── vision_service.py      # 图像→文本降级
+│   │   └── input_compressor.py    # RTK 输入压缩
+│   ├── infra/                     # 基础设施层
+│   │   ├── db.py                  # SQLite 操作
+│   │   ├── http_client.py         # 全局 HTTP 客户端
+│   │   └── archive.py             # 用量记录
+│   └── middleware/                # 中间件
+│       ├── request_id.py
+│       ├── access_log.py
+│       └── catch_all_exceptions.py
+├── static/                        # 前端（Preact + TypeScript + Vite）
+├── tests/                         # 测试
+├── docs/                          # 文档
+├── config.example.json            # 配置模板
+├── Dockerfile / docker-compose.yml
+└── start.sh                       # 启动入口
 ```
 
 ---
@@ -303,4 +377,5 @@ llm-proxy/
 
 本软件使用 [GNU Affero General Public License v3.0](https://www.gnu.org/licenses/agpl-3.0.html) 发布。
 
-简而言之：你可以自由使用、修改、分发本软件，但**如果你将其用于商业用途（包括但不限于作为商业服务的后端组件），你必须将完整的源代码（包括你的修改和与之交互的完整系统）以同样的许可证开放给所有用户。**
+简而言之：你可以自由使用、修改、分发本软件，但如果你将其用于商业用途（包括但不限于作为商业服务的后端组件），你必须将完整的源代码（包括你的修改和与之交互的完整系统）以同样的许可证开放给所有用户。
+
