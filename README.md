@@ -7,7 +7,16 @@
   <img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License AGPL-3.0">
 </p>
 
-**LLM Proxy** — 一个基于 FastAPI 的 LLM API 聚合网关，支持多模型、多协议的双向格式转换。Anthropic Messages、OpenAI Chat Completions、OpenAI Responses API 三种请求格式均可路由到任意格式的上游模型。
+**LLM Proxy** — 一个基于 FastAPI 的 LLM API 聚合网关，支持多模型、多协议的**双向格式转换**。你可以用任一种协议格式请求，代理自动转换为目标上游所需的协议格式。
+
+目前支持的协议转换：
+
+| 请求格式 | 可转换的上游格式 | 请求路由 |
+| Anthropic Messages | Anthropic Messages / OpenAI Chat Completions | `/v1/messages` |
+| OpenAI Chat Completions | OpenAI Chat Completions / Anthropic Messages | `/v1/chat/completions` |
+| OpenAI Responses | OpenAI Chat Completions | `/v1/responses` |
+
+→ **Anthropic 、 OpenAI Chat Completions 和 OpenAI Responses 三种请求格式均可由指定路径路由到任意格式的上游模型。**
 
 ---
 
@@ -378,4 +387,3 @@ llm-proxy/
 本软件使用 [GNU Affero General Public License v3.0](https://www.gnu.org/licenses/agpl-3.0.html) 发布。
 
 简而言之：你可以自由使用、修改、分发本软件，但如果你将其用于商业用途（包括但不限于作为商业服务的后端组件），你必须将完整的源代码（包括你的修改和与之交互的完整系统）以同样的许可证开放给所有用户。
-
