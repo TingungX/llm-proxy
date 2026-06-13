@@ -263,6 +263,11 @@ def response_from_ir(ir: IRResponse) -> dict[str, Any]:
                 "name": block.name,
                 "input": block.input,
             })
+        elif isinstance(block, IRRedactedThinkingBlock):
+            content_blocks.append({
+                "type": "redacted_thinking",
+                "data": block.data,
+            })
 
     if not content_blocks:
         content_blocks.append({"type": "text", "text": ""})

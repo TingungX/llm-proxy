@@ -161,8 +161,12 @@ class IRProxyStep(HandlerStep):
 
         if resp.status_code >= 400:
             self._record_usage(ctx, 0, 0, status="error", error_type=f"upstream_{resp.status_code}")
-            # 直接透传错误
-            raise  # 让上层 catch_all_exceptions 处理
+            # 透传上游错误响应（保留原始 status_code 和 body）
+            ctx.response = JSONResponse(
+                upstream_resp_body if isinstance(upstream_resp_body, dict) else {"error": {"message": str(upstream_resp_body)}},
+                status_code=resp.status_code,
+            )
+            return
 
         # IR → client
         ir_response = REGISTRY[upstream_proto].response_to_ir(upstream_resp_body)
@@ -199,7 +203,7 @@ class IRProxyStep(HandlerStep):
             events: AsyncIterator[IRStreamEvent],
         ) -> AsyncIterator[IRStreamEvent]:
             """包装 IR events 流，提取 usage / 错误状态。"""
-            nonlocal accumulated_input, accumulated_output, had_error
+            nonlocal accumulated_input, accumulated_output, had_error, stop_reason
             async for ev in events:
                 if ev.type == "usage":
                     data = ev.data or {}

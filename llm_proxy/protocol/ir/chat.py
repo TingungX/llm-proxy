@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 from typing import Any, AsyncIterator
 
@@ -291,8 +292,7 @@ def response_from_ir(ir: IRResponse) -> dict[str, Any]:
     return {
         "id": ir.id or f"chatcmpl-{uuid.uuid4().hex[:24]}",
         "object": "chat.completion",
-        "created": 0,
-        "model": ir.model,
+        "created": int(time.time()),
         "choices": [{
             "index": 0,
             "message": message,
@@ -733,6 +733,9 @@ async def format_ir_as_sse(
     Chat 流式无复杂状态机：每个 IR 事件 → 一个 Chat chunk。
     """
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created_ts = int(time.time())
+    tool_index = 0  # 每个 tool_call 需要独立的递增 index
+    active_tool_index = 0  # 当前活跃 tool_call 的 index（用于 delta）
 
     async for event in events:
         etype = event.type
@@ -743,7 +746,7 @@ async def format_ir_as_sse(
             yield sse_format_data_only({
                 "id": data.get("id") or chunk_id,
                 "object": "chat.completion.chunk",
-                "created": 0,
+                "created": created_ts,
                 "model": data.get("model") or model,
                 "choices": [{
                     "index": 0,
@@ -763,7 +766,7 @@ async def format_ir_as_sse(
                 yield sse_format_data_only({
                     "id": chunk_id,
                     "object": "chat.completion.chunk",
-                    "created": 0,
+                    "created": created_ts,
                     "model": model,
                     "choices": [{
                         "index": 0,
@@ -785,7 +788,7 @@ async def format_ir_as_sse(
                 yield sse_format_data_only({
                     "id": chunk_id,
                     "object": "chat.completion.chunk",
-                    "created": 0,
+                    "created": created_ts,
                     "model": model,
                     "choices": [{
                         "index": 0,
@@ -800,15 +803,17 @@ async def format_ir_as_sse(
         elif etype == "tool_use_start":
             tool_id = data.get("id", f"call_{uuid.uuid4().hex[:24]}")
             tool_name = data.get("name", "")
+            active_tool_index = tool_index
+            tool_index += 1
             yield sse_format_data_only({
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
-                "created": 0,
+                "created": created_ts,
                 "model": model,
                 "choices": [{
                     "index": 0,
                     "delta": {"tool_calls": [{
-                        "index": 0,
+                        "index": active_tool_index,
                         "id": tool_id,
                         "type": "function",
                         "function": {"name": tool_name, "arguments": ""},
@@ -822,12 +827,12 @@ async def format_ir_as_sse(
             yield sse_format_data_only({
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
-                "created": 0,
+                "created": created_ts,
                 "model": model,
                 "choices": [{
                     "index": 0,
                     "delta": {"tool_calls": [{
-                        "index": 0,
+                        "index": active_tool_index,
                         "function": {"arguments": args_delta},
                     }]},
                     "finish_reason": None,
@@ -848,7 +853,7 @@ async def format_ir_as_sse(
             yield sse_format_data_only({
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
-                "created": 0,
+                "created": created_ts,
                 "model": model,
                 "choices": [],
                 "usage": chat_usage,
@@ -866,7 +871,7 @@ async def format_ir_as_sse(
             yield sse_format_data_only({
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
-                "created": 0,
+                "created": created_ts,
                 "model": model,
                 "choices": [{
                     "index": 0,

@@ -36,7 +36,9 @@ from llm_proxy.protocol.ir.responses import (
 from llm_proxy.protocol.ir.types import (
     IRImageBlock,
     IRMessage,
+    IRRedactedThinkingBlock,
     IRRequest,
+    IRResponse,
     IRTextBlock,
     IRThinkingBlock,
     IRToolDef,
@@ -862,3 +864,46 @@ class TestRegistryConsistency:
         })
         assert result["model"] == "gpt-5"
 
+
+# ── 回归测试（review 修复点）───────────────────────────────────────
+
+
+class TestRedactedThinkingRoundTrip:
+    """N1 修复：redacted_thinking 在 IR ↔ Anthropic 双向必须保留。"""
+
+    def test_response_to_ir_recognizes_redacted_thinking(self):
+        """Anthropic 响应含 redacted_thinking → IRRedactedThinkingBlock（不丢 data）。"""
+        body = {
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "redacted_thinking", "data": "encrypted_blob_xyz"},
+            ],
+            "stop_reason": "end_turn",
+            "model": "claude",
+        }
+        ir = anthropic_response_to_ir(body)
+        types = [b.type for b in ir.content_blocks]
+        assert "redacted_thinking" in types
+        # data 必须保留
+        redacted = next(b for b in ir.content_blocks if b.type == "redacted_thinking")
+        assert redacted.data == "encrypted_blob_xyz"
+
+    def test_response_from_ir_emits_redacted_thinking(self):
+        """IRRedactedThinkingBlock → Anthropic 响应的 redacted_thinking block。"""
+        ir = IRResponse(
+            id="msg_1",
+            model="claude",
+            content_blocks=[
+                IRTextBlock(text="hi"),
+                IRRedactedThinkingBlock(data="encrypted_blob_xyz"),
+            ],
+            stop_reason="end_turn",
+        )
+        body = anthropic_response_from_ir(ir)
+        blocks = body["content"]
+        redacted = [b for b in blocks if b["type"] == "redacted_thinking"]
+        assert len(redacted) == 1
+        assert redacted[0]["data"] == "encrypted_blob_xyz"

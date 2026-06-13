@@ -828,3 +828,148 @@ class TestKeepaliveWrapper:
         assert "data: first" in text
         assert ": keepalive" in text
         assert "data: second" in text
+
+
+# ── 回归测试（review 修复点）───────────────────────────────────────
+
+
+class TestRegressionReviewFixes:
+    """针对第二轮 review 找出的问题的回归测试。"""
+
+    async def test_responses_streaming_output_items_populated(self):
+        """S2: response.completed 的 output 数组必须包含已闭合的 items。"""
+        sse = [
+            'data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5","status":"in_progress","output":[]}}',
+            '',
+            'data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message","status":"in_progress","content":[],"role":"assistant"}}',
+            '',
+            'data: {"type":"response.content_part.added","item_id":"msg_1","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}',
+            '',
+            'data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"Hi"}',
+            '',
+            'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_1","type":"message","status":"completed","content":[{"type":"output_text","text":"Hi"}],"role":"assistant"}}',
+            '',
+            'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":5}}}',
+            '',
+        ]
+        resp = MockResp(sse)
+        events = responses_parse(resp, model="gpt-5")
+
+        chunks = []
+        async for b in responses_format(events, model="gpt-5"):
+            chunks.append(b)
+        text = b"".join(chunks).decode()
+
+        # 找到 response.completed 事件
+        import re
+        m = re.search(r"event: response\.completed\ndata: (.+)\n\n", text)
+        assert m is not None, "response.completed event not found"
+        payload = json.loads(m.group(1))
+        completed = payload.get("response", payload)
+        # output 不应该是空
+        assert len(completed.get("output", [])) >= 1
+        msg_item = completed["output"][0]
+        assert msg_item["type"] == "message"
+        assert msg_item["content"][0]["text"] == "Hi"
+
+    async def test_responses_function_calls_have_unique_output_index(self):
+        """S5: 多个 function_call 的 output_index 必须递增，不能共享同一 index。"""
+        sse = [
+            'data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5","status":"in_progress","output":[]}}',
+            '',
+            'data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","type":"function_call","status":"in_progress","call_id":"c1","name":"a","arguments":""}}',
+            '',
+            'data: {"type":"response.output_item.added","output_index":1,"item":{"id":"fc_2","type":"function_call","status":"in_progress","call_id":"c2","name":"b","arguments":""}}',
+            '',
+            'data: {"type":"response.function_call_arguments.done","item_id":"fc_1","output_index":0,"arguments":"{}"}',
+            '',
+            'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_1","type":"function_call","status":"completed","arguments":"{}","call_id":"c1","name":"a"}}',
+            '',
+            'data: {"type":"response.function_call_arguments.done","item_id":"fc_2","output_index":1,"arguments":"{}"}',
+            '',
+            'data: {"type":"response.output_item.done","output_index":1,"item":{"id":"fc_2","type":"function_call","status":"completed","arguments":"{}","call_id":"c2","name":"b"}}',
+            '',
+            'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":5}}}',
+            '',
+        ]
+        resp = MockResp(sse)
+        events = responses_parse(resp, model="gpt-5")
+
+        chunks = []
+        async for b in responses_format(events, model="gpt-5"):
+            chunks.append(b)
+        text = b"".join(chunks).decode()
+
+        import re
+        # 找到所有 function_call 的 output_index
+        added_matches = re.findall(
+            r'event: response\.output_item\.added\ndata: (\{.+?\})\n\n', text
+        )
+        output_indexes = []
+        for payload_str in added_matches:
+            payload = json.loads(payload_str)
+            if payload.get("item", {}).get("type") == "function_call":
+                output_indexes.append(payload["output_index"])
+        assert output_indexes == [0, 1], f"Expected [0, 1], got {output_indexes}"
+
+    async def test_chat_tool_call_indices_are_incremented(self):
+        """N3: Chat 流式多个 tool_call 的 index 必须递增。"""
+        async def events_aiter():
+            for e in [
+                IRStreamEvent("message_start", {"id": "x", "model": "gpt-5"}),
+                IRStreamEvent("tool_use_start", {"id": "call_1", "name": "search"}),
+                IRStreamEvent("tool_use_delta", {"id": "call_1", "arguments_delta": '{"q":'}),
+                IRStreamEvent("tool_use_end", {"id": "call_1", "input": {}}),
+                IRStreamEvent("tool_use_start", {"id": "call_2", "name": "fetch"}),
+                IRStreamEvent("tool_use_delta", {"id": "call_2", "arguments_delta": '{"u":'}),
+                IRStreamEvent("tool_use_end", {"id": "call_2", "input": {}}),
+                IRStreamEvent("message_stop", {"stop_reason": "tool_use"}),
+            ]:
+                yield e
+
+        chunks = []
+        async for b in chat_format(events_aiter(), model="gpt-5"):
+            chunks.append(b)
+        text = b"".join(chunks).decode()
+
+        # 解析所有 tool_calls chunks
+        tool_indexes = []
+        for line in text.split("\n\n"):
+            if line.startswith("data: "):
+                try:
+                    payload = json.loads(line[6:])
+                except json.JSONDecodeError:
+                    continue
+                tcs = payload.get("choices", [{}])[0].get("delta", {}).get("tool_calls")
+                if tcs:
+                    for tc in tcs:
+                        if "index" in tc:
+                            tool_indexes.append(tc["index"])
+        # 第一次 tool_use_start 是 0，第二次是 1
+        assert 0 in tool_indexes
+        assert 1 in tool_indexes
+
+    async def test_chat_created_field_is_unix_timestamp(self):
+        """N4: Chat 流式 chunk 的 created 字段必须是 Unix 时间戳（>0）。"""
+        async def events_aiter():
+            for e in [
+                IRStreamEvent("message_start", {"id": "x", "model": "gpt-5"}),
+                IRStreamEvent("text_delta", {"text": "hi"}),
+                IRStreamEvent("message_stop", {"stop_reason": "end_turn"}),
+            ]:
+                yield e
+
+        chunks = []
+        async for b in chat_format(events_aiter(), model="gpt-5"):
+            chunks.append(b)
+        text = b"".join(chunks).decode()
+
+        # 所有 chunk 的 created 字段 > 0
+        for line in text.split("\n\n"):
+            if line.startswith("data: "):
+                try:
+                    payload = json.loads(line[6:])
+                except json.JSONDecodeError:
+                    continue
+                if "created" in payload:
+                    assert payload["created"] > 0, f"created should be > 0, got {payload['created']}"

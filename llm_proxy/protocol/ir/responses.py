@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+import time
 from typing import Any, AsyncIterator
 
 from llm_proxy.protocol.ir._common import (
@@ -440,7 +441,7 @@ def response_from_ir(ir: IRResponse) -> dict[str, Any]:
     result: dict[str, Any] = {
         "id": ir.id or f"resp_{uuid.uuid4().hex[:24]}",
         "object": "response",
-        "created": 0,
+        "created": int(time.time()),
         "model": ir.model,
         "status": status,
         "output": output,
@@ -960,6 +961,7 @@ async def format_ir_as_sse(
     """
     response_id = ""
     seq = 0
+    created_ts = int(time.time())
     reverse_tool_map = reverse_tool_map or {}
     namespace_map = namespace_map or {}
 
@@ -980,6 +982,7 @@ async def format_ir_as_sse(
     has_reasoning = False
     has_text = False
     has_function_calls = False
+    function_call_count = 0  # 每个 function_call 独立 output_index
 
     def next_seq() -> int:
         nonlocal seq
@@ -988,16 +991,8 @@ async def format_ir_as_sse(
         return s
 
     def item_output_index() -> int:
-        # item index 取决于前面的 item 数量
-        idx = 0
-        if has_reasoning:
-            idx += 1
-        if has_text:
-            idx += 1
-        if has_function_calls:
-            # 简化：function_call 共享一个 index（实际更复杂，但本实现足够）
-            pass
-        return idx
+        # output_index = 已闭合的 item 数量（即 all_output_items 的当前长度）
+        return len(all_output_items)
 
     def new_item_id(prefix: str) -> str:
         return f"{prefix}_{uuid.uuid4().hex[:24]}"
@@ -1041,6 +1036,13 @@ async def format_ir_as_sse(
                     "summary": [{"type": "summary_text", "text": reasoning_buf}],
                 },
             }))
+            # 保存到 all_output_items（必须在清空 buf 前完成）
+            all_output_items.append({
+                "id": current_item_id,
+                "type": "reasoning",
+                "status": "completed",
+                "summary": [{"type": "summary_text", "text": reasoning_buf}],
+            })
             reasoning_buf = ""
         elif current_item_type == "message":
             events_out.append(sse_format("response.output_text.done", {
@@ -1068,7 +1070,15 @@ async def format_ir_as_sse(
                     "role": "assistant",
                 },
             }))
-            text_buf = ""
+            # 保存到 all_output_items（必须在清空 buf 前完成）
+            all_output_items.append({
+                "id": current_item_id,
+                "type": "message",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text_buf}],
+                "role": "assistant",
+            })
+            text_buf = ""  # 立即清空，避免下一轮累积
         elif current_item_type == "function_call":
             # 普通 function_call
             args_raw = tool_args_buf.get(current_tool_call_id, "")
@@ -1093,21 +1103,24 @@ async def format_ir_as_sse(
                 "sequence_number": next_seq(),
                 "item": item_payload,
             }))
+            all_output_items.append(item_payload)
         elif current_item_type == "custom_tool_call":
             # custom_tool_call（apply_patch 反向）
             args_raw = tool_args_buf.get(current_tool_call_id, "")
+            ctc_payload: dict[str, Any] = {
+                "id": current_item_id,
+                "type": "custom_tool_call",
+                "name": current_tool_downstream_name,
+                "status": "completed",
+                "call_id": current_tool_call_id,
+                "input": args_raw,
+            }
             events_out.append(sse_format("response.output_item.done", {
                 "output_index": output_index,
                 "sequence_number": next_seq(),
-                "item": {
-                    "id": current_item_id,
-                    "type": "custom_tool_call",
-                    "name": current_tool_downstream_name,
-                    "status": "completed",
-                    "call_id": current_tool_call_id,
-                    "input": args_raw,
-                },
+                "item": ctc_payload,
             }))
+            all_output_items.append(ctc_payload)
 
         current_item_type = None
         current_item_id = ""
@@ -1123,7 +1136,7 @@ async def format_ir_as_sse(
         "response": {
             "id": f"resp_{uuid.uuid4().hex[:24]}",
             "object": "response",
-            "created": 0,
+            "created": created_ts,
             "model": model,
             "status": "in_progress",
             "output": [],
@@ -1456,7 +1469,7 @@ async def format_ir_as_sse(
     completed_payload: dict[str, Any] = {
         "id": response_id or f"resp_{uuid.uuid4().hex[:24]}",
         "object": "response",
-        "created": 0,
+        "created": created_ts,
         "model": model,
         "status": status,
         "output": all_output_items,
