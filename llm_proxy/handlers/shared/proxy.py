@@ -723,8 +723,8 @@ class ProxyStep(HandlerStep):
                                                "api_error", resp.status_code))
 
             self._record_usage(ctx, endpoint_id, model_id,
-                               usage.get("prompt_tokens", 0),
-                               usage.get("completion_tokens", 0))
+                               resp_body.get("usage", {}).get("prompt_tokens", 0),
+                               resp_body.get("usage", {}).get("completion_tokens", 0))
 
             responses_body = to_responses_response(resp_body, actual_model, reverse_tool_map, namespace_map=namespace_map)
             ctx.response = JSONResponse(responses_body)
