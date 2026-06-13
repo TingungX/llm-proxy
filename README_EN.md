@@ -24,6 +24,7 @@ Supported protocol conversions:
 ## Table of Contents
 
 - [Features](#features)
+- [Architecture](#architecture)
 - [Quick Start](#quick-start)
 - [Deployment](#deployment)
 - [Configuration](#configuration)
@@ -41,19 +42,20 @@ Supported protocol conversions:
 
 LLM Proxy deeply integrates with Codex Desktop's OpenAI Responses API, with full tool conversion support:
 
-Codex Desktop uses the **OpenAI Responses API** protocol. LLM Proxy automatically converts Responses → Chat Completions at `/v1/responses`, with full support for apply_patch, namespace, web_search, and other tool conversions.
+- **Tool conversion**: `apply_patch` (custom) auto-expands into 4 standard file tools (`write_to_file` / `replace_in_file` / `append_to_file` / `delete_file`), then reverses back into `custom_tool_call` events on the response path
+- **Non-standard tool downgrade**: `namespace` recursively flattened, `web_search` downgraded to standard function, other `custom` tools passed through
+- **Think tag extraction**: `<think>` tags from upstream responses are extracted into reasoning/thinking blocks
+- **Protocol conversion**: Automatic bidirectional conversion regardless of upstream format (Chat Completions or Anthropic Messages)
 
 See [`config.toml.example`](config.toml.example) to configure Codex Desktop with this proxy.
 
 ### Other AI Clients
 
-The following AI coding tools are also compatible — just plug them in:
-
 | Tool | Protocol | Route |
 |------|----------|-------|
-| **Claude Code** | Anthropic Messages API | `/v1/messages` |
-| **OpenCode** | OpenAI Chat Completions | `/v1/chat/completions` |
-| Any OpenAI-compatible client | OpenAI Chat Completions | `/v1/chat/completions` |
+| Claude Code | Anthropic Messages API | `/v1/messages` |
+| OpenCode / Any OpenAI-compatible client | OpenAI Chat Completions | `/v1/chat/completions` |
+| Any OpenAI Responses-compatible client | OpenAI Responses API | `/v1/responses` |
 
 Point your tool's `api_base` to this proxy. **One proxy serves all your tools.**
 
@@ -61,14 +63,50 @@ Point your tool's `api_base` to this proxy. **One proxy serves all your tools.**
 
 | Feature | Description |
 |---------|-------------|
-| **Multi-Protocol Bidirectional Conversion** | Anthropic Messages ↔ OpenAI Chat Completions (full bidirectional), OpenAI Responses → Chat Completions |
+| **Full Protocol Interop** | Anthropic / Chat / Responses — any protocol can be routed to any upstream via the IR abstraction layer in a single hop |
+| **Unified IR Abstraction Layer** | `protocol/ir/` — zero-dependency intermediate representation with ProtocolConverter registry pattern; adding a new protocol means implementing a single subclass |
+| **Legacy Channel Compatibility** | `anthropic_openai/` and `responses_chat/` legacy channels preserved in parallel for gradual migration |
 | **Multi-Upstream Aggregation** | One proxy for DeepSeek, MiniMax, GLM (iFlytek), OpenCode, and more |
-| **RTK (Input Compression / Beta)** | Built-in input compression tool (Rust Token Killer), strips CLI output noise from tool_results, truncates long code blocks, collapses blank lines to save input tokens; disabled by default, enable in endpoint config editor (may reduce model quality) |
+| **RTK (Input Compression / Beta)** | Built-in input compression tool (Rust Token Killer), strips CLI output noise from tool_results, truncates long code blocks, collapses blank lines |
 | **Endpoint Authentication** | API-Key-based isolation, each endpoint independently configures available models |
-| **Model Routing & Fallback** | When enabled, model family failover chain, auto-switch on 429/503 |
+| **Model Routing & Fallback** | Model family failover chain, auto-switch on 429/503 |
 | **Request Tracking** | Unique Request ID per call, structured logging, web admin panel filtering |
 | **Tool Format Compatibility** | Auto-conversion for namespace, apply_patch, and other non-standard tool types |
 | **Admin Panel** | Preact + Vite web console for endpoint/model/usage/log management |
+
+---
+
+## Architecture
+
+```
+Request (Anthropic / Chat / Responses)
+  │
+  ▼
+Handler Pipeline (Auth → ModelResolve → ProtocolSelect → ... → Proxy)
+  │
+  ├── Same protocol ──→ Direct passthrough to upstream
+  │
+  └── Cross-protocol ──→ Protocol conversion layer
+                           │
+                           ├── New path (IRProxyStep)
+                           │   └── client_body → IRRequest → upstream_body
+                           │   └── upstream SSE → IRStreamEvent → client SSE
+                           │
+                           └── Legacy path (ProxyStep)
+                               └── anthropic_openai / responses_chat direct conversion
+```
+
+The protocol conversion layer is built around `protocol/ir/`:
+
+```
+                    ┌─────────────┐
+   Anthropic ──────→│             │──────→ Anthropic
+   Chat     ──────→│  IR Layer   │──────→ Chat
+   Responses──────→│ (dataclass) │──────→ Responses
+                    └─────────────┘
+```
+
+Conversion flow: **Request direction** `client_body → to_ir() → IRRequest → to_upstream() → upstream_body`; **Response direction** `upstream_body → response_to_ir() → IRResponse → response_from_ir() → client_body`. IR types are pure dataclasses with zero external dependencies; protocol-specific fields pass through `extensions` dict.
 
 ---
 
@@ -92,20 +130,28 @@ Once running, access the admin panel at http://localhost:4000/static/.
 
 ### Usage Examples
 
-**Anthropic format:**
+**Anthropic format (cross-protocol to OpenAI Chat):**
 ```bash
 curl http://localhost:4000/v1/messages \
   -H "x-api-key: your-endpoint-key" \
   -H "Content-Type: application/json" \
-  -d '{"model": "claude-sonnet-4-5", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 100}'
+  -d '{"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 100}'
 ```
 
-**OpenAI format:**
+**OpenAI Chat format:**
 ```bash
 curl http://localhost:4000/v1/chat/completions \
   -H "x-api-key: your-endpoint-key" \
   -H "Content-Type: application/json" \
   -d '{"model": "gpt-5", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 100}'
+```
+
+**OpenAI Responses format (cross-protocol to Chat):**
+```bash
+curl http://localhost:4000/v1/responses \
+  -H "x-api-key: your-endpoint-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "deepseek-v4-pro", "input": "Hello", "max_output_tokens": 100}'
 ```
 
 ---
@@ -122,7 +168,7 @@ cd static && npm ci && npm run build && cd ..
 docker-compose up -d
 ```
 
-The Dockerfile includes a built-in health check (every 30s via `GET /api/config`), ready to go.
+The Docker image includes a built-in health check (every 30s via `GET /api/config`), ready to go.
 
 ### macOS launchd
 
@@ -198,8 +244,10 @@ Models are configured in `config.json`. Each model entry contains:
 | `api_base` | Upstream API URL (without `/v1/...` suffix) |
 | `api_key` | Upstream API Key |
 | `upstream_model` | Actual model name sent to upstream |
-| `upstream_protocol` | `anthropic` or `openai`, auto-detected when empty |
+| `upstream_protocol` | Scalar field (legacy compat); prefer `upstream_protocols` array |
+| `upstream_protocols` | Array like `["anthropic", "openai"]`, protocol selection is automatic via reachability table |
 | `upstream_paths` | Protocol-specific upstream paths (optional) |
+| `vision_support` | Whether image input is supported |
 
 Endpoints (API key auth, model allowlist, family routing) are configured at runtime via the admin panel or API, stored in SQLite, and support hot reload.
 
@@ -211,11 +259,11 @@ Endpoints (API key auth, model allowlist, family routing) are configured at runt
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/v1/messages` | Anthropic Messages format |
-| POST | `/v1/chat/completions` | OpenAI Chat Completions format |
-| POST | `/v1/responses` | OpenAI Responses format (converted to Chat) |
-
-All requests require `x-api-key` or `Authorization: Bearer` header.
+| POST | `/v1/messages` | Anthropic Messages format (passthrough or cross-protocol) |
+| POST | `/v1/chat/completions` | OpenAI Chat Completions format (passthrough or cross-protocol) |
+| POST | `/v1/responses` | OpenAI Responses format (with apply_patch/namespace tool conversion) |
+| POST | `/v1/messages/count_tokens` | Token counting |
+| GET | `/v1/models` | Model list |
 
 ### Admin API
 
@@ -224,8 +272,9 @@ All requests require `x-api-key` or `Authorization: Bearer` header.
 | GET/PUT | `/api/config` | Read/write configuration |
 | GET/POST/PUT/DEL | `/api/endpoints` | Endpoint CRUD |
 | GET | `/api/usage[?days=&group_by=&granularity=]` | Usage statistics |
-| GET | `/api/logs` | Log query |
+| GET | `/api/logs/list` | Log query |
 | POST | `/api/latency` | Latency test |
+| POST | `/api/detect-protocol` | Detect upstream protocol |
 
 ---
 
@@ -254,7 +303,13 @@ npm run test     # Run tests
 ## Testing
 
 ```bash
+# Full test suite
 python -m pytest tests/ -v
+
+# IR abstraction layer tests only
+python -m pytest tests/test_ir_conversions.py tests/test_ir_streaming.py -v
+
+# Smoke test
 python tests/smoke_test.py
 ```
 
@@ -264,23 +319,54 @@ python tests/smoke_test.py
 
 ```
 llm-proxy/
-├── llm_proxy/           # Python backend
-│   ├── main.py          # FastAPI entry point
-│   ├── state.py         # Runtime state management
-│   ├── config_loader.py # Configuration loader
-│   ├── routes/          # HTTP routes (thin layer)
-│   ├── handlers/        # Pipeline processing
-│   ├── protocol/        # Bidirectional protocol conversion (pure Python)
-│   ├── services/        # Business services
-│   ├── infra/           # Infrastructure (SQLite, HTTP client)
-│   └── middleware/      # Middleware (request_id, access_log)
-├── static/              # Frontend (Preact + TypeScript + Vite)
-├── tests/               # Tests
-├── docs/                # Documentation
-├── config.example.json  # Configuration template
-├── Dockerfile
-├── docker-compose.yml
-└── start.sh / proxy.py  # Startup scripts
+├── llm_proxy/
+│   ├── main.py                    # FastAPI entry point
+│   ├── state.py                   # Runtime state management
+│   ├── config_loader.py           # Configuration loader
+│   ├── logging_config.py          # Unified log format
+│   ├── routes/                    # HTTP routes (thin layer)
+│   ├── handlers/                  # Pipeline processing
+│   │   ├── base.py                # PipelineContext + HandlerStep + Pipeline
+│   │   ├── *_handler.py           # Route-specific pipeline assembly
+│   │   └── shared/                # Reusable steps
+│   │       ├── auth.py
+│   │       ├── model_resolve.py
+│   │       ├── protocol_select.py
+│   │       ├── proxy.py           # Legacy ProxyStep (uses legacy channels)
+│   │       └── ir_proxy.py        # New IRProxyStep (uses IR layer)
+│   ├── protocol/                  # Protocol conversion layer
+│   │   ├── capabilities.py        # Protocol reachability table + upstream selection
+│   │   ├── ir/                    # ★ IR Abstraction Layer (new)
+│   │   │   ├── __init__.py        #   ProtocolConverter base class + REGISTRY
+│   │   │   ├── types.py           #   IRRequest/IRResponse/IRMessage/IRContentBlock
+│   │   │   ├── _common.py         #   Shared utility functions
+│   │   │   ├── _stream.py         #   Streaming utilities
+│   │   │   ├── anthropic.py       #   Anthropic ↔ IR
+│   │   │   ├── chat.py            #   Chat ↔ IR
+│   │   │   └── responses.py       #   Responses ↔ IR
+│   │   ├── anthropic_openai/      # Anthropic ↔ Chat (legacy, retained)
+│   │   ├── responses_chat/        # Responses ↔ Chat (legacy, retained)
+│   │   ├── errors.py              # Error formatting
+│   │   ├── sse.py                 # SSE passthrough
+│   │   └── think_tag.py           # Think tag detection
+│   ├── services/                  # Business services
+│   │   ├── tool_call_fix.py       # Tool call repair
+│   │   ├── vision_service.py      # Image→text fallback
+│   │   └── input_compressor.py    # RTK input compression
+│   ├── infra/                     # Infrastructure layer
+│   │   ├── db.py                  # SQLite operations
+│   │   ├── http_client.py         # Global HTTP client
+│   │   └── archive.py             # Usage recording
+│   └── middleware/                # Middleware
+│       ├── request_id.py
+│       ├── access_log.py
+│       └── catch_all_exceptions.py
+├── static/                        # Frontend (Preact + TypeScript + Vite)
+├── tests/                         # Tests
+├── docs/                          # Documentation
+├── config.example.json            # Configuration template
+├── Dockerfile / docker-compose.yml
+└── start.sh                       # Startup script
 ```
 
 ---
@@ -294,3 +380,4 @@ This software is released under the [GNU Affero General Public License v3.0](htt
 In short: you are free to use, modify, and distribute this software, but **if you use it for commercial purposes (including but not limited to serving as a backend component of a commercial service), you must make the complete source code (including your modifications and the complete system it interacts with) available to all users under the same license.**
 
 Core requirement: **Commercial use requires open source; closed-source commercial use is prohibited.**
+
