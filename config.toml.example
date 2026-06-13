@@ -1,22 +1,74 @@
 # LLM Proxy — Codex Desktop 配置模板
-# 复制到 Codex 的 config.toml 即可使用
 #
-# 位置：
-#   macOS: ~/.config/codex/config.toml 或 ~/Library/Application Support/codex/config.toml
-#   或项目根目录 .codex/config.toml
+# 复制以下内容到 Codex 的 config.toml（~/.codex/config.toml 或 ~/.config/codex/config.toml）
+#
+# 原理：通过 model_providers 定义一个指向本代理的自定义 provider，
+# Codex Desktop 会通过 Responses API 格式与代理通信，代理自动完成跨协议转换。
 
-[models]
-deepseek-v4-pro = { provider = "custom", api_base = "http://localhost:4000/v1/responses", api_key = "YOUR_ENDPOINT_KEY" }
-deepseek-v4-flash = { provider = "custom", api_base = "http://localhost:4000/v1/responses", api_key = "YOUR_ENDPOINT_KEY" }
-GLM-5 = { provider = "custom", api_base = "http://localhost:4000/v1/responses", api_key = "YOUR_ENDPOINT_KEY" }
-"Minimax-M2.7" = { provider = "custom", api_base = "http://localhost:4000/v1/responses", api_key = "YOUR_ENDPOINT_KEY" }
-"minimax-m3" = { provider = "custom", api_base = "http://localhost:4000/v1/responses", api_key = "YOUR_ENDPOINT_KEY" }
+# ── 基础设置 ──────────────────────────────────────────────────────
 
-# 自定义上游（OpenCode 聚合）也可以通过相同代理地址
-og-deepseek-v4-pro = { provider = "custom", api_base = "http://localhost:4000/v1/responses", api_key = "YOUR_ENDPOINT_KEY" }
-og-deepseek-v4-flash = { provider = "custom", api_base = "http://localhost:4000/v1/responses", api_key = "YOUR_ENDPOINT_KEY" }
-og-glm-5 = { provider = "custom", api_base = "http://localhost:4000/v1/responses", api_key = "YOUR_ENDPOINT_KEY" }
-og-glm-5-1 = { provider = "custom", api_base = "http://localhost:4000/v1/responses", api_key = "YOUR_ENDPOINT_KEY" }
-og-kimi-k2-6 = { provider = "custom", api_base = "http://localhost:4000/v1/responses", api_key = "YOUR_ENDPOINT_KEY" }
-og-mimo-v2-5 = { provider = "custom", api_base = "http://localhost:4000/v1/responses", api_key = "YOUR_ENDPOINT_KEY" }
+# 选择模型提供者（对应下方 [model_providers] 中定义的 key）
+model_provider = "llm_proxy"
+
+# 代理端选择模型（对应 config.json 中定义的模型 key）
+model = "deepseek-v4-pro"
+
+# 显式指定 Codex 模式与行为
+sandbox_mode = "danger-full-access"       # 沙箱模式：read-only / workspace-write / danger-full-access
+approval_policy = "never"                 # 审批策略：always / never / moderate
+approvals_reviewer = "user"               # 审批人
+personality = "pragmatic"                 # 个性预设：pragmatic / precise / creative / open
+model_reasoning_effort = "high"           # 推理努力度：none / low / medium / high / xhigh
+disable_response_storage = true           # 是否禁用响应存储
+
+# 模型目录（可选，用于未内建模型提示）
+model_catalog_json = "/path/to/models_catalog.json"
+
+
+# ── 模型提供者定义 ────────────────────────────────────────────────
+
+# model_providers 表用于定义自定义 API 后端。
+# wire_api 必须为 "responses"（Codex 只支持 Responses API 格式）。
+# env_key 指定从环境变量读取 API Key 的变量名。
+
+[model_providers.llm_proxy]
+name = "LLM Proxy"                                     # 显示名称
+base_url = "http://127.0.0.1:4000/v1"                  # 代理地址（不含 /responses）
+wire_api = "responses"                                  # 固定为 responses（Codex 原生协议）
+env_key = "LLM_PROXY_API_KEY"                           # API Key 环境变量名
+
+
+# ── 可选的第二个 provider（直连 OpenAI）─────────────────────────
+
+# [model_providers.openai_direct]
+# name = "OpenAI Direct"
+# base_url = "https://api.openai.com/v1"
+# wire_api = "responses"
+# env_key = "OPENAI_API_KEY"
+
+
+# ── 功能开关 ──────────────────────────────────────────────────────
+
+[features]
+js_repl = false                            # JavaScript REPL（需要 node_repl MCP）
+memories = true                            # 记忆功能
+multi_agent = true                         # 多 agent 并行
+
+[features.multi_agent_v2]
+enabled = true
+
+
+# ── 通知（可选，macOS）────────────────────────────────────────────
+
+notify = [
+    "/path/to/notifier",   # 可选的通知程序路径
+    "turn-ended",
+]
+
+
+# ── 项目信任（可选，避免每次确认）────────────────────────────────
+
+# [projects."/path/to/your/project"]
+# trust_level = "trusted"
+
 
