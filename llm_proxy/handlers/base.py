@@ -37,7 +37,7 @@ class PipelineContext:
     upstream_protocol: str = ""
     converter: str | None = None  # "responses_to_chat" | "chat_to_responses" | None
     reverse_tool_map: dict | None = None
-    namespace_map: dict | None = None  # 子工具名 → server_label（namespace 展开时填充）
+    tool_spec_map: dict | None = None  # 上游工具名 → CodexToolSpec（namespace 展开等工具元信息）
     response: JSONResponse | StreamingResponse | None = None
 
     # 额外数据
@@ -68,4 +68,3 @@ class Pipeline:
         if ctx.error_protocol == "anthropic":
             raise PipelineStop(make_anthropic_error("No response generated", "server_error", 500))
         raise PipelineStop(make_openai_error("No response generated", "server_error", 500))
-

@@ -3,6 +3,7 @@ import json
 import pytest
 from llm_proxy.protocol.responses_chat.stream import StreamState
 from llm_proxy.protocol.responses_chat.request import (
+    CodexToolSpec,
     convert_chunk_to_events,
     make_response_completed_event,
     make_sse_event,
@@ -290,7 +291,7 @@ class TestConvertToolsToChatCustomPassthrough:
         assert len(result) == 5
         names = [t["function"]["name"] for t in result]
         assert "write_to_file" in names
-        assert "spawn_agent" in names
+        assert "multi_agent_v1.spawn_agent" in names
         assert reverse_map["write_to_file"] == "apply_patch"
         # namespace 子工具以 function_call 格式返回给客户端，不写入 reverse_tool_map
         assert "spawn_agent" not in reverse_map
@@ -555,29 +556,32 @@ class TestStreamChatToResponsesEmptyChoices:
 class TestMcpCallStreaming:
     """namespace 子工具在流式场景下应产出 function_call+namespace 事件"""
 
+    def _ns_spec(self, name: str, namespace: str) -> CodexToolSpec:
+        return CodexToolSpec(kind="namespace", name=name, namespace=namespace)
+
     def test_namespace_tool_call_produces_function_call_with_namespace(self):
         """namespace 子工具应产出 function_call + namespace 字段的 output_item.added"""
-        nsmap = {"search": "web_search"}
-        state = StreamState(namespace_map=nsmap)
+        nsmap = {"web_search.search": self._ns_spec("search", "web_search")}
+        state = StreamState(tool_spec_map=nsmap)
 
         # 1) tool call id → output_item.added (type: function_call, namespace: web_search)
-        events1 = state.handle_tool_call_id(0, "call_mcp1", "search")
+        events1 = state.handle_tool_call_id(0, "call_mcp1", "web_search.search")
         parsed1 = _parse_events(events1)
         added = [e for e in parsed1 if e["type"] == "response.output_item.added"]
         assert len(added) == 1
         item = added[0]["item"]
         assert item["type"] == "function_call"
-        assert item["name"] == "search"
+        assert item["name"] == "search"  # 恢复原始子工具名
         assert item["namespace"] == "web_search"
         assert item["status"] == "in_progress"
 
-        # 2) arguments delta → function_call_arguments.delta（Codex 不认 mcp_call 事件）
+        # 2) arguments delta → function_call_arguments.delta
         events2 = state.handle_tool_call_args_delta(0, '{"query":')
         parsed2 = _parse_events(events2)
         delta_types = [e["type"] for e in parsed2]
         assert "response.function_call_arguments.delta" in delta_types
 
-        # 3) finish_reason → close_func_blocks → function_call_arguments.done + output_item.done
+        # 3) finish_reason → close_func_blocks → done
         chunk = {
             "id": "chatcmpl-123",
             "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
@@ -587,23 +591,23 @@ class TestMcpCallStreaming:
         done_types = [e["type"] for e in parsed3]
         assert "response.function_call_arguments.done" in done_types
         assert "response.output_item.done" in done_types
-
-        # 验证 output_item.done 的 item type
         done_item = [e for e in parsed3 if e["type"] == "response.output_item.done"][0]
         assert done_item["item"]["type"] == "function_call"
+        assert done_item["item"]["name"] == "search"
         assert done_item["item"]["namespace"] == "web_search"
         assert done_item["item"]["status"] == "completed"
 
     def test_mixed_namespace_and_plain_function_call_streaming(self):
         """混合 namespace 子工具和普通 function 工具时，各自产出正确事件类型"""
-        nsmap = {"search": "web_search"}
-        state = StreamState(namespace_map=nsmap)
+        nsmap = {"web_search.search": self._ns_spec("search", "web_search")}
+        state = StreamState(tool_spec_map=nsmap)
 
-        # namespace 子工具 (index 0)
-        events1 = state.handle_tool_call_id(0, "call_mcp1", "search")
+        # namespace 子工具 (index 0) — 使用限定的上游名
+        events1 = state.handle_tool_call_id(0, "call_mcp1", "web_search.search")
         parsed1 = _parse_events(events1)
         added_ns = [e for e in parsed1 if e["type"] == "response.output_item.added"][0]
         assert added_ns["item"]["type"] == "function_call"
+        assert added_ns["item"]["name"] == "search"
         assert added_ns["item"]["namespace"] == "web_search"
 
         # 普通 function 工具 (index 1)
@@ -613,25 +617,18 @@ class TestMcpCallStreaming:
         assert added_fn["item"]["type"] == "function_call"
         assert "namespace" not in added_fn["item"]
 
-        # arguments delta — 两者都用 function_call_arguments.delta
         events3 = state.handle_tool_call_args_delta(0, '{"q":')
         events4 = state.handle_tool_call_args_delta(1, '{"city":')
-        parsed3 = _parse_events(events3)
-        parsed4 = _parse_events(events4)
-        assert "response.function_call_arguments.delta" in [e["type"] for e in parsed3]
-        assert "response.function_call_arguments.delta" in [e["type"] for e in parsed4]
-
-        # 关闭
         events5 = state.close_func_blocks()
         parsed5 = _parse_events(events5)
-        done_types = [e["type"] for e in parsed5]
-        assert "response.function_call_arguments.done" in done_types
         done_items = [e for e in parsed5 if e["type"] == "response.output_item.done"]
-        # 两个都是 function_call，但一个有 namespace
         items_with_ns = [e for e in done_items if e["item"].get("namespace")]
         items_without_ns = [e for e in done_items if not e["item"].get("namespace")]
         assert len(items_with_ns) == 1
+        assert items_with_ns[0]["item"]["name"] == "search"
+        assert items_with_ns[0]["item"]["namespace"] == "web_search"
         assert len(items_without_ns) == 1
+        assert items_without_ns[0]["item"]["name"] == "get_weather"
 
     def test_namespace_with_mcp_prefix(self):
         """mcp__web_search namespace 的子工具应保留原始 namespace 名"""
@@ -647,20 +644,25 @@ class TestMcpCallStreaming:
             ],
         }]
         _, _, nsmap = convert_tools_to_chat(tools)
-        assert nsmap["search"] == "mcp__web_search"
-        assert nsmap["fetch_url"] == "mcp__web_search"
+        assert nsmap["mcp__web_search.search"].kind == "namespace"
+        assert nsmap["mcp__web_search.search"].name == "search"
+        assert nsmap["mcp__web_search.search"].namespace == "mcp__web_search"
+        assert nsmap["mcp__web_search.fetch_url"].kind == "namespace"
+        assert nsmap["mcp__web_search.fetch_url"].name == "fetch_url"
+        assert nsmap["mcp__web_search.fetch_url"].namespace == "mcp__web_search"
 
-        state = StreamState(namespace_map=nsmap)
-        events = state.handle_tool_call_id(0, "call_ws1", "search")
+        state = StreamState(tool_spec_map=nsmap)
+        events = state.handle_tool_call_id(0, "call_ws1", "mcp__web_search.search")
         parsed = _parse_events(events)
         added = [e for e in parsed if e["type"] == "response.output_item.added"][0]
+        assert added["item"]["name"] == "search"
         assert added["item"]["namespace"] == "mcp__web_search"
 
-    def test_reverse_tool_map_takes_priority_over_namespace_map(self):
+    def test_reverse_tool_map_takes_priority_over_tool_spec_map(self):
         """reverse_tool_map 命中时应优先走 custom_tool_call"""
         state = StreamState(
             reverse_tool_map={"search": "search"},
-            namespace_map={"search": "web_search"},
+            tool_spec_map={"search": self._ns_spec("search", "web_search")},
         )
         events = state.handle_tool_call_id(0, "call_1", "search")
         parsed = _parse_events(events)
@@ -669,9 +671,9 @@ class TestMcpCallStreaming:
 
     def test_build_output_items_namespace_function_call(self):
         """_build_output_items 应为 namespace 子工具生成 function_call+namespace 的 item"""
-        nsmap = {"search": "web_search"}
-        state = StreamState(namespace_map=nsmap)
-        state.handle_tool_call_id(0, "call_mcp1", "search")
+        nsmap = {"web_search.search": self._ns_spec("search", "web_search")}
+        state = StreamState(tool_spec_map=nsmap)
+        state.handle_tool_call_id(0, "call_mcp1", "web_search.search")
         state.handle_tool_call_args_delta(0, '{"query": "weather"}')
         items = state._build_output_items()
         assert len(items) == 1

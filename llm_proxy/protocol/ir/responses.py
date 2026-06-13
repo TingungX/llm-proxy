@@ -117,13 +117,13 @@ def to_ir(body: dict[str, Any]) -> IRRequest:
     # tools — 处理 apply_patch / namespace / web_search 等
     tools = body.get("tools") or []
     if tools:
-        ir_tools, reverse_tool_map, namespace_map = _convert_tools_to_ir(tools)
+        ir_tools, reverse_tool_map, tool_spec_map = _convert_tools_to_ir(tools)
         if ir_tools:
             ir_request.tools = ir_tools
         if reverse_tool_map:
             ir_request.extensions["reverse_tool_map"] = reverse_tool_map
-        if namespace_map:
-            ir_request.extensions["namespace_map"] = namespace_map
+        if tool_spec_map:
+            ir_request.extensions["tool_spec_map"] = tool_spec_map
 
     if "tool_choice" in body:
         ir_request.tool_choice = body["tool_choice"]
@@ -250,15 +250,16 @@ def _extract_reasoning_text(item: dict) -> str:
     return ""
 
 
-def _convert_tools_to_ir(tools: list) -> tuple[list[IRToolDef], dict[str, str], dict[str, str]]:
-    """Responses tools → (IRToolDef list, reverse_tool_map, namespace_map)。
+def _convert_tools_to_ir(tools: list) -> tuple[list[IRToolDef], dict[str, str], dict[str, dict]]:
+    """Responses tools → (IRToolDef list, reverse_tool_map, tool_spec_map)。
 
     处理 custom / namespace / web_search / function 等类型。
     apply_patch 展开为 4 个标准文件工具。
+    tool_spec_map 的 value 为 {"kind": "...", "name": "...", "namespace": "..."}。
     """
     ir_tools: list[IRToolDef] = []
     reverse_tool_map: dict[str, str] = {}
-    namespace_map: dict[str, str] = {}
+    tool_spec_map: dict[str, dict] = {}
 
     # 客户端侧工具：跳过
     CLIENT_SIDE_TOOLS = {"tool_search", "web_search"}
@@ -285,6 +286,7 @@ def _convert_tools_to_ir(tools: list) -> tuple[list[IRToolDef], dict[str, str], 
                 parameters=clean_schema(_normalize_params(tool.get("parameters"))),
             ))
             reverse_tool_map[name] = name
+            tool_spec_map[name] = {"kind": "custom", "name": name}
             continue
 
         if tool_type == "namespace":
@@ -293,12 +295,15 @@ def _convert_tools_to_ir(tools: list) -> tuple[list[IRToolDef], dict[str, str], 
                 if not isinstance(sub, dict) or sub.get("type") != "function":
                     continue
                 sub_name = sub.get("name", "")
+                chat_name = f"{ns_name}.{sub_name}"
                 ir_tools.append(IRToolDef(
-                    name=sub_name,
+                    name=chat_name,
                     description=sub.get("description", ""),
                     parameters=clean_schema(_normalize_params(sub.get("parameters"))),
                 ))
-                namespace_map[sub_name] = ns_name
+                tool_spec_map[chat_name] = {
+                    "kind": "namespace", "name": sub_name, "namespace": ns_name,
+                }
             continue
 
         if tool_type == "web_search":
@@ -337,7 +342,7 @@ def _convert_tools_to_ir(tools: list) -> tuple[list[IRToolDef], dict[str, str], 
             parameters=clean_schema(_normalize_params(tool.get("parameters"))),
         ))
 
-    return ir_tools, reverse_tool_map, namespace_map
+    return ir_tools, reverse_tool_map, tool_spec_map
 
 
 def _normalize_params(params) -> dict:
@@ -932,7 +937,7 @@ async def format_ir_as_sse(
     model: str,
     *,
     reverse_tool_map: dict | None = None,
-    namespace_map: dict | None = None,
+    tool_spec_map: dict | None = None,
 ) -> AsyncIterator[bytes]:
     """IRStreamEvent 序列 → OpenAI Responses API SSE 字节流。
 
@@ -956,14 +961,14 @@ async def format_ir_as_sse(
     reverse_tool_map 命中时：
     - tool_use_end 的 input 用 reverse_tool_args_to_apply_patch 反向构造
     - 走 custom_tool_call 事件序列（不是 function_call）
-    namespace_map 命中时：
-    - 普通 function_call，但附加 namespace 字段
+    tool_spec_map 命中且子工具时：
+    - 普通 function_call，但使用原始 sub-tool 名，附加 namespace 字段
     """
     response_id = ""
     seq = 0
     created_ts = int(time.time())
     reverse_tool_map = reverse_tool_map or {}
-    namespace_map = namespace_map or {}
+    tool_spec_map = tool_spec_map or {}
 
     # 当前 item 状态
     current_item_type: str | None = None  # "reasoning" / "message" / "function_call" / "custom_tool_call"
@@ -977,7 +982,7 @@ async def format_ir_as_sse(
     current_tool_call_id: str = ""
     current_tool_name: str = ""
     current_tool_downstream_name: str = ""  # reverse_tool_map[name] 后的名
-    current_tool_server_label: str = ""  # namespace_map[name] 后的名
+    current_tool_spec: dict = {}  # tool_spec_map[name] 的 spec 副本
 
     has_reasoning = False
     has_text = False
@@ -1004,7 +1009,7 @@ async def format_ir_as_sse(
         """
         nonlocal current_item_type, current_item_id, reasoning_buf, text_buf
         nonlocal current_tool_call_id, current_tool_name
-        nonlocal current_tool_downstream_name, current_tool_server_label
+        nonlocal current_tool_downstream_name, current_tool_spec
         events_out: list[bytes] = []
         if current_item_type is None:
             return events_out
@@ -1096,8 +1101,9 @@ async def format_ir_as_sse(
                 "call_id": current_tool_call_id,
                 "name": current_tool_name,
             }
-            if current_tool_server_label:
-                item_payload["namespace"] = current_tool_server_label
+            if current_tool_spec.get("kind") == "namespace" and current_tool_spec.get("namespace"):
+                item_payload["name"] = current_tool_spec["name"]
+                item_payload["namespace"] = current_tool_spec["namespace"]
             events_out.append(sse_format("response.output_item.done", {
                 "output_index": output_index,
                 "sequence_number": next_seq(),
@@ -1127,7 +1133,7 @@ async def format_ir_as_sse(
         current_tool_call_id = ""
         current_tool_name = ""
         current_tool_downstream_name = ""
-        current_tool_server_label = ""
+        current_tool_spec = {}
         return events_out
 
     # ── 起始：response.created ──
@@ -1279,7 +1285,8 @@ async def format_ir_as_sse(
 
             # 决定是 custom_tool_call 还是 function_call
             downstream_name = reverse_tool_map.get(upstream_name)
-            server_label = namespace_map.get(upstream_name)
+            spec = tool_spec_map.get(upstream_name, {})
+            current_tool_spec = spec
 
             if downstream_name is not None:
                 # apply_patch 反向：custom_tool_call（参数一次性 emit）
@@ -1301,18 +1308,18 @@ async def format_ir_as_sse(
             else:
                 # 普通 function_call（可流式发 arguments delta）
                 current_item_type = "function_call"
-                current_tool_server_label = server_label or ""
+                current_tool_spec = spec
                 output_index = item_output_index()
                 added_item: dict[str, Any] = {
                     "id": current_item_id,
                     "type": "function_call",
                     "status": "in_progress",
                     "call_id": tool_call_id,
-                    "name": upstream_name,
+                    "name": spec.get("name", upstream_name),
                     "arguments": "",
                 }
-                if server_label:
-                    added_item["namespace"] = server_label
+                if spec.get("kind") == "namespace" and spec.get("namespace"):
+                    added_item["namespace"] = spec["namespace"]
                 yield sse_format("response.output_item.added", {
                     "output_index": output_index,
                     "sequence_number": next_seq(),

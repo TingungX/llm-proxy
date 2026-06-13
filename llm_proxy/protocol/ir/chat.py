@@ -726,7 +726,7 @@ async def format_ir_as_sse(
     model: str,
     *,
     reverse_tool_map: dict | None = None,
-    namespace_map: dict | None = None,
+    tool_spec_map: dict | None = None,
 ) -> AsyncIterator[bytes]:
     """IRStreamEvent 序列 → OpenAI Chat SSE 字节流。
 

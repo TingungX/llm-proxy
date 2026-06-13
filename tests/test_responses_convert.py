@@ -1,10 +1,10 @@
-"""Regression tests for ResponsesConvertStep — bug fix for `namespace_map` UnboundLocalError.
+"""Regression tests for ResponsesConvertStep — bug fix for `tool_spec_map` UnboundLocalError.
 
 背景：
   Codex 在 compact 完成后的下一轮请求会省略 `tools` 字段。
   `llm_proxy/handlers/shared/responses_convert.py` 的 `ResponsesConvertStep.execute()`
-  在 `if body.get("tools"):` 块里才给 `namespace_map` 赋值，但函数末尾无条件
-  访问 `namespace_map`（line ~117 `ctx.namespace_map = namespace_map or None`），
+  在 `if body.get("tools"):` 块里才给 `tool_spec_map` 赋值，但函数末尾无条件
+  访问 `tool_spec_map`（line ~117 `ctx.tool_spec_map = tool_spec_map or None`），
   导致 Codex 每次 compact 后下一轮 100% 抛 `UnboundLocalError`，HTTP 500。
 
 证据：
@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 
 from llm_proxy.handlers.base import PipelineContext
 from llm_proxy.handlers.shared.responses_convert import ResponsesConvertStep
+from llm_proxy.protocol.responses_chat.request import CodexToolSpec
 
 
 # 来自 Codex 16:42 / 17:00 真实 payload 模式的 6 元组
@@ -63,8 +64,8 @@ class TestResponsesConvertStepNoTools:
     def test_no_tools_field_at_all_does_not_raise(self):
         """17:00-17:01 真实场景：body 中完全没有 `tools` 键。
 
-        修复前：抛 UnboundLocalError: cannot access local variable 'namespace_map'...
-        修复后：干净返回，ctx.namespace_map 被设为 None（or {} 的结果）。
+        修复前：抛 UnboundLocalError: cannot access local variable 'tool_spec_map'...
+        修复后：干净返回，ctx.tool_spec_map 被设为 None（or {} 的结果）。
         """
         # 来自 17:00:07 [7c9c5d83] 的真实 input 结构
         ctx = _make_ctx({
@@ -83,8 +84,8 @@ class TestResponsesConvertStepNoTools:
         # 修复前：会抛 UnboundLocalError
         _execute(ctx)
 
-        # 修复后：ctx.namespace_map 应该是 None（empty dict 走 `or None` 分支）
-        assert ctx.namespace_map is None
+        # 修复后：ctx.tool_spec_map 应该是 None（empty dict 走 `or None` 分支）
+        assert ctx.tool_spec_map is None
         assert ctx.reverse_tool_map is None
         # ctx.body 应该是转换后的 chat_body
         assert "messages" in ctx.body
@@ -102,13 +103,13 @@ class TestResponsesConvertStepNoTools:
 
         _execute(ctx)
 
-        assert ctx.namespace_map is None
+        assert ctx.tool_spec_map is None
         assert ctx.reverse_tool_map is None
 
     def test_with_tools_still_works(self):
         """Sanity 检查：带 tools 的请求（原有 happy path）必须不受影响。
 
-        修复不能破坏现有行为：function tool 应该被转换，namespace_map
+        修复不能破坏现有行为：function tool 应该被转换，tool_spec_map
         在没有 namespace 工具时仍为 None。
         """
         ctx = _make_ctx({
@@ -134,11 +135,11 @@ class TestResponsesConvertStepNoTools:
         assert ctx.body["tools"][0]["function"]["name"] == "exec_command"
         # 没有 custom tool，reverse_tool_map 为 None
         assert ctx.reverse_tool_map is None
-        # 没有 namespace tool，namespace_map 为 None
-        assert ctx.namespace_map is None
+        # 没有 namespace tool，tool_spec_map 为 None
+        assert ctx.tool_spec_map is None
 
-    def test_with_namespace_tools_populates_namespace_map(self):
-        """带 namespace 工具的请求必须正确填充 namespace_map（这是原行为不能破）。"""
+    def test_with_namespace_tools_populates_tool_spec_map(self):
+        """带 namespace 工具的请求必须正确填充 tool_spec_map（这是原行为不能破）。"""
         ctx = _make_ctx({
             "model": "gpt-5.3-codex",
             "input": [{"type": "message", "role": "user", "content": "hi"}],
@@ -159,8 +160,9 @@ class TestResponsesConvertStepNoTools:
 
         _execute(ctx)
 
-        # namespace_map 应该包含子工具名 → namespace 名
-        assert ctx.namespace_map == {"search": "mcp__web_search"}
+        # tool_spec_map 应该包含 upstream 名 → CodexToolSpec
+        expected = CodexToolSpec(kind="namespace", name="search", namespace="mcp__web_search")
+        assert ctx.tool_spec_map == {"mcp__web_search.search": expected}
 
 
 class TestResponsesConvertStepEarlyReturn:
@@ -178,7 +180,6 @@ class TestResponsesConvertStepEarlyReturn:
 
         # body 不应该被改
         assert ctx.body == {"model": "gpt-4", "input": [{"type": "message", "role": "user", "content": "hi"}]}
-        # 也没有 namespace_map 被设置
-        assert ctx.namespace_map is None
+        # 也没有 tool_spec_map 被设置
+        assert ctx.tool_spec_map is None
         assert ctx.reverse_tool_map is None
-

@@ -4,6 +4,7 @@ import logging
 
 from llm_proxy.handlers.base import PipelineContext, HandlerStep
 from llm_proxy.protocol.responses_chat.request import (
+    CodexToolSpec,
     convert_input_to_messages,
     convert_tools_to_chat,
 )
@@ -60,10 +61,10 @@ class ResponsesConvertStep(HandlerStep):
         # Tool 转换
         reverse_tool_map: dict[str, str] = {}
         # Codex 在 compact 完成后的下一轮请求会省略 `tools` 字段；
-        # 因此 namespace_map 必须在 if 块外初始化为 {}，否则函数末尾的
-        # `ctx.namespace_map = namespace_map or None` 会抛 UnboundLocalError
+        # 因此 tool_spec_map 必须在 if 块外初始化为 {}，否则函数末尾的
+        # `ctx.tool_spec_map = tool_spec_map or None` 会抛 UnboundLocalError
         # （参考 /private/tmp/llm-proxy.log 16:42 / 17:00 的 30+ 6-item 500 链）。
-        namespace_map: dict[str, str] = {}
+        tool_spec_map: dict[str, CodexToolSpec] = {}
         if body.get("tools"):
             # DEBUG: 记录原始工具列表的类型和名称
             for t in body["tools"]:
@@ -74,17 +75,19 @@ class ResponsesConvertStep(HandlerStep):
                     if tt == "namespace":
                         subs = t.get("tools") or []
                         sub_names = ", subtools=[" + "; ".join(
-                            f"name={s.get('name','?')},type={s.get('type','?')},defer={s.get('deferLoading',s.get('defer_loading','?'))}" 
+                            f"name={s.get('name','?')},type={s.get('type','?')},defer={s.get('deferLoading',s.get('defer_loading','?'))}"
                             for s in subs if isinstance(s, dict)
                         ) + "]"
                     logger.info(f"  RAW tool: type={tt}, name={tn}{sub_names}")
-            chat_tools, reverse_tool_map, namespace_map = convert_tools_to_chat(body["tools"])
+            chat_tools, reverse_tool_map, tool_spec_map = convert_tools_to_chat(body["tools"])
             if chat_tools:
                 chat_body["tools"] = chat_tools
             if reverse_tool_map:
                 logger.info(f"Custom tools replaced: {list(reverse_tool_map.keys())}")
-            if namespace_map:
-                logger.info(f"Namespace tools mapped: {namespace_map}")
+            if tool_spec_map:
+                ns_entries = {k: v for k, v in tool_spec_map.items() if v.kind == "namespace"}
+                if ns_entries:
+                    logger.info(f"Namespace tools mapped: {ns_entries}")
 
         # tool_choice 透传
         if body.get("tool_choice"):
@@ -113,7 +116,7 @@ class ResponsesConvertStep(HandlerStep):
 
         ctx.body = chat_body
         ctx.reverse_tool_map = reverse_tool_map or None
-        ctx.namespace_map = namespace_map or None
+        ctx.tool_spec_map = tool_spec_map or None
 
         logger.info(f"Converted Responses → Chat: {len(messages)} messages, "
                      f"tools={len(chat_body.get('tools', []))}, "

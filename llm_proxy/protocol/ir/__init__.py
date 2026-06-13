@@ -18,7 +18,7 @@
     ir_events = converter.parse_stream_to_ir(upstream_resp, model)
     sse_bytes = converter.format_ir_as_sse(ir_events, model,
                                            reverse_tool_map=ir.extensions.get("reverse_tool_map"),
-                                           namespace_map=ir.extensions.get("namespace_map"))
+                                           tool_spec_map=ir.extensions.get("tool_spec_map"))
 """
 
 from __future__ import annotations
@@ -90,11 +90,11 @@ class ProtocolConverter:
         model: str,          # 客户端模型名
         *,
         reverse_tool_map: dict | None = None,
-        namespace_map: dict | None = None,
+        tool_spec_map: dict | None = None,
     ):
         """IRStreamEvent 序列 → 客户端 SSE 字节流（异步生成器）。
 
-        reverse_tool_map / namespace_map 仅 Responses 协议使用：
+        reverse_tool_map / tool_spec_map 仅 Responses 协议使用：
         解析时存于 IRRequest.extensions，发送时透传过来。
         """
         raise NotImplementedError

@@ -652,29 +652,30 @@ class TestResponsesFormat:
         assert "/tmp/x.py" in text
         assert "+print" in text
 
-    async def test_namespace_map_adds_namespace_field(self):
-        """namespace_map 命中的 tool → function_call + namespace 字段。"""
+    async def test_tool_spec_map_adds_namespace_field(self):
+        """tool_spec_map 命中的 tool → function_call + namespace 字段。"""
         async def events_aiter():
             for e in [
             IRStreamEvent("message_start", {"id": "resp_1", "model": "gpt-5"}),
-            IRStreamEvent("tool_use_start", {"id": "call_1", "name": "search"}),
+            IRStreamEvent("tool_use_start", {"id": "call_1", "name": "mcp__web_search.search"}),
             IRStreamEvent("tool_use_delta", {"id": "call_1", "arguments_delta": '{"q":"x"}'}),
             IRStreamEvent("tool_use_end", {"id": "call_1", "input": {"q": "x"}}),
             IRStreamEvent("message_stop", {"stop_reason": "tool_use"}),
         ]:
                 yield e
         events_aiter = events_aiter()
-        namespace_map = {"search": "mcp__web_search"}
+        tool_spec_map = {"mcp__web_search.search": {"kind": "namespace", "name": "search", "namespace": "mcp__web_search"}}
         chunks = []
         async for b in responses_format(
-            events_aiter, model='gpt-5', namespace_map=namespace_map,
+            events_aiter, model='gpt-5', tool_spec_map=tool_spec_map,
         ):
             chunks.append(b)
         text = b''.join(chunks).decode()
         # 应是 function_call（不是 custom_tool_call）
         assert "function_call" in text
         assert "custom_tool_call" not in text
-        # 含 namespace 字段
+        # 含 namespace 字段，且 name 被还原为原始子工具名
+        assert '"name": "search"' in text or '"name":\\n"search"' in text
         assert '"namespace": "mcp__web_search"' in text
 
 

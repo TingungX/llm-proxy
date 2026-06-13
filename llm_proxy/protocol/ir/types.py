@@ -135,7 +135,7 @@ class IRRequest:
 
     Responses 特有：
       - "reverse_tool_map": dict[str, str]  # 工具名 → 原始 custom tool 名（apply_patch 用）
-      - "namespace_map": dict[str, str]  # 子工具名 → namespace 名
+      - "tool_spec_map": dict[str, dict]  # 上游工具名 → {kind, name, namespace} 规格
       - "instructions": str  # Responses 顶层 instructions（与 system_prompt 类似但语义不同）
       - "parallel_tool_calls": bool
       - "truncation": str
@@ -201,4 +201,3 @@ class IRStreamEvent:
 
     type: str = ""
     data: dict = field(default_factory=dict)
-

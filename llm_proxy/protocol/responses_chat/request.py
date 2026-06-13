@@ -10,6 +10,8 @@ import logging
 import re
 import time
 import uuid
+from dataclasses import dataclass
+from typing import Optional
 
 from llm_proxy.infra import db
 
@@ -38,6 +40,19 @@ _ROLE_MAP = {
 }
 
 
+@dataclass
+class CodexToolSpec:
+    """Tracks original Responses API tool info for reverse conversion.
+
+    Records the original tool kind, name, and optional namespace so the return
+    path can restore correct event types and names (e.g., namespace sub-tools
+    get their original name and namespace field back).
+    """
+    kind: str       # "function" | "custom" | "namespace" | "tool_search" | "web_search" | ...
+    name: str       # original name as sent by Codex
+    namespace: Optional[str] = None  # parent namespace name (only for namespace tools)
+
+
 def _normalize_params(params) -> dict:
     if params is None or not isinstance(params, dict):
         params = {}
@@ -60,19 +75,20 @@ def _make_chat_function_tool(name: str, description: str, parameters: dict) -> d
     }
 
 
-def convert_tools_to_chat(tools: list) -> tuple[list, dict[str, str], dict[str, str]]:
+def convert_tools_to_chat(tools: list) -> tuple[list, dict[str, str], dict[str, CodexToolSpec]]:
     """Convert Responses API tools to Chat Completions format.
 
     Returns:
-        (chat_tools, reverse_tool_map, namespace_map) —
+        (chat_tools, reverse_tool_map, tool_spec_map) —
         reverse_tool_map maps upstream tool names back to downstream
         custom tool names (apply_patch).
-        namespace_map maps sub-tool names to original namespace name
-        (e.g. "search" → "mcp__web_search") for function_call+namespace response.
+        tool_spec_map maps upstream chat names → CodexToolSpec for
+        namespace sub-tools, custom tools, and degraded tools so the
+        return path can restore correct event types and names.
     """
     result = []
     reverse_tool_map: dict[str, str] = {}
-    namespace_map: dict[str, str] = {}
+    tool_spec_map: dict[str, CodexToolSpec] = {}
 
     # 客户端侧内置工具，不应发给上游模型
     # tool_search: Codex 客户端搜索延迟加载工具，客户端执行
@@ -105,26 +121,27 @@ def convert_tools_to_chat(tools: list) -> tuple[list, dict[str, str], dict[str, 
                     name, tool.get("description", ""), _normalize_params(tool.get("parameters"))
                 ))
                 reverse_tool_map[name] = name
+                tool_spec_map[name] = CodexToolSpec(kind="custom", name=name)
                 logger.debug(f"Pass-through custom tool as function: {name}")
             continue
 
-        # --- namespace 工具：展开子工具 ---
+        # --- namespace 工具：展开子工具，使用限定的全名以避免同名冲突 ---
         if tool_type == "namespace":
             ns_name = tool.get("name", "")
             for sub in (tool.get("tools") or []):
                 if not isinstance(sub, dict) or sub.get("type") != "function":
                     continue
                 sub_name = sub.get("name", "")
+                chat_name = f"{ns_name}.{sub_name}"
                 result.append(_make_chat_function_tool(
-                    sub_name,
+                    chat_name,
                     sub.get("description", ""),
                     _normalize_params(sub.get("parameters")),
                 ))
-                # namespace 子工具以 function_call + namespace 格式返回给客户端，
-                # 记录子工具名 → 原始 namespace 名映射（如 "search" → "mcp__web_search"）
-                # Codex 用 ToolName::new(namespace, name) 拼接，需要原始 namespace 名
-                namespace_map[sub_name] = ns_name
-                logger.debug(f"Expanded namespace tool: {ns_name}.{sub_name}")
+                tool_spec_map[chat_name] = CodexToolSpec(
+                    kind="namespace", name=sub_name, namespace=ns_name
+                )
+                logger.debug(f"Expanded namespace tool: {ns_name}.{sub_name} → upstream name={chat_name}")
             continue
 
         # --- 其他非 function 类型：尝试降级为 function ---
@@ -147,6 +164,7 @@ def convert_tools_to_chat(tools: list) -> tuple[list, dict[str, str], dict[str, 
                 }
             desc = tool.get("description", f"Tool of type {tool_type}")
             result.append(_make_chat_function_tool(name, desc, params))
+            tool_spec_map[name] = CodexToolSpec(kind=tool_type, name=name)
             logger.debug(f"Degraded non-function tool type={tool_type} name={name} to function")
             continue
 
@@ -155,7 +173,7 @@ def convert_tools_to_chat(tools: list) -> tuple[list, dict[str, str], dict[str, 
         result.append(_make_chat_function_tool(
             name, func.get("description", ""), _normalize_params(func.get("parameters"))
         ))
-    return result, reverse_tool_map, namespace_map
+    return result, reverse_tool_map, tool_spec_map
 
 
 def _extract_reasoning_text(item: dict) -> str:
@@ -440,7 +458,7 @@ def convert_input_to_messages(input_data, instructions: str | None = None) -> li
     return messages
 
 
-def to_responses_response(chat_body: dict, original_model: str, reverse_tool_map: dict[str, str] | None = None, namespace_map: dict[str, str] | None = None) -> dict:
+def to_responses_response(chat_body: dict, original_model: str, reverse_tool_map: dict[str, str] | None = None, tool_spec_map: dict[str, CodexToolSpec] | None = None) -> dict:
     choices = chat_body.get("choices", [])
     choice = choices[0] if choices else {}
     message = choice.get("message", {})
@@ -479,14 +497,14 @@ def to_responses_response(chat_body: dict, original_model: str, reverse_tool_map
         })
 
     _reverse = reverse_tool_map or {}
-    _ns = namespace_map or {}
+    _spec = tool_spec_map or {}
     tool_calls = message.get("tool_calls") or []
     for tc in tool_calls:
         if tc.get("type") == "function":
             func = tc.get("function", {})
             name = func.get("name", "")
             downstream_name = _reverse.get(name)
-            server_label = _ns.get(name)
+            spec = _spec.get(name)
             if downstream_name is not None:
                 # 1) reverse_tool_map 命中 → custom_tool_call
                 args_str = func.get("arguments", "{}")
@@ -510,16 +528,16 @@ def to_responses_response(chat_body: dict, original_model: str, reverse_tool_map
                     "call_id": tc.get("id", ""),
                     "input": input_text,
                 })
-            elif server_label is not None:
-                # 2) namespace 子工具 → function_call + namespace
+            elif spec is not None and spec.kind == "namespace" and spec.namespace:
+                # 2) namespace 子工具 → function_call + 原始名称 + namespace
                 args = func.get("arguments", "")
                 if not args:
                     args = "{}"
                 output.append({
                     "id": f"fc_{tc.get('id', '')}",
                     "type": "function_call",
-                    "name": name,
-                    "namespace": server_label,
+                    "name": spec.name,
+                    "namespace": spec.namespace,
                     "arguments": args,
                     "status": "completed",
                     "call_id": tc.get("id", ""),
@@ -672,12 +690,12 @@ async def stream_chat_to_responses(
     original_request: dict | None = None,
     result: dict | None = None,
     reverse_tool_map: dict[str, str] | None = None,
-    namespace_map: dict[str, str] | None = None,
+    tool_spec_map: dict[str, CodexToolSpec] | None = None,
     request_id: str = "",
     client_ip: str = "",
     user_agent: str = "",
 ):
-    state = StreamState(reverse_tool_map=reverse_tool_map, namespace_map=namespace_map)
+    state = StreamState(reverse_tool_map=reverse_tool_map, tool_spec_map=tool_spec_map)
     response_id = state.response_id
     usage = {"input_tokens": 0, "output_tokens": 0}
     had_error = False

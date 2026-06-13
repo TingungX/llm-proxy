@@ -673,7 +673,7 @@ class ProxyStep(HandlerStep):
             if _needs_reasoning_split(api_base):
                 chat_body["reasoning_split"] = True
             reverse_tool_map = ctx.reverse_tool_map
-            namespace_map = ctx.namespace_map
+            tool_spec_map = ctx.tool_spec_map
             model = raw_model  # SSE 事件中使用原始模型名
 
             model_paths = get_state().paths_map.get(model_id.lower(), {})
@@ -690,7 +690,7 @@ class ProxyStep(HandlerStep):
                 ctx.response = StreamingResponse(
                     self._responses_to_chat_stream(target_url, req_headers, chat_body, model,
                                                    endpoint_id, model_id, reverse_tool_map,
-                                                   namespace_map=namespace_map,
+                                                   tool_spec_map=tool_spec_map,
                                                    record_ctx=ctx.extra.get("_record_ctx", {})),
                     media_type="text/event-stream",
                 )
@@ -726,7 +726,7 @@ class ProxyStep(HandlerStep):
                                resp_body.get("usage", {}).get("prompt_tokens", 0),
                                resp_body.get("usage", {}).get("completion_tokens", 0))
 
-            responses_body = to_responses_response(resp_body, actual_model, reverse_tool_map, namespace_map=namespace_map)
+            responses_body = to_responses_response(resp_body, actual_model, reverse_tool_map, tool_spec_map=tool_spec_map)
             ctx.response = JSONResponse(responses_body)
         else:
             # Chat completions 同协议透传
@@ -737,7 +737,7 @@ class ProxyStep(HandlerStep):
         self, target_url: str, headers: dict, body: dict,
         model: str, endpoint_id: str, model_id: str,
         reverse_tool_map: dict | None = None,
-        namespace_map: dict | None = None,
+        tool_spec_map: dict | None = None,
         record_ctx: dict | None = None,
     ):
         """Responses → Chat 流式 SSE 转换，含 429/503 重试"""
@@ -771,7 +771,7 @@ class ProxyStep(HandlerStep):
                         resp, model, endpoint_id, model_id,
                         original_request=body, result=stream_result,
                         reverse_tool_map=reverse_tool_map,
-                        namespace_map=namespace_map,
+                        tool_spec_map=tool_spec_map,
                         request_id=(record_ctx or {}).get("request_id", ""),
                         client_ip=(record_ctx or {}).get("client_ip", ""),
                         user_agent=(record_ctx or {}).get("user_agent", ""),

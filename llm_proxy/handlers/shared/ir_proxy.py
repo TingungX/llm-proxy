@@ -248,12 +248,12 @@ class IRProxyStep(HandlerStep):
                 raw_events = REGISTRY[upstream_proto].parse_stream_to_ir(resp, actual_model)
                 intercepted_events = _intercept_events(raw_events)
 
-                # 客户端 SSE formatter（带 reverse_tool_map / namespace_map）
+                # 客户端 SSE formatter（带 reverse_tool_map / tool_spec_map）
                 sse_bytes = REGISTRY[client_proto].format_ir_as_sse(
                     intercepted_events,
                     actual_model,
                     reverse_tool_map=ir_request.extensions.get("reverse_tool_map"),
-                    namespace_map=ir_request.extensions.get("namespace_map"),
+                    tool_spec_map=ir_request.extensions.get("tool_spec_map"),
                 )
 
                 # keepalive 包装：每 15s 无数据发心跳

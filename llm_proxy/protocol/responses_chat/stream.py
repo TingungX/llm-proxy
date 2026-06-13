@@ -2,7 +2,12 @@ import json
 import logging
 import uuid
 
+from typing import TYPE_CHECKING
+
 from llm_proxy.protocol.responses_chat.tool_replacement import reverse_tool_args_to_apply_patch, ReverseConversionError
+
+if TYPE_CHECKING:
+    from llm_proxy.protocol.responses_chat.request import CodexToolSpec
 from llm_proxy.protocol.think_tag import ThinkTagStateMachine
 
 logger = logging.getLogger(__name__)
@@ -21,7 +26,7 @@ def _gen_id(prefix: str = "") -> str:
 
 
 class StreamState:
-    def __init__(self, response_id: str | None = None, reverse_tool_map: dict[str, str] | None = None, namespace_map: dict[str, str] | None = None):
+    def __init__(self, response_id: str | None = None, reverse_tool_map: dict[str, str] | None = None, tool_spec_map: dict[str, "CodexToolSpec"] | None = None):
         self.response_id: str = response_id or _gen_id("resp_")
         self.seq: int = 0
         self.reasoning_active: bool = False
@@ -38,7 +43,7 @@ class StreamState:
         self.func_call_ids: dict[int, str] = {}
         self.func_item_added: dict[int, bool] = {}
         self.reverse_tool_map: dict[str, str] = reverse_tool_map or {}
-        self.namespace_map: dict[str, str] = namespace_map or {}
+        self.tool_spec_map: dict[str, "CodexToolSpec"] = tool_spec_map or {}
         self.think: ThinkTagStateMachine = ThinkTagStateMachine()
         self.finish_reason: str | None = None
 
@@ -212,7 +217,7 @@ class StreamState:
         self.func_args_buf.setdefault(idx, "")
         output_index = self._func_output_index(idx)
         downstream_name = self.reverse_tool_map.get(name)
-        server_label = self.namespace_map.get(name)
+        spec = self.tool_spec_map.get(name)
 
         if downstream_name is not None:
             # 1) reverse_tool_map 命中 → custom_tool_call
@@ -224,15 +229,15 @@ class StreamState:
                 "name": downstream_name,
                 "input": "",
             }
-        elif server_label is not None:
-            # 2) namespace 子工具 → function_call + namespace
+        elif spec is not None and spec.kind == "namespace" and spec.namespace:
+            # 2) namespace 子工具 → function_call + 原始名称 + namespace
             item = {
                 "id": f"fc_{tc_id}",
                 "type": "function_call",
                 "status": "in_progress",
                 "call_id": tc_id,
-                "name": name,
-                "namespace": server_label,
+                "name": spec.name,
+                "namespace": spec.namespace,
                 "arguments": "",
             }
         else:
@@ -262,7 +267,6 @@ class StreamState:
             return []  # custom_tool_call 不流式 delta
         output_index = self._func_output_index(idx)
         item_id = f"fc_{self.func_call_ids[idx]}"
-        server_label = self.namespace_map.get(name)
         # namespace 子工具也使用标准 function_call_arguments 事件（Codex 不认 mcp_call 事件）
         event_type = "response.function_call_arguments.delta"
         return [_make_sse_event({
@@ -386,9 +390,9 @@ class StreamState:
                     },
                 }))
             else:
-                server_label = self.namespace_map.get(name)
-                if server_label is not None:
-                    # 2) namespace 子工具 → function_call + namespace
+                spec = self.tool_spec_map.get(name)
+                if spec is not None and spec.kind == "namespace" and spec.namespace:
+                    # 2) namespace 子工具 → function_call + 原始名称 + namespace
                     events.append(_make_sse_event({
                         "type": "response.function_call_arguments.done",
                         "item_id": f"fc_{call_id}",
@@ -403,8 +407,8 @@ class StreamState:
                         "item": {
                             "id": f"fc_{call_id}",
                             "type": "function_call",
-                            "name": name,
-                            "namespace": server_label,
+                            "name": spec.name,
+                            "namespace": spec.namespace,
                             "arguments": args,
                             "status": "completed",
                             "call_id": call_id,
@@ -560,14 +564,14 @@ class StreamState:
                     "input": input_text,
                 })
             else:
-                server_label = self.namespace_map.get(name)
-                if server_label is not None:
-                    # 2) namespace 子工具 → function_call + namespace
+                spec = self.tool_spec_map.get(name)
+                if spec is not None and spec.kind == "namespace" and spec.namespace:
+                    # 2) namespace 子工具 → function_call + 原始名称 + namespace
                     items.append({
                         "id": f"fc_{call_id}",
                         "type": "function_call",
-                        "name": name,
-                        "namespace": server_label,
+                        "name": spec.name,
+                        "namespace": spec.namespace,
                         "arguments": args,
                         "status": "completed",
                         "call_id": call_id,
