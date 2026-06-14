@@ -632,19 +632,23 @@ def convert_chunk_to_events(
     return events
 
 
-def make_sse_event(data: dict) -> bytes:
+def make_sse_event(data: dict, event_type: str | None = None) -> bytes:
     """将字典转换为 SSE 事件格式
 
     Args:
         data: 事件数据字典
+        event_type: 显式指定 SSE `event:` 头（OpenAI Responses API 错误流需要
+                    显式 `event: error` 头 + `data: {"error": {...}}`，
+                    不能从 data 字段反推）
 
     Returns:
-        SSE 格式的字节串，形如 b'data: {...}\\n\\n'
+        SSE 格式的字节串，形如 b'event: xxx\\ndata: {...}\\n\\n' 或 b'data: {...}\\n\\n'
     """
-    event_type = data.get("type", "")
+    # 显式 event_type 优先；否则从 data["type"] 兜底（向后兼容）
+    resolved_type = event_type if event_type is not None else data.get("type", "")
     payload = json.dumps(data, ensure_ascii=False)
-    if event_type:
-        return f"event: {event_type}\ndata: {payload}\n\n".encode()
+    if resolved_type:
+        return f"event: {resolved_type}\ndata: {payload}\n\n".encode()
     return f"data: {payload}\n\n".encode()
 
 
@@ -795,7 +799,17 @@ async def stream_chat_to_responses(
                     extracted = extract_usage_metrics(u)
                     usage.update(extracted)
 
-                for event in convert_chunk_to_events(chunk, model, state):
+                try:
+                    chunk_events = list(convert_chunk_to_events(chunk, model, state))
+                except Exception as e:
+                    # 单个 chat chunk 转换失败不能让整个 stream 挂掉——
+                    # 跳过这个 chunk 并继续，OpenAI 客户端会看到 partial 响应
+                    logger.warning(
+                        f"convert_chunk_to_events failed for chunk (skipping): "
+                        f"{type(e).__name__}: {e}; chunk={json.dumps(chunk)[:200]}"
+                    )
+                    continue
+                for event in chunk_events:
                     yield event
         finally:
             read_task.cancel()

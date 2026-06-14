@@ -626,7 +626,10 @@ class ProxyStep(HandlerStep):
                         err_code = err_data.get("error", {}).get("code") or _status_to_code(resp.status_code)
                     except json.JSONDecodeError:
                         err_message, err_code = error_msg, _status_to_code(resp.status_code)
-                    yield make_sse_event({"type": "error", "code": err_code, "message": err_message})
+                    yield make_sse_event(
+                        {"error": {"code": err_code, "message": err_message}},
+                        event_type="error",
+                    )
                     yield make_response_completed_event(model, f"resp_{uuid.uuid4().hex[:16]}")
                     yield b"data: [DONE]\n\n"
                     return
@@ -646,7 +649,10 @@ class ProxyStep(HandlerStep):
         except Exception as e:
             had_error = True
             logger.error(f"Direct stream error: {e}", exc_info=True)
-            yield make_sse_event({"type": "error", "code": "proxy_error", "message": str(e) or type(e).__name__})
+            yield make_sse_event(
+                {"error": {"code": "proxy_error", "message": str(e) or type(e).__name__}},
+                event_type="error",
+            )
             yield make_response_completed_event(model, f"resp_{uuid.uuid4().hex[:16]}")
             yield b"data: [DONE]\n\n"
         finally:
@@ -761,7 +767,10 @@ class ProxyStep(HandlerStep):
                             err_code = err_data.get("error", {}).get("code") or _status_to_code(status)
                         except json.JSONDecodeError:
                             err_message, err_code = error_msg, _status_to_code(status)
-                        yield make_sse_event({"type": "error", "code": err_code, "message": err_message})
+                        yield make_sse_event(
+                            {"error": {"code": err_code, "message": err_message}},
+                            event_type="error",
+                        )
                         yield make_response_completed_event(model, f"resp_{uuid.uuid4().hex[:16]}")
                         yield b"data: [DONE]\n\n"
                         return
@@ -786,8 +795,10 @@ class ProxyStep(HandlerStep):
                     await asyncio.sleep(wait)
                     continue
                 logger.error(f"Stream request error after {_RETRY_MAX + 1} attempts: {e}", exc_info=True)
-                yield make_sse_event({"type": "error", "code": "proxy_error",
-                                      "message": f"{type(e).__name__}: {e}"})
+                yield make_sse_event(
+                    {"error": {"code": "proxy_error", "message": f"{type(e).__name__}: {e}"}},
+                    event_type="error",
+                )
                 yield make_response_completed_event(model, f"resp_{uuid.uuid4().hex[:16]}")
                 yield b"data: [DONE]\n\n"
                 return
