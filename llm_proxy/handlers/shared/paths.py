@@ -1,5 +1,5 @@
 DEFAULT_PATHS = {
-    "anthropic/messages":       "anthropic/v1/messages",
+    "anthropic/messages":       "/anthropic/v1/messages",
     "openai/chat-completions":  "/v1/chat/completions",
     "openai/responses":         "/v1/responses",
 }

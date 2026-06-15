@@ -234,7 +234,7 @@ class ProxyStep(HandlerStep):
         stream = out_body.get("stream", False)
         model_paths = get_state().paths_map.get(model_id.lower(), {})
         messages_path = resolve_path(model_paths, "anthropic/messages")
-        target_url = f"{api_base.rstrip('/')}{messages_path}"
+        target_url = f"{api_base.rstrip('/')}/{messages_path.lstrip('/')}"
         req_headers = _build_anthropic_upstream_headers(api_key, ctx.headers)
         logger.info(f"Anthropic proxy: {target_url}, model={actual_model}, stream={stream}")
 
@@ -261,7 +261,7 @@ class ProxyStep(HandlerStep):
                 logger.info(f"Failover: trying {current} -> {f_model_id}")
                 f_paths = s.paths_map.get(f_model_id.lower(), {})
                 f_msg_path = resolve_path(f_paths, "anthropic/messages")
-                f_target_url = f"{f_api_base.rstrip('/')}{f_msg_path}"
+                f_target_url = f"{f_api_base.rstrip('/')}/{f_msg_path.lstrip('/')}"
                 fb, fs = await self._anthropic_request(f_target_url, f_api_key, f_upstream, out_body, ctx.headers, f_model_id)
                 if fs < 400 or fb.get("type") != "error":
                     logger.info(f"Failover succeeded: {current} -> {f_model_id}")
@@ -377,7 +377,7 @@ class ProxyStep(HandlerStep):
         state = get_state()
         model_paths = state.paths_map.get(model_id.lower(), {})
         chat_path = resolve_path(model_paths, "openai/chat-completions")
-        target_url = f"{api_base.rstrip('/')}{chat_path}"
+        target_url = f"{api_base.rstrip('/')}/{chat_path.lstrip('/')}"
         req_headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -555,7 +555,7 @@ class ProxyStep(HandlerStep):
         stream = body.get("stream", False)
         model_paths = get_state().paths_map.get(model_id.lower(), {})
         resp_path = resolve_path(model_paths, "openai/responses")
-        target_url = f"{api_base.rstrip('/')}{resp_path}"
+        target_url = f"{api_base.rstrip('/')}/{resp_path.lstrip('/')}"
         req_headers = {
             "Authorization": f"Bearer {upstream_api_key}",
             "Content-Type": "application/json",
@@ -684,7 +684,7 @@ class ProxyStep(HandlerStep):
 
             model_paths = get_state().paths_map.get(model_id.lower(), {})
             chat_path = resolve_path(model_paths, "openai/chat-completions")
-            target_url = f"{api_base.rstrip('/')}{chat_path}"
+            target_url = f"{api_base.rstrip('/')}/{chat_path.lstrip('/')}"
             req_headers = {
                 "Authorization": f"Bearer {upstream_api_key}",
                 "Content-Type": "application/json",
@@ -816,7 +816,7 @@ class ProxyStep(HandlerStep):
         stream = out_body.get("stream", False)
         model_paths = get_state().paths_map.get(model_id.lower(), {})
         chat_path = resolve_path(model_paths, "openai/chat-completions")
-        target_url = f"{api_base.rstrip('/')}{chat_path}"
+        target_url = f"{api_base.rstrip('/')}/{chat_path.lstrip('/')}"
         req_headers = {
             "Authorization": f"Bearer {upstream_api_key}",
             "Content-Type": "application/json",
@@ -894,7 +894,7 @@ class ProxyStep(HandlerStep):
 
         model_paths = get_state().paths_map.get(model_id.lower(), {})
         resp_path = resolve_path(model_paths, "openai/responses")
-        target_url = f"{api_base.rstrip('/')}{resp_path}"
+        target_url = f"{api_base.rstrip('/')}/{resp_path.lstrip('/')}"
         req_headers = {
             "Authorization": f"Bearer {upstream_api_key}",
             "Content-Type": "application/json",

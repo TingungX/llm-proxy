@@ -4,7 +4,7 @@ from llm_proxy.handlers.shared.paths import resolve_path, DEFAULT_PATHS
 
 
 def test_default_anthropic_path_is_third_party_compatible():
-    assert DEFAULT_PATHS["anthropic/messages"] == "anthropic/v1/messages"
+    assert DEFAULT_PATHS["anthropic/messages"] == "/anthropic/v1/messages"
 
 
 def test_default_openai_chat_path():
@@ -16,7 +16,7 @@ def test_default_openai_responses_path():
 
 
 def test_resolve_path_returns_default_when_no_user_config():
-    assert resolve_path({}, "anthropic/messages") == "anthropic/v1/messages"
+    assert resolve_path({}, "anthropic/messages") == "/anthropic/v1/messages"
 
 
 def test_resolve_path_returns_user_override():
