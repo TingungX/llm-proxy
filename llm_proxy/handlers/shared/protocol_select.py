@@ -47,7 +47,7 @@ class ProtocolSelectStep(HandlerStep):
             for t in (body.get("tools") or [])
         )
         if needs_downgrade:
-            logger.info("Request has non-Responses tool types, restricting to openai/chat-completions")
+            logger.debug("Request has non-Responses tool types, restricting to openai/chat-completions")
             model_protocols = model_protocols & {"openai", "openai/chat-completions"}
 
         try:
@@ -70,5 +70,4 @@ class ProtocolSelectStep(HandlerStep):
                 400,
             ))
 
-        logger.info(f"Protocol: upstream={upstream_protocol}, converter={ctx.converter}")
-
+        logger.debug(f"Protocol: upstream={upstream_protocol}, converter={ctx.converter}")

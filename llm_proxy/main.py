@@ -15,6 +15,7 @@ from llm_proxy.logging_config import setup_logging
 
 setup_logging()
 logger = logging.getLogger(__name__)
+lifecycle = logging.getLogger("llm_proxy.lifecycle")
 
 
 async def hourly_aggregator():
@@ -23,7 +24,7 @@ async def hourly_aggregator():
         await asyncio.sleep(3600)
         try:
             db.aggregate_hourly()
-            logger.info("Hourly aggregation completed")
+            lifecycle.info("Hourly aggregation completed")
         except Exception as e:
             logger.error(f"Hourly aggregation error: {e}")
 
@@ -39,7 +40,7 @@ async def daily_cleanup():
         try:
             db.aggregate_daily()
             db.cleanup_old_records()
-            logger.info("Daily cleanup completed")
+            lifecycle.info("Daily cleanup completed")
         except Exception as e:
             logger.error(f"Daily cleanup error: {e}")
 
@@ -47,15 +48,15 @@ async def daily_cleanup():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
-    logger.info("Database initialized")
+    lifecycle.info("Database initialized")
 
     from llm_proxy.state import init_state, get_state
     init_state()
-    logger.info("State initialized")
+    lifecycle.info("State initialized")
 
     aggregator_task = asyncio.create_task(hourly_aggregator())
     cleanup_task = asyncio.create_task(daily_cleanup())
-    logger.info("Background tasks started")
+    lifecycle.info("Background tasks started")
 
     state = get_state()
 
@@ -66,7 +67,7 @@ async def lifespan(app: FastAPI):
 
     from llm_proxy.infra.http_client import close_client
     await close_client()
-    logger.info("HTTP client closed")
+    lifecycle.info("HTTP client closed")
 
 
 app = FastAPI(lifespan=lifespan)

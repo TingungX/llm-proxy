@@ -63,7 +63,7 @@ async def _image_to_text(image_data: bytes, mime: str) -> str:
         resp.raise_for_status()
         data = resp.json()
         text = data["choices"][0]["message"]["content"]
-        logger.info(
+        logger.debug(
             "Omlx vision returned %d chars for image (mime=%s)", len(text), mime
         )
         return text

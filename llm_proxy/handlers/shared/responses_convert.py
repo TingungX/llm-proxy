@@ -33,7 +33,7 @@ class ResponsesConvertStep(HandlerStep):
         instructions = body.get("instructions")
 
         if isinstance(input_data, list):
-            logger.info(f"Responses input_items={len(input_data)}")
+            logger.debug(f"Responses input_items={len(input_data)}")
             for idx, item in enumerate(input_data[:3]):
                 if isinstance(item, dict):
                     t = item.get('type', '?')
@@ -44,10 +44,10 @@ class ResponsesConvertStep(HandlerStep):
                         clen = sum(len(p.get('text', '')) for p in c if isinstance(p, dict))
                     else:
                         clen = 0
-                    logger.info(f"  input[{idx}]: type={t}, role={item.get('role', '-')}, content_len={clen}")
+                    logger.debug(f"  input[{idx}]: type={t}, role={item.get('role', '-')}, content_len={clen}")
 
         if instructions:
-            logger.info(f"  instructions_len={len(instructions)}")
+            logger.debug(f"  instructions_len={len(instructions)}")
 
         messages = convert_input_to_messages(input_data, instructions)
 
@@ -78,16 +78,16 @@ class ResponsesConvertStep(HandlerStep):
                             f"name={s.get('name','?')},type={s.get('type','?')},defer={s.get('deferLoading',s.get('defer_loading','?'))}"
                             for s in subs if isinstance(s, dict)
                         ) + "]"
-                    logger.info(f"  RAW tool: type={tt}, name={tn}{sub_names}")
+                    logger.debug(f"  RAW tool: type={tt}, name={tn}{sub_names}")
             chat_tools, reverse_tool_map, tool_spec_map = convert_tools_to_chat(body["tools"])
             if chat_tools:
                 chat_body["tools"] = chat_tools
             if reverse_tool_map:
-                logger.info(f"Custom tools replaced: {list(reverse_tool_map.keys())}")
+                logger.debug(f"Custom tools replaced: {list(reverse_tool_map.keys())}")
             if tool_spec_map:
                 ns_entries = {k: v for k, v in tool_spec_map.items() if v.kind == "namespace"}
                 if ns_entries:
-                    logger.info(f"Namespace tools mapped: {ns_entries}")
+                    logger.debug(f"Namespace tools mapped: {ns_entries}")
 
         # tool_choice 透传
         if body.get("tool_choice"):
@@ -118,6 +118,6 @@ class ResponsesConvertStep(HandlerStep):
         ctx.reverse_tool_map = reverse_tool_map or None
         ctx.tool_spec_map = tool_spec_map or None
 
-        logger.info(f"Converted Responses → Chat: {len(messages)} messages, "
+        logger.debug(f"Converted Responses → Chat: {len(messages)} messages, "
                      f"tools={len(chat_body.get('tools', []))}, "
                      f"reasoning_effort={chat_body.get('reasoning_effort')}")

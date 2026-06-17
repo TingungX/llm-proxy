@@ -113,7 +113,7 @@ class IRProxyStep(HandlerStep):
                 "Content-Type": "application/json",
             }
 
-        logger.info(
+        logger.debug(
             f"IRProxyStep: client={self.client_protocol} → upstream={upstream_protocol}, "
             f"target={target_url}, stream={ir_request.stream}"
         )
@@ -223,7 +223,7 @@ class IRProxyStep(HandlerStep):
             async with client.stream(
                 "POST", target_url, json=upstream_body, headers=req_headers, timeout=120.0
             ) as resp:
-                logger.info(f"IR proxy stream response status: {resp.status_code}")
+                logger.debug(f"IR proxy stream response status: {resp.status_code}")
                 if resp.status_code >= 400:
                     # 错误处理：发 error event 给客户端
                     error_body = await resp.aread()

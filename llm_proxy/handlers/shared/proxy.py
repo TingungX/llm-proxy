@@ -236,7 +236,7 @@ class ProxyStep(HandlerStep):
         messages_path = resolve_path(model_paths, "anthropic/messages")
         target_url = f"{api_base.rstrip('/')}/{messages_path.lstrip('/')}"
         req_headers = _build_anthropic_upstream_headers(api_key, ctx.headers)
-        logger.info(f"Anthropic proxy: {target_url}, model={actual_model}, stream={stream}")
+        logger.debug(f"Anthropic proxy: {target_url}, model={actual_model}, stream={stream}")
 
         if stream:
             ctx.response = StreamingResponse(
@@ -258,13 +258,13 @@ class ProxyStep(HandlerStep):
                 if not fr:
                     break
                 f_api_base, f_api_key, f_upstream, f_model_id, _, next_failover = fr
-                logger.info(f"Failover: trying {current} -> {f_model_id}")
+                logger.debug(f"Failover: trying {current} -> {f_model_id}")
                 f_paths = s.paths_map.get(f_model_id.lower(), {})
                 f_msg_path = resolve_path(f_paths, "anthropic/messages")
                 f_target_url = f"{f_api_base.rstrip('/')}/{f_msg_path.lstrip('/')}"
                 fb, fs = await self._anthropic_request(f_target_url, f_api_key, f_upstream, out_body, ctx.headers, f_model_id)
                 if fs < 400 or fb.get("type") != "error":
-                    logger.info(f"Failover succeeded: {current} -> {f_model_id}")
+                    logger.debug(f"Failover succeeded: {current} -> {f_model_id}")
                     resp_body, status_code = fb, fs
                     break
                 if not _is_rate_error(fb, fs):
@@ -332,7 +332,7 @@ class ProxyStep(HandlerStep):
         try:
             client = _client_for(model_id)
             async with client.stream("POST", target_url, json=out_body, headers=req_headers, timeout=120.0) as resp:
-                logger.info(f"Anthropic stream response status: {resp.status_code}")
+                logger.debug(f"Anthropic stream response status: {resp.status_code}")
                 async for chunk in sse_stream(resp, on_event=track_usage):
                     yield chunk
         except Exception as e:
@@ -383,7 +383,7 @@ class ProxyStep(HandlerStep):
             "Content-Type": "application/json",
         }
 
-        logger.info(f"Cross-protocol: {target_url}, model={actual_model}, stream={stream}")
+        logger.debug(f"Cross-protocol: {target_url}, model={actual_model}, stream={stream}")
 
         # 2. 流式请求
         if stream:
@@ -427,10 +427,10 @@ class ProxyStep(HandlerStep):
                     error_msg = str(error_obj)
 
             if should_rectify(error_msg):
-                logger.info(f"Thinking rectifier triggered for model {model_id}, retrying...")
+                logger.debug(f"Thinking rectifier triggered for model {model_id}, retrying...")
                 rectified_body = dict(body)
                 result = rectify_request(rectified_body)
-                logger.info(
+                logger.debug(
                     f"Rectify result: applied={result.applied}, "
                     f"removed_thinking={result.removed_thinking_blocks}, "
                     f"removed_redacted={result.removed_redacted_thinking_blocks}, "
@@ -504,7 +504,7 @@ class ProxyStep(HandlerStep):
         try:
             client = _client_for(model_id)
             async with client.stream("POST", target_url, json=chat_body, headers=req_headers, timeout=120.0) as resp:
-                logger.info(f"Cross-protocol stream response status: {resp.status_code}")
+                logger.debug(f"Cross-protocol stream response status: {resp.status_code}")
 
                 if resp.status_code >= 400:
                     upstream_errored = True
@@ -616,7 +616,7 @@ class ProxyStep(HandlerStep):
         try:
             client = _client_for(model_id)
             async with client.stream("POST", target_url, json=body, headers=headers, timeout=120.0) as resp:
-                logger.info(f"Direct stream response status: {resp.status_code}")
+                logger.debug(f"Direct stream response status: {resp.status_code}")
                 if resp.status_code >= 400:
                     error_body = await resp.aread()
                     error_msg = error_body.decode()
@@ -821,7 +821,7 @@ class ProxyStep(HandlerStep):
             "Authorization": f"Bearer {upstream_api_key}",
             "Content-Type": "application/json",
         }
-        logger.info(f"Chat completions proxy: {target_url}, model={actual_model}, stream={stream}")
+        logger.debug(f"Chat completions proxy: {target_url}, model={actual_model}, stream={stream}")
 
         if stream:
             self._record_usage(ctx, endpoint_id, model_id, 0, 0)
@@ -872,7 +872,7 @@ class ProxyStep(HandlerStep):
         client = _client_for(model_id)
         try:
             async with client.stream("POST", target_url, json=body, headers=headers, timeout=120.0) as resp:
-                logger.info(f"Chat stream response status: {resp.status_code}")
+                logger.debug(f"Chat stream response status: {resp.status_code}")
                 async for chunk in resp.aiter_bytes():
                     yield chunk
         except Exception as e:
@@ -899,7 +899,7 @@ class ProxyStep(HandlerStep):
             "Authorization": f"Bearer {upstream_api_key}",
             "Content-Type": "application/json",
         }
-        logger.info(f"Chat→Responses: {target_url}, model={actual_model}, stream={stream}")
+        logger.debug(f"Chat→Responses: {target_url}, model={actual_model}, stream={stream}")
 
         if stream:
             self._record_usage(ctx, endpoint_id, model_id, 0, 0)
@@ -954,7 +954,7 @@ class ProxyStep(HandlerStep):
         try:
             client = _client_for(model_id)
             async with client.stream("POST", target_url, json=body, headers=headers, timeout=120.0) as resp:
-                logger.info(f"Chat→Responses stream status: {resp.status_code}")
+                logger.debug(f"Chat→Responses stream status: {resp.status_code}")
                 if resp.status_code >= 400:
                     error_body = await resp.aread()
                     error_chunk = {"error": {"message": error_body.decode(), "type": "api_error"}}

@@ -212,9 +212,9 @@ async def count_tokens(request: Request):
         resp = await client.post(target_url, json=token_body, headers=req_headers, timeout=30.0)
         if resp.status_code == 200:
             return JSONResponse(resp.json())
-        logger.info(f"count_tokens upstream returned {resp.status_code}, using estimate")
+        logger.debug(f"count_tokens upstream returned {resp.status_code}, using estimate")
     except Exception as e:
-        logger.info(f"count_tokens error: {e}, using estimate")
+        logger.debug(f"count_tokens error: {e}, using estimate")
 
     messages = body.get("messages", [])
     total_chars = sum(len(str(m.get("content", ""))) for m in messages)

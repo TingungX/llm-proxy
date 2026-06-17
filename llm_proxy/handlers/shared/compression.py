@@ -38,7 +38,7 @@ class CompressionStep(HandlerStep):
             compressor.compress_chat_body(ctx.body)
 
         if compressor.stats.items_compressed > 0:
-            logger.info(
+            logger.debug(
                 "Input compressed: %d items, %d→%d chars",
                 compressor.stats.items_compressed,
                 compressor.stats.original_chars,
