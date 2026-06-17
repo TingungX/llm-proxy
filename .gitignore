@@ -41,6 +41,7 @@ static/.vite/
 .coverage
 
 # AI dev files
+AGENTS.md
 CLAUDE.md
 .superpowers/
 .opencode/
