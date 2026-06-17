@@ -2,20 +2,86 @@
 
 LLM Proxy — 基于 FastAPI 的 LLM API 聚合网关，支持多模型、多协议的双向格式转换。Anthropic Messages、OpenAI Chat Completions、OpenAI Responses 三种请求格式均可路由到任意格式的上游模型。
 
-## Dev 数据库接入
+## Dev 环境规范（强约束）
 
-dev server 接入的是**稳定服务器**（main 分支 root）的数据，不是临时假数据：
+**所有代码修改和调试必须在 dev server 中进行，在 CLI 副本测试通过后才准合并到 main。**
 
-- **DB 来源**：`/Users/tingung/Projects/github/llm-proxy/usage.db`（main 分支 worktree 根目录）
-- **config 来源**：`/Users/tingung/Projects/github/llm-proxy/config.json`（main 分支根，11 个模型）
-- **接入步骤**：
-  1. 停止 dev server（`lsof -ti:4001 | xargs kill -9`）
-  2. 备份当前 dev DB：`cp usage.db usage.db.bak.dev-$(date +%Y%m%d-%H%M%S)`
-  3. 复制 main DB：`cp /Users/tingung/Projects/github/llm-proxy/usage.db usage.db`
-  4. 同样处理 `config.json`
-  5. 启动 dev server（`python3 -m uvicorn llm_proxy.main:app --port 4001`）
-- **当前数据规模**（2026-06-12 同步）：~7400+ records / 95M+ token / 4+ 端点 / 11+ 模型
+### 架构
+
+```
+生产环境（不受影响）          开发环境
+─────────────────          ─────────────────
+llm-proxy (main)           llm-proxy-dev (dev 分支)
+  └─ Docker :4000            └─ uvicorn --reload :4010
+  └─ Codex → :4000           └─ Codex dev profile → :4010
+  └─ Claude Code → :4000     └─ Claude Code (项目级配置) → :4010
+```
+
+### dev server（`../llm-proxy-dev/`）
+
+- **位置**：`/Users/tingung/Projects/github/llm-proxy-dev`（git worktree，`dev` 分支）
+- **端口**：4010
+- **启动**：`cd ../llm-proxy-dev && ./dev.sh start`
+- **停止**：`cd ../llm-proxy-dev && ./dev.sh stop`
+- **日志**：`cd ../llm-proxy-dev && ./dev.sh log`（或 `tail -f ../llm-proxy-dev/dev-server.log`）
+- **连接终端**：`screen -r llm-proxy-dev`（Ctrl-A D 退出）
+- **环境变量**：自动加载 `../llm-proxy-dev/.dev-env`（`LLM_PROXY_DEV=true`，`LLM_PROXY_LOG_LEVEL=DEBUG`）
+- **DB 同步**：从 main 复制 `usage.db` 和 `config.json`（见下方同步步骤）
+
+### Codex CLI dev 副本
+
+```bash
+# 连接 dev server (port 4010)
+codex -p dev
+
+# 对比：连接生产 (port 4000) — 不变
+codex
+```
+
+- **Profile 文件**：`~/.codex/dev.config.toml`
+- 仅覆盖 `model_provider` 和 `base_url`，其他配置（插件、MCP、features）继承自 `~/.codex/config.toml`
+
+### Claude Code CLI dev 副本
+
+```bash
+# 在 llm-proxy-dev 目录下启动 Claude Code
+cd ../llm-proxy-dev
+claude
+
+# 项目级 .claude/settings.local.json 自动覆盖 ANTHROPIC_BASE_URL 为 :4010
+```
+
+- **配置文件**：`../llm-proxy-dev/.claude/settings.local.json`
+- 本机 `~/.claude/settings.json` 不变（仍指向 :4000）
+
+### DB 同步步骤
+
+dev server 接入的是**稳定服务器**（main 分支 root）的数据：
+
+1. 停止 dev server：`cd ../llm-proxy-dev && ./dev.sh stop`
+2. 备份当前 dev DB：`cp usage.db usage.db.bak.dev-$(date +%Y%m%d-%H%M%S)`
+3. 复制 main DB：`cp /Users/tingung/Projects/github/llm-proxy/usage.db ../llm-proxy-dev/usage.db`
+4. 同样处理 `config.json`
+5. 启动 dev server：`./dev.sh`
 - **不要**直接 git add/rm `usage.db`、`*.bak.dev-*`
+
+### 工作流
+
+1. **修改代码**：在 `../llm-proxy-dev/` 中修改，dev server 自动热更新
+2. **验证**：用 CLI 副本（`codex -p dev` 或 `cd ../llm-proxy-dev && claude`）测试
+3. **合并**：CLI 副本测试通过后，将 dev 分支合并到 main
+4. **部署**：main 分支通过 Docker 部署到生产（:4000）
+
+### 日志分层
+
+| 环境 | 默认级别 | 说明 |
+|------|----------|------|
+| dev (`LLM_PROXY_DEV=true`) | DEBUG | 全量日志：per-request 路由、协议选择、流处理、chunk 内容 |
+| prod (Docker/main) | WARNING | 仅警告和错误；生命周期日志（启动/关闭/定时任务）始终 INFO |
+| 手动覆盖 | `LLM_PROXY_LOG_LEVEL=INFO` | 可随时调高 dev 日志级别 |
+
+- 生命周期日志使用 `logging.getLogger("llm_proxy.lifecycle")`，不受全局级别影响
+- per-request 日志（路由、协议选择、流处理）在代码中为 `logger.debug`，dev 环境下可见，prod 下静默
 
 ## 验证（改代码后必跑）
 
@@ -26,13 +92,17 @@ python -m pytest tests/ -v && python tests/smoke_test.py
 ## 命令
 
 ```bash
-# 开发（dev server, port 4001）
-uvicorn llm_proxy.main:app --port 4001 --reload
+# 开发（dev server, port 4010）
+cd ../llm-proxy-dev && ./dev.sh
 
 # 生产（Docker, port 4000，已部署）
-docker build -t llm-proxy .
-docker rm -f llm-proxy 2>/dev/null
-docker run -d -p 4000:4000 --name llm-proxy llm-proxy
+# ⚠️ 必须用 docker-compose 启动，不能用裸 docker run
+# 原因：config.json 和 usage.db 通过 volume 挂载，裸 docker run 不会挂载，
+# Docker 会把不存在的 bind mount 源自动创建为空目录，导致 FileNotFoundError
+docker compose up -d
+
+# 重建镜像后重启
+docker compose up -d --build
 
 # 测试
 python -m pytest tests/ -v                                       # 单元测试

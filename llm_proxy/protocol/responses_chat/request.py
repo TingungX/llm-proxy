@@ -267,7 +267,7 @@ def convert_input_to_messages(input_data, instructions: str | None = None) -> li
             # mcp_call：转为 Chat tool_calls（McpCall 用 id 字段，非 call_id）
             if item_type == "mcp_call":
                 mcp_call_id = item.get("call_id") or item.get("id", "")
-                logger.info(
+                logger.debug(
                     "mcp_call input: id=%s, call_id=%s, name=%s, server_label=%s, "
                     "has_output=%s, has_error=%s, status=%s",
                     item.get("id", "-"), item.get("call_id", "-"),
@@ -742,7 +742,7 @@ async def stream_chat_to_responses(
             except Exception as e:
                 logger.warning(f"Error reading upstream stream lines: {e}", exc_info=True)
             finally:
-                logger.info(f"_read_lines finished, stream_done=True, lines={line_count}")
+                logger.debug(f"_read_lines finished, stream_done=True, lines={line_count}")
                 stream_done = True
                 await line_queue.put(None)
 
@@ -821,6 +821,16 @@ async def stream_chat_to_responses(
         if result is not None:
             result["completed"] = completed
             result["has_text"] = bool(state.text_buf) or state.in_text_block
+
+        if completed:
+            output_items = state._build_output_items()
+            logger.debug(
+                f"Stream completed: output_items={len(output_items)}, "
+                f"item_types={[o.get('type') for o in output_items]}, "
+                f"text_buf_len={len(state.text_buf)}, "
+                f"reasoning_buf_len={len(state.reasoning_buf)}, "
+                f"in_func_block={state.in_func_block}"
+            )
 
         if not completed:
             logger.warning(f"Stream ended without [DONE] marker for model {model}")

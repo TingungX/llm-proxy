@@ -41,5 +41,4 @@ class VisionFallbackStep(HandlerStep):
             if isinstance(ctx.body.get("messages"), list):
                 ctx.body["messages"] = await replace_images_in_chat_messages(ctx.body["messages"])
 
-        logger.info(f"Vision fallback applied for model {model_id}")
-
+        logger.debug(f"Vision fallback applied for model {model_id}")

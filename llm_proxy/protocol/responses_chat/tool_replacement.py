@@ -364,14 +364,14 @@ def _parse_segment(action: str, path: str, lines: list[str]) -> dict | None:
             if plus_lines:
                 # 有 Move to → 必须用 replace_in_file（append_to_file 不支持 destinationPath）
                 if dest_path is not None:
-                    logger.info("Update File has only '+' lines with Move to, degrading to user message: %s", path)
+                    logger.debug("Update File has only '+' lines with Move to, degrading to user message: %s", path)
                     return {
                         "tool": "_degraded_user_message",
                         "args": {
                             "content": f"[File {path} was modified (rename to {dest_path}, append) — appended content]\n" + "\n".join(plus_lines),
                         },
                     }
-                logger.info("Update File has only '+' lines and no context (append), converting to append_to_file: %s", path)
+                logger.debug("Update File has only '+' lines and no context (append), converting to append_to_file: %s", path)
                 return {
                     "tool": "append_to_file",
                     "args": {

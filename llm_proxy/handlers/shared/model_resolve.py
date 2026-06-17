@@ -20,7 +20,7 @@ class ModelResolveStep(HandlerStep):
 
     async def execute(self, ctx: PipelineContext) -> None:
         raw_model = ctx.body.get("model", "")
-        logger.info(f"Received request for model: {raw_model}")
+        logger.debug(f"Received request for model: {raw_model}")
 
         s = get_state()
         endpoint = ctx.endpoint
@@ -34,7 +34,7 @@ class ModelResolveStep(HandlerStep):
             raise PipelineStop(_make_error(ctx, f"Unknown model: {raw_model}", "invalid_request_error", 400))
 
         api_base, api_key, actual_model, model_id, upstream_protocol, failover_family = resolved
-        logger.info(f"Resolved: raw={raw_model} -> actual={actual_model} config_key={model_id} protocol={upstream_protocol}")
+        logger.debug(f"Resolved: raw={raw_model} -> actual={actual_model} config_key={model_id} protocol={upstream_protocol}")
 
         if not api_key:
             logger.error(f"Model {model_id} has no API key configured")
@@ -56,4 +56,3 @@ class ModelResolveStep(HandlerStep):
             ))
 
         ctx.resolved = resolved
-

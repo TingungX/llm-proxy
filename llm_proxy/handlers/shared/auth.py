@@ -34,7 +34,7 @@ class AuthStep(HandlerStep):
     async def execute(self, ctx: PipelineContext) -> None:
         client_api_key = _extract_api_key(ctx.headers)
         masked = f"{client_api_key[:4]}***" if len(client_api_key) > 4 else "***"
-        logger.info(f"Auth: client_api_key={masked}")
+        logger.debug(f"Auth: client_api_key={masked}")
 
         if not client_api_key:
             raise PipelineStop(_make_error(ctx, "API Key is required", "invalid_request_error", 401))
@@ -50,4 +50,3 @@ class AuthStep(HandlerStep):
 
         ctx.api_key = client_api_key
         ctx.endpoint = endpoint
-

@@ -47,7 +47,7 @@ class OpenAIProtocolStep(HandlerStep):
             t.get("type") in self.NON_CHAT_TOOL_TYPES for t in (body.get("tools") or [])
         )
         if has_non_chat_tools:
-            logger.info("Request has non-chat tool types, restricting to openai/chat-completions")
+            logger.debug("Request has non-chat tool types, restricting to openai/chat-completions")
             model_protocols = model_protocols & {"openai", "openai/chat-completions"}
 
         try:
@@ -69,7 +69,7 @@ class OpenAIProtocolStep(HandlerStep):
                 400,
             ))
 
-        logger.info(f"Protocol: upstream={upstream_protocol}, converter={ctx.converter}")
+        logger.debug(f"Protocol: upstream={upstream_protocol}, converter={ctx.converter}")
 
 
 class ToolCallFixStep(HandlerStep):
@@ -78,7 +78,7 @@ class ToolCallFixStep(HandlerStep):
     async def execute(self, ctx: PipelineContext) -> None:
         if isinstance(ctx.body.get("messages"), list):
             ctx.body["messages"] = fix_orphaned_tool_calls(ctx.body["messages"])
-            logger.info("Tool call fix applied")
+            logger.debug("Tool call fix applied")
 
 
 class OpenAIHandler:
