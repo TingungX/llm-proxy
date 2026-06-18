@@ -4,8 +4,6 @@ import uuid
 
 from typing import TYPE_CHECKING
 
-from llm_proxy.protocol.responses_chat.tool_replacement import reverse_tool_args_to_apply_patch, ReverseConversionError
-
 if TYPE_CHECKING:
     from llm_proxy.protocol.responses_chat.request import CodexToolSpec
 from llm_proxy.protocol.think_tag import ThinkTagStateMachine
@@ -289,92 +287,15 @@ class StreamState:
             downstream_name = self.reverse_tool_map.get(name)
 
             if downstream_name is not None:
-                try:
-                    parsed_args = json.loads(args) if isinstance(args, str) else args
-                except json.JSONDecodeError:
-                    # arguments 被截断（如上游模型输出 token 超限）
-                    # 不发 custom_tool_call，改发 text message，避免 Codex 执行无效 apply_patch 死循环
-                    logger.warning(
-                        "Truncated tool call arguments for %s (call_id=%s), "
-                        "falling back to text message",
-                        name, call_id,
-                    )
-                    truncated_msg = (
-                        f"[Output truncated] The tool call {name} was interrupted "
-                        f"because the arguments were too long and got truncated. "
-                        f"Consider using append_to_file to write content in smaller chunks."
-                    )
-                    # 发 text message 而非 custom_tool_call，这样 Codex 不会执行 apply_patch
-                    events.append(_make_sse_event({
-                        "type": "response.output_text.delta",
-                        "item_id": f"msg_{call_id}",
-                        "output_index": output_index,
-                        "delta": truncated_msg,
-                    }))
-                    events.append(_make_sse_event({
-                        "type": "response.output_text.done",
-                        "item_id": f"msg_{call_id}",
-                        "output_index": output_index,
-                        "sequence_number": self._next_seq(),
-                    }))
-                    events.append(_make_sse_event({
-                        "type": "response.output_item.done",
-                        "output_index": output_index,
-                        "sequence_number": self._next_seq(),
-                        "item": {
-                            "id": f"msg_{call_id}",
-                            "type": "message",
-                            "status": "completed",
-                            "content": [{"type": "output_text", "text": truncated_msg}],
-                        },
-                    }))
-                    continue
-
-                if downstream_name == "apply_patch":
-                    # apply_patch：需要将标准文件工具参数转换为 apply_patch DSL
-                    try:
-                        input_text = reverse_tool_args_to_apply_patch(name, parsed_args)
-                    except ReverseConversionError as exc:
-                        # 反向转换失败 → 发 text message 而非 custom_tool_call，避免 Codex 执行无效 apply_patch
-                        logger.warning("Reverse conversion failed: %s", exc)
-                        error_msg = (
-                            f"Tool call {name} failed: {exc.reason}. {exc.detail}"
-                        )
-                        # 发 text message，Codex 不会执行 apply_patch，模型收到错误文本后可修正重试
-                        events.append(_make_sse_event({
-                            "type": "response.output_text.delta",
-                            "item_id": f"msg_{call_id}",
-                            "output_index": output_index,
-                            "delta": error_msg,
-                        }))
-                        events.append(_make_sse_event({
-                            "type": "response.output_text.done",
-                            "item_id": f"msg_{call_id}",
-                            "output_index": output_index,
-                            "sequence_number": self._next_seq(),
-                        }))
-                        events.append(_make_sse_event({
-                            "type": "response.output_item.done",
-                            "output_index": output_index,
-                            "sequence_number": self._next_seq(),
-                            "item": {
-                                "id": f"msg_{call_id}",
-                                "type": "message",
-                                "status": "completed",
-                                "content": [{"type": "output_text", "text": error_msg}],
-                            },
-                        }))
-                        continue
-                else:
-                    # 其他 custom 工具（spawn_agent, view_image 等）：
-                    # 参数本身就是 JSON，直接序列化为 input
-                    input_text = json.dumps(parsed_args, ensure_ascii=False)
+                # 透传模式：arguments 原样作为 custom_tool_call.input
+                if not isinstance(args, str):
+                    args = json.dumps(args, ensure_ascii=False)
 
                 events.append(_make_sse_event({
                     "type": "response.custom_tool_call_input.delta",
                     "item_id": f"fc_{call_id}",
                     "call_id": call_id,
-                    "delta": input_text,
+                    "delta": args,
                 }))
                 events.append(_make_sse_event({
                     "type": "response.output_item.done",
@@ -386,7 +307,7 @@ class StreamState:
                         "name": downstream_name,
                         "status": "completed",
                         "call_id": call_id,
-                        "input": input_text,
+                        "input": args,
                     },
                 }))
             else:
@@ -518,50 +439,16 @@ class StreamState:
             args = self.func_args_buf[idx] or "{}"
             downstream_name = self.reverse_tool_map.get(name)
             if downstream_name is not None:
-                try:
-                    parsed_args = json.loads(args) if isinstance(args, str) else args
-                except json.JSONDecodeError:
-                    # arguments 被截断 → 发 message 而非 custom_tool_call
-                    logger.warning(
-                        "Truncated tool call arguments for %s (call_id=%s), "
-                        "falling back in output items",
-                        name, call_id,
-                    )
-                    truncated_msg = (
-                        f"[Output truncated] The tool call {name} was interrupted "
-                        f"because the arguments were too long and got truncated. "
-                        f"Consider using append_to_file to write content in smaller chunks."
-                    )
-                    items.append({
-                        "id": f"msg_{call_id}",
-                        "type": "message",
-                        "status": "completed",
-                        "content": [{"type": "output_text", "text": truncated_msg}],
-                    })
-                    continue
-                if downstream_name == "apply_patch":
-                    try:
-                        input_text = reverse_tool_args_to_apply_patch(name, parsed_args)
-                    except ReverseConversionError as exc:
-                        logger.warning("Reverse conversion failed: %s", exc)
-                        error_msg = f"Tool call {name} failed: {exc.reason}. {exc.detail}"
-                        items.append({
-                            "id": f"msg_{call_id}",
-                            "type": "message",
-                            "status": "completed",
-                            "content": [{"type": "output_text", "text": error_msg}],
-                        })
-                        continue
-                else:
-                    # 其他 custom 工具：参数直接 JSON 序列化
-                    input_text = json.dumps(parsed_args, ensure_ascii=False)
+                # 透传模式：arguments 原样作为 custom_tool_call.input
+                if not isinstance(args, str):
+                    args = json.dumps(args, ensure_ascii=False)
                 items.append({
                     "id": f"fc_{call_id}",
                     "type": "custom_tool_call",
                     "name": downstream_name,
                     "status": "completed",
                     "call_id": call_id,
-                    "input": input_text,
+                    "input": args,
                 })
             else:
                 spec = self.tool_spec_map.get(name)

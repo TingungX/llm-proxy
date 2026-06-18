@@ -253,26 +253,22 @@ class TestConvertToolsToChatCustomPassthrough:
         assert "task_name" in result[0]["function"]["parameters"]["properties"]
         assert reverse_map["spawn_agent"] == "spawn_agent"
 
-    def test_apply_patch_still_expands_to_four_tools(self):
-        """apply_patch 仍应展开为 4 个标准文件工具"""
+    def test_apply_patch_passthrough(self):
+        """透传：apply_patch 转为单个 function tool + reverse_tool_map 自映射"""
         from llm_proxy.protocol.responses_chat.request import convert_tools_to_chat
         tools = [
-            {"type": "custom", "name": "apply_patch"},
+            {"type": "custom", "name": "apply_patch", "description": "Apply a patch"},
         ]
         result, reverse_map, nsmap = convert_tools_to_chat(tools)
-        assert len(result) == 4
-        names = [t["function"]["name"] for t in result]
-        assert "write_to_file" in names
-        assert "replace_in_file" in names
-        assert "delete_file" in names
-        assert "append_to_file" in names
-        assert reverse_map["write_to_file"] == "apply_patch"
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "apply_patch"
+        assert reverse_map["apply_patch"] == "apply_patch"
 
     def test_mixed_custom_and_apply_patch(self):
         """同时有 apply_patch 和 spawn_agent(namespace) 时，各自走不同路径"""
         from llm_proxy.protocol.responses_chat.request import convert_tools_to_chat
         tools = [
-            {"type": "custom", "name": "apply_patch"},
+            {"type": "custom", "name": "apply_patch", "description": "Apply a patch"},
             {
                 "type": "namespace",
                 "name": "multi_agent_v1",
@@ -288,11 +284,11 @@ class TestConvertToolsToChatCustomPassthrough:
             },
         ]
         result, reverse_map, nsmap = convert_tools_to_chat(tools)
-        assert len(result) == 5
+        assert len(result) == 2  # apply_patch + namespace 子工具
         names = [t["function"]["name"] for t in result]
-        assert "write_to_file" in names
+        assert "apply_patch" in names
         assert "multi_agent_v1__spawn_agent" in names
-        assert reverse_map["write_to_file"] == "apply_patch"
+        assert reverse_map["apply_patch"] == "apply_patch"
         # namespace 子工具以 function_call 格式返回给客户端，不写入 reverse_tool_map
         assert "spawn_agent" not in reverse_map
 
@@ -375,12 +371,12 @@ class TestConvertInputCustomToolPassthrough:
         args = json.loads(tc["function"]["arguments"])
         assert args["path"] == "/tmp/test.png"
 
-    def test_apply_patch_custom_tool_call_still_uses_dsl(self):
-        """apply_patch 的 custom_tool_call 仍应走 DSL 解析路径"""
+    def test_apply_patch_custom_tool_call_passthrough(self):
+        """透传：apply_patch 的 custom_tool_call input 原样作为 function arguments"""
         from llm_proxy.protocol.responses_chat.request import convert_input_to_messages
         input_data = [
             {"type": "custom_tool_call", "name": "apply_patch", "call_id": "call_3",
-             "input": "*** Begin Patch\n*** Add File: /tmp/test.txt\n+hello\n*** End File\n"},
+             "input": "*** Begin Patch\n*** Add File: /tmp/test.txt\n+hello\n*** End Patch"},
             {"type": "custom_tool_call_output", "call_id": "call_3",
              "output": "File created"},
         ]
@@ -388,18 +384,17 @@ class TestConvertInputCustomToolPassthrough:
         assistant_msgs = [m for m in messages if m.get("role") == "assistant" and m.get("tool_calls")]
         assert len(assistant_msgs) == 1
         tc = assistant_msgs[0]["tool_calls"][0]
-        # apply_patch 应被解析为 write_to_file
-        assert tc["function"]["name"] == "write_to_file"
-        args = json.loads(tc["function"]["arguments"])
-        assert args["filePath"] == "/tmp/test.txt"
-        assert args["content"] == "hello"
+        # 透传：function name 保持 apply_patch，arguments 是原始 DSL 字符串
+        assert tc["function"]["name"] == "apply_patch"
+        assert "*** Begin Patch" in tc["function"]["arguments"]
+        assert "/tmp/test.txt" in tc["function"]["arguments"]
 
-    def test_custom_tool_call_with_invalid_json_input(self):
-        """custom_tool_call 的 input 不是有效 JSON 时，应降级为空参数"""
+    def test_custom_tool_call_with_non_string_input(self):
+        """custom_tool_call 的 input 是非字符串时，应 JSON 序列化"""
         from llm_proxy.protocol.responses_chat.request import convert_input_to_messages
         input_data = [
             {"type": "custom_tool_call", "name": "spawn_agent", "call_id": "call_4",
-             "input": 'not valid json'},
+             "input": {"task_name": "task1", "message": "hi"}},
             {"type": "custom_tool_call_output", "call_id": "call_4",
              "output": "ok"},
         ]
@@ -409,7 +404,7 @@ class TestConvertInputCustomToolPassthrough:
         tc = assistant_msgs[0]["tool_calls"][0]
         assert tc["function"]["name"] == "spawn_agent"
         args = json.loads(tc["function"]["arguments"])
-        assert args == {}  # 降级为空 dict
+        assert args == {"task_name": "task1", "message": "hi"}
 
 
 class TestToResponsesResponseCustomPassthrough:
@@ -442,45 +437,46 @@ class TestToResponsesResponseCustomPassthrough:
         parsed = json.loads(item["input"])
         assert parsed["task_name"] == "task1"
 
-    def test_apply_patch_still_uses_dsl_in_response(self):
-        """上游返回 write_to_file 时，apply_patch 仍应走 DSL 转换"""
+    def test_apply_patch_passthrough_in_response(self):
+        """透传：上游返回 apply_patch 调用，arguments 原样作为 custom_tool_call.input"""
         from llm_proxy.protocol.responses_chat.request import to_responses_response
         chat_body = {
             "choices": [{
                 "message": {
                     "tool_calls": [{
-                        "id": "call_write1",
+                        "id": "call_patch1",
                         "type": "function",
                         "function": {
-                            "name": "write_to_file",
-                            "arguments": '{"filePath": "/tmp/test.txt", "content": "hello"}',
+                            "name": "apply_patch",
+                            "arguments": '{"input": "*** Begin Patch\\n*** Add File: /tmp/x.txt\\n+hello\\n*** End Patch"}',
                         },
                     }],
                 },
             }],
         }
-        reverse_map = {"write_to_file": "apply_patch"}
+        reverse_map = {"apply_patch": "apply_patch"}
         result = to_responses_response(chat_body, "gpt-4", reverse_map)
         output = result.get("output", [])
         custom_items = [o for o in output if o.get("type") == "custom_tool_call"]
         assert len(custom_items) == 1
         item = custom_items[0]
         assert item["name"] == "apply_patch"
-        assert "*** Begin Patch" in item["input"]
+        parsed = json.loads(item["input"])
+        assert "*** Begin Patch" in parsed["input"]
 
-    def test_mixed_custom_and_apply_patch_in_response(self):
-        """同时有 apply_patch 和 spawn_agent 时，各自走不同路径"""
+    def test_mixed_apply_patch_and_custom_in_response(self):
+        """透传：apply_patch 和 spawn_agent 都走 JSON 透传"""
         from llm_proxy.protocol.responses_chat.request import to_responses_response
         chat_body = {
             "choices": [{
                 "message": {
                     "tool_calls": [
                         {
-                            "id": "call_write1",
+                            "id": "call_patch1",
                             "type": "function",
                             "function": {
-                                "name": "write_to_file",
-                                "arguments": '{"filePath": "/tmp/test.txt", "content": "hello"}',
+                                "name": "apply_patch",
+                                "arguments": '{"input": "*** Begin Patch\\n*** Add File: a.txt\\n+hi\\n*** End Patch"}',
                             },
                         },
                         {
@@ -495,7 +491,7 @@ class TestToResponsesResponseCustomPassthrough:
                 },
             }],
         }
-        reverse_map = {"write_to_file": "apply_patch", "spawn_agent": "spawn_agent"}
+        reverse_map = {"apply_patch": "apply_patch", "spawn_agent": "spawn_agent"}
         result = to_responses_response(chat_body, "gpt-4", reverse_map)
         output = result.get("output", [])
         custom_items = [o for o in output if o.get("type") == "custom_tool_call"]
@@ -503,12 +499,12 @@ class TestToResponsesResponseCustomPassthrough:
         names = [i["name"] for i in custom_items]
         assert "apply_patch" in names
         assert "spawn_agent" in names
-        # apply_patch 的 input 是 DSL
         apply_item = [i for i in custom_items if i["name"] == "apply_patch"][0]
-        assert "*** Begin Patch" in apply_item["input"]
-        # spawn_agent 的 input 是 JSON
+        apply_parsed = json.loads(apply_item["input"])
+        assert "*** Begin Patch" in apply_parsed["input"]
         spawn_item = [i for i in custom_items if i["name"] == "spawn_agent"][0]
         parsed = json.loads(spawn_item["input"])
+        assert parsed["task_name"] == "task1"
 
 
 class TestStreamChatToResponsesEmptyChoices:

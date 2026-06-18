@@ -327,8 +327,8 @@ class TestResponsesIRRoundtripRequest:
         assert tool_msg["tool_call_id"] == "call_1"
         assert tool_msg["content"] == "4"
 
-    def test_apply_patch_tool_expanded(self):
-        """apply_patch custom 工具展开为 4 个标准文件工具。"""
+    def test_apply_patch_passthrough_in_ir(self):
+        """apply_patch 透传：单 function tool + reverse_tool_map 自映射。"""
         body = {
             "model": "gpt-5",
             "input": "Add a file",
@@ -339,12 +339,10 @@ class TestResponsesIRRoundtripRequest:
             }],
         }
         ir = responses_to_ir(body)
-        # reverse_tool_map 应包含 4 个文件工具
+        assert len(ir.tools) == 1
+        assert ir.tools[0].name == "apply_patch"
         rtm = ir.extensions.get("reverse_tool_map", {})
-        assert set(rtm.values()) == {"apply_patch"}
-        # tools 列表应包含 4 个标准工具
-        tool_names = {t.name for t in ir.tools}
-        assert tool_names == {"write_to_file", "replace_in_file", "delete_file", "append_to_file"}
+        assert rtm.get("apply_patch") == "apply_patch"
 
 
 # ── Anthropic → IR → Responses（核心：拼图最后一块）──

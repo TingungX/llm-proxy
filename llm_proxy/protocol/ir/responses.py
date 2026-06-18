@@ -1,6 +1,6 @@
 """OpenAI Responses API ↔ IR 转换器。
 
-复用 responses_chat/tool_replacement.py 中的 apply_patch 解析与反向构造。
+透传模式：apply_patch 不再展开为 4 个标准文件工具，直接降级为 function tool。
 """
 
 from __future__ import annotations
@@ -41,21 +41,8 @@ from llm_proxy.protocol.ir.types import (
     IRToolResultBlock,
     IRToolUseBlock,
 )
-from llm_proxy.protocol.responses_chat.tool_replacement import (
-    APPEND_TOOL_DEF,
-    DELETE_TOOL_DEF,
-    REPLACE_TOOL_DEF,
-    WRITE_TOOL_DEF,
-    build_reverse_tool_map,
-    parse_apply_patch_to_simple,
-    reverse_tool_args_to_apply_patch,
-    ReverseConversionError,
-)
 
 logger = logging.getLogger(__name__)
-
-# 标准文件工具名（apply_patch 展开后的 4 个）
-_STANDARD_FILE_TOOL_NAMES = frozenset({"write_to_file", "replace_in_file", "delete_file", "append_to_file"})
 
 
 # ── 请求：Responses → IR ──────────────────────────────────────────
@@ -253,8 +240,7 @@ def _extract_reasoning_text(item: dict) -> str:
 def _convert_tools_to_ir(tools: list) -> tuple[list[IRToolDef], dict[str, str], dict[str, dict]]:
     """Responses tools → (IRToolDef list, reverse_tool_map, tool_spec_map)。
 
-    处理 custom / namespace / web_search / function 等类型。
-    apply_patch 展开为 4 个标准文件工具。
+    透传模式：apply_patch 与其他 custom 工具一致，直接降级为 function tool。
     tool_spec_map 的 value 为 {"kind": "...", "name": "...", "namespace": "..."}。
     """
     ir_tools: list[IRToolDef] = []
@@ -275,15 +261,18 @@ def _convert_tools_to_ir(tools: list) -> tuple[list[IRToolDef], dict[str, str], 
 
         if tool_type == "custom":
             name = tool.get("name", "")
-            if name == "apply_patch":
-                # 展开为 4 个标准文件工具
-                _add_standard_file_tools(ir_tools, reverse_tool_map)
-                continue
-            # 其他 custom 工具 → 降级为 function
+            # 透传：apply_patch 与其他 custom 工具一致，直接降级为单个 function tool
+            params = _normalize_params(tool.get("parameters"))
+            if not params.get("properties"):
+                params = {
+                    "type": "object",
+                    "properties": {"input": {"type": "string", "description": "Tool input (e.g., apply_patch DSL text)."}},
+                    "required": [],
+                }
             ir_tools.append(IRToolDef(
                 name=name,
                 description=tool.get("description", ""),
-                parameters=clean_schema(_normalize_params(tool.get("parameters"))),
+                parameters=clean_schema(params),
             ))
             reverse_tool_map[name] = name
             tool_spec_map[name] = {"kind": "custom", "name": name}
@@ -354,18 +343,6 @@ def _normalize_params(params) -> dict:
     params.setdefault("properties", {})
     params.setdefault("required", [])
     return params
-
-
-def _add_standard_file_tools(ir_tools: list[IRToolDef], reverse_tool_map: dict[str, str]):
-    """添加 4 个标准文件工具到 IR tools 列表。"""
-    for tool_def in (WRITE_TOOL_DEF, REPLACE_TOOL_DEF, DELETE_TOOL_DEF, APPEND_TOOL_DEF):
-        func = tool_def.get("function", {})
-        ir_tools.append(IRToolDef(
-            name=func.get("name", ""),
-            description=func.get("description", ""),
-            parameters=clean_schema(func.get("parameters", {})),
-        ))
-    reverse_tool_map.update(build_reverse_tool_map())
 
 
 # ── 响应：IR → Responses ──────────────────────────────────────────
@@ -678,33 +655,13 @@ def _tools_ir_to_responses(
 ) -> list[dict]:
     """IRToolDef list → Responses tools 列表。
 
-    如果 reverse_tool_map 包含标准文件工具，反向还原为 apply_patch custom tool。
+    透传模式：每个 IRToolDef 直接还原为 Responses function tool。
     """
     if not ir_tools:
         return []
 
-    # 检测是否所有标准文件工具都存在 → 还原为 apply_patch
-    tool_names = {t.name for t in ir_tools}
-    if _STANDARD_FILE_TOOL_NAMES.issubset(tool_names) and reverse_tool_map:
-        # 所有 4 个标准工具都存在 → 还原为 apply_patch
-        return [{
-            "type": "custom",
-            "name": "apply_patch",
-            "description": "Apply a patch to files in the workspace.",
-        }]
-
     result: list[dict] = []
     for tool in ir_tools:
-        if tool.name in _STANDARD_FILE_TOOL_NAMES and reverse_tool_map:
-            # 单个标准文件工具：作为 custom tool（apply_patch 的一部分）
-            result.append({
-                "type": "custom",
-                "name": reverse_tool_map.get(tool.name, tool.name),
-                "description": tool.description,
-                "format": {"type": "grammar", "syntax": "lark"},
-            })
-            continue
-
         result.append({
             "type": "function",
             "name": tool.name,
@@ -958,8 +915,8 @@ async def format_ir_as_sse(
     - response.output_item.done ×N
     - response.completed（含 status, output 数组, usage）
 
-    reverse_tool_map 命中时：
-    - tool_use_end 的 input 用 reverse_tool_args_to_apply_patch 反向构造
+    reverse_tool_map 命中时（透传模式）：
+    - tool_use_end 的 input 原样作为 custom_tool_call.input
     - 走 custom_tool_call 事件序列（不是 function_call）
     tool_spec_map 命中且子工具时：
     - 普通 function_call，但使用原始 sub-tool 名，附加 namespace 字段
@@ -1353,86 +1310,22 @@ async def format_ir_as_sse(
                 for ev in close_current_item():
                     yield ev
             elif current_item_type == "custom_tool_call":
-                # 反向构造 apply_patch DSL
+                # 透传模式：final_input 原样作为 custom_tool_call.input
                 final_input = data.get("input", {})
-                if not isinstance(final_input, dict):
-                    final_input = {}
-                try:
-                    input_text = reverse_tool_args_to_apply_patch(
-                        current_tool_name, final_input
-                    )
-                except ReverseConversionError as exc:
-                    # 反向失败 → 降级为 text message
-                    logger.warning("Reverse tool args failed: %s", exc)
-                    for ev in close_current_item():
-                        yield ev
-                    err_msg = f"Tool call {current_tool_name} failed: {exc.reason}. {exc.detail}"
-                    # 发 text message 代替
-                    err_msg_id = new_item_id("msg")
-                    last_text_id = err_msg_id
-                    has_text = True
-                    output_index = item_output_index()
-                    yield sse_format("response.output_item.added", {
-                        "output_index": output_index,
-                        "sequence_number": next_seq(),
-                        "item": {
-                            "id": err_msg_id,
-                            "type": "message",
-                            "status": "in_progress",
-                            "content": [],
-                            "role": "assistant",
-                        },
-                    })
-                    yield sse_format("response.content_part.added", {
-                        "item_id": err_msg_id,
-                        "output_index": output_index,
-                        "content_index": 0,
-                        "sequence_number": next_seq(),
-                        "part": {"type": "output_text", "text": ""},
-                    })
-                    yield sse_format("response.output_text.delta", {
-                        "item_id": err_msg_id,
-                        "output_index": output_index,
-                        "content_index": 0,
-                        "sequence_number": next_seq(),
-                        "delta": err_msg,
-                    })
-                    yield sse_format("response.output_text.done", {
-                        "item_id": err_msg_id,
-                        "output_index": output_index,
-                        "content_index": 0,
-                        "sequence_number": next_seq(),
-                        "delta": err_msg,
-                    })
-                    yield sse_format("response.content_part.done", {
-                        "item_id": err_msg_id,
-                        "output_index": output_index,
-                        "content_index": 0,
-                        "sequence_number": next_seq(),
-                        "part": {"type": "output_text", "text": err_msg},
-                    })
-                    yield sse_format("response.output_item.done", {
-                        "output_index": output_index,
-                        "sequence_number": next_seq(),
-                        "item": {
-                            "id": err_msg_id,
-                            "type": "message",
-                            "status": "completed",
-                            "content": [{"type": "output_text", "text": err_msg}],
-                            "role": "assistant",
-                        },
-                    })
+                if isinstance(final_input, dict):
+                    input_text = safe_json_dumps(final_input, default="{}")
                 else:
-                    tool_args_buf[current_tool_call_id] = input_text
-                    # emit custom_tool_call_input.delta（一次性给完 input）
-                    output_index = item_output_index()
-                    yield sse_format("response.custom_tool_call_input.delta", {
-                        "item_id": current_item_id,
-                        "call_id": current_tool_call_id,
-                        "delta": input_text,
-                    })
-                    for ev in close_current_item():
-                        yield ev
+                    input_text = str(final_input)
+                tool_args_buf[current_tool_call_id] = input_text
+                # emit custom_tool_call_input.delta（一次性给完 input）
+                output_index = item_output_index()
+                yield sse_format("response.custom_tool_call_input.delta", {
+                    "item_id": current_item_id,
+                    "call_id": current_tool_call_id,
+                    "delta": input_text,
+                })
+                for ev in close_current_item():
+                    yield ev
 
         elif etype == "usage":
             pending_usage = data

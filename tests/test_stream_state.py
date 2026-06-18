@@ -344,11 +344,11 @@ class TestCustomToolPassthrough:
         parsed = json.loads(input_text)
         assert parsed["path"] == "/tmp/test.png"
 
-    def test_apply_patch_still_uses_dsl_conversion(self):
-        """apply_patch 的标准文件工具仍应使用 DSL 转换"""
-        st = StreamState(reverse_tool_map={"write_to_file": "apply_patch"})
-        st.handle_tool_call_id(0, "call_write1", "write_to_file")
-        st.handle_tool_call_args_delta(0, '{"filePath": "/tmp/test.txt", "content": "hello"}')
+    def test_apply_patch_passthrough(self):
+        """透传：上游 apply_patch 调用的 arguments 原样作为 custom_tool_call.input"""
+        st = StreamState(reverse_tool_map={"apply_patch": "apply_patch"})
+        st.handle_tool_call_id(0, "call_patch1", "apply_patch")
+        st.handle_tool_call_args_delta(0, '{"input": "*** Begin Patch\\n*** Add File: /tmp/x.txt\\n+hello\\n*** End Patch"}')
         events = st.close_func_blocks()
         done_events = [e for e in _parse_events(events) if e.get("type") == "response.output_item.done"]
         assert len(done_events) == 1
@@ -356,28 +356,26 @@ class TestCustomToolPassthrough:
         assert item.get("type") == "custom_tool_call"
         assert item.get("name") == "apply_patch"
         input_text = item.get("input", "")
-        # apply_patch 的 input 应该是 DSL 格式，不是 JSON
-        assert "*** Begin Patch" in input_text
-        assert "*** Add File" in input_text
+        parsed = json.loads(input_text)
+        assert "*** Begin Patch" in parsed["input"]
 
-    def test_mixed_custom_and_apply_patch_tools(self):
-        """同时有 apply_patch 和 spawn_agent 工具调用时，各自走不同路径"""
+    def test_mixed_apply_patch_and_custom_tools(self):
+        """透传：apply_patch 和 spawn_agent 都走 JSON 透传"""
         st = StreamState(reverse_tool_map={
-            "write_to_file": "apply_patch",
+            "apply_patch": "apply_patch",
             "spawn_agent": "spawn_agent",
         })
-        st.handle_tool_call_id(0, "call_write1", "write_to_file")
-        st.handle_tool_call_args_delta(0, '{"filePath": "/tmp/test.txt", "content": "hello"}')
+        st.handle_tool_call_id(0, "call_patch1", "apply_patch")
+        st.handle_tool_call_args_delta(0, '{"input": "*** Begin Patch\\n*** Add File: a.txt\\n+hi\\n*** End Patch"}')
         st.handle_tool_call_id(1, "call_spawn1", "spawn_agent")
         st.handle_tool_call_args_delta(1, '{"task_name": "task1"}')
         events = st.close_func_blocks()
         done_events = [e for e in _parse_events(events) if e.get("type") == "response.output_item.done"]
         assert len(done_events) == 2
-        # 第一个是 write_to_file → apply_patch DSL
-        write_item = done_events[0].get("item", {})
-        assert write_item.get("name") == "apply_patch"
-        assert "*** Begin Patch" in write_item.get("input", "")
-        # 第二个是 spawn_agent → JSON
+        patch_item = done_events[0].get("item", {})
+        assert patch_item.get("name") == "apply_patch"
+        patch_parsed = json.loads(patch_item.get("input", ""))
+        assert "*** Begin Patch" in patch_parsed["input"]
         spawn_item = done_events[1].get("item", {})
         assert spawn_item.get("name") == "spawn_agent"
         parsed = json.loads(spawn_item.get("input", ""))
