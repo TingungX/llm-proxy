@@ -1,0 +1,6 @@
+# llm-proxy-dev 环境变量
+# dev.sh 自动加载此文件
+
+LLM_PROXY_DEV=true
+LLM_PROXY_LOG_LEVEL=DEBUG
+
