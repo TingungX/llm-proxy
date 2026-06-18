@@ -231,13 +231,13 @@ class TestConvertToolsToChat:
         ]
         result, rmap, nsmap = convert_tools_to_chat(tools)
         assert len(result) == 1
-        assert result[0]["function"]["name"] == "multi_agent_v1.spawn_agent"
+        assert result[0]["function"]["name"] == "multi_agent_v1__spawn_agent"
         # namespace 子工具不写入 reverse_tool_map
-        assert "multi_agent_v1.spawn_agent" not in rmap
+        assert "multi_agent_v1__spawn_agent" not in rmap
         # namespace 子工具写入 tool_spec_map，含 kind/name/namespace
-        assert nsmap["multi_agent_v1.spawn_agent"].kind == "namespace"
-        assert nsmap["multi_agent_v1.spawn_agent"].name == "spawn_agent"
-        assert nsmap["multi_agent_v1.spawn_agent"].namespace == "multi_agent_v1"
+        assert nsmap["multi_agent_v1__spawn_agent"].kind == "namespace"
+        assert nsmap["multi_agent_v1__spawn_agent"].name == "spawn_agent"
+        assert nsmap["multi_agent_v1__spawn_agent"].namespace == "multi_agent_v1"
 
     def test_namespace_mcp_prefix_preserves_original_name(self):
         """namespace name 为 mcp__web_search 时，namespace_map 保留原始名"""
@@ -253,16 +253,16 @@ class TestConvertToolsToChat:
         ]
         result, rmap, nsmap = convert_tools_to_chat(tools)
         assert len(result) == 2
-        assert result[0]["function"]["name"] == "mcp__web_search.search"
-        assert result[1]["function"]["name"] == "mcp__web_search.fetch_url"
-        assert nsmap["mcp__web_search.search"].kind == "namespace"
-        assert nsmap["mcp__web_search.search"].name == "search"
-        assert nsmap["mcp__web_search.search"].namespace == "mcp__web_search"
-        assert nsmap["mcp__web_search.fetch_url"].kind == "namespace"
-        assert nsmap["mcp__web_search.fetch_url"].name == "fetch_url"
-        assert nsmap["mcp__web_search.fetch_url"].namespace == "mcp__web_search"
-        assert "mcp__web_search.search" not in rmap
-        assert "mcp__web_search.fetch_url" not in rmap
+        assert result[0]["function"]["name"] == "mcp__web_search__search"
+        assert result[1]["function"]["name"] == "mcp__web_search__fetch_url"
+        assert nsmap["mcp__web_search__search"].kind == "namespace"
+        assert nsmap["mcp__web_search__search"].name == "search"
+        assert nsmap["mcp__web_search__search"].namespace == "mcp__web_search"
+        assert nsmap["mcp__web_search__fetch_url"].kind == "namespace"
+        assert nsmap["mcp__web_search__fetch_url"].name == "fetch_url"
+        assert nsmap["mcp__web_search__fetch_url"].namespace == "mcp__web_search"
+        assert "mcp__web_search__search" not in rmap
+        assert "mcp__web_search__fetch_url" not in rmap
 
     def test_web_search_with_top_level_config_fields(self):
         """web_search 带 user_location/search_context_size 顶级字段时，
@@ -342,15 +342,15 @@ class TestConvertToolsToChat:
         ]
         result, rmap, nsmap = convert_tools_to_chat(tools)
         assert len(result) == 1
-        assert result[0]["function"]["name"] == "crm.list_open_orders"
+        assert result[0]["function"]["name"] == "crm__list_open_orders"
         # defer_loading 被忽略，工具仍被展开
         assert "defer_loading" not in result[0]["function"]
         # namespace 子工具不写入 reverse_tool_map
-        assert "crm.list_open_orders" not in rmap
+        assert "crm__list_open_orders" not in rmap
         # namespace 子工具写入 tool_spec_map
-        assert nsmap["crm.list_open_orders"].kind == "namespace"
-        assert nsmap["crm.list_open_orders"].name == "list_open_orders"
-        assert nsmap["crm.list_open_orders"].namespace == "crm"
+        assert nsmap["crm__list_open_orders"].kind == "namespace"
+        assert nsmap["crm__list_open_orders"].name == "list_open_orders"
+        assert nsmap["crm__list_open_orders"].namespace == "crm"
 
     def test_namespace_with_mixed_subtool_types(self):
         """namespace 中非 function 类型的子工具应被跳过。"""
@@ -372,7 +372,7 @@ class TestConvertToolsToChat:
         ]
         result, rmap, nsmap = convert_tools_to_chat(tools)
         assert len(result) == 1
-        assert result[0]["function"]["name"] == "mixed.valid_func"
+        assert result[0]["function"]["name"] == "mixed__valid_func"
 
     def test_namespace_with_empty_tools(self):
         """namespace 的 tools 为空列表时，不产生任何工具。"""
@@ -906,15 +906,15 @@ class TestMcpCallResponse:
                     "tool_calls": [{
                         "id": "call_mcp1",
                         "type": "function",
-                        "function": {"name": "mcp__web_search.search", "arguments": '{"query":"weather"}'},
+                        "function": {"name": "mcp__web_search__search", "arguments": '{"query":"weather"}'},
                     }],
                 }
             }],
             "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
         }
         tool_spec_map = {
-            "mcp__web_search.search": CodexToolSpec(kind="namespace", name="search", namespace="mcp__web_search"),
-            "mcp__web_search.fetch_url": CodexToolSpec(kind="namespace", name="fetch_url", namespace="mcp__web_search"),
+            "mcp__web_search__search": CodexToolSpec(kind="namespace", name="search", namespace="mcp__web_search"),
+            "mcp__web_search__fetch_url": CodexToolSpec(kind="namespace", name="fetch_url", namespace="mcp__web_search"),
         }
         result = to_responses_response(chat_body, "gpt-4", tool_spec_map=tool_spec_map)
         output = result.get("output", [])
@@ -937,7 +937,7 @@ class TestMcpCallResponse:
                     "role": "assistant",
                     "content": None,
                     "tool_calls": [
-                        {"id": "call_1", "type": "function", "function": {"name": "mcp__web_search.search", "arguments": '{"q":"test"}'}},
+                        {"id": "call_1", "type": "function", "function": {"name": "mcp__web_search__search", "arguments": '{"q":"test"}'}},
                         {"id": "call_2", "type": "function", "function": {"name": "get_weather", "arguments": '{"city":"NYC"}'}},
                     ],
                 }
@@ -945,7 +945,7 @@ class TestMcpCallResponse:
             "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
         }
         tool_spec_map = {
-            "mcp__web_search.search": CodexToolSpec(kind="namespace", name="search", namespace="mcp__web_search"),
+            "mcp__web_search__search": CodexToolSpec(kind="namespace", name="search", namespace="mcp__web_search"),
         }
         result = to_responses_response(chat_body, "gpt-4", tool_spec_map=tool_spec_map)
         output = result.get("output", [])

@@ -126,13 +126,15 @@ def convert_tools_to_chat(tools: list) -> tuple[list, dict[str, str], dict[str, 
             continue
 
         # --- namespace 工具：展开子工具，使用限定的全名以避免同名冲突 ---
+        # 注意：分隔符使用 "__"（双下划线）而非 "."，因为部分上游（如 DeepSeek）
+        # 要求 tool name 匹配 ^[a-zA-Z0-9_-]+$，不接受点号。
         if tool_type == "namespace":
             ns_name = tool.get("name", "")
             for sub in (tool.get("tools") or []):
                 if not isinstance(sub, dict) or sub.get("type") != "function":
                     continue
                 sub_name = sub.get("name", "")
-                chat_name = f"{ns_name}.{sub_name}"
+                chat_name = f"{ns_name}__{sub_name}"
                 result.append(_make_chat_function_tool(
                     chat_name,
                     sub.get("description", ""),

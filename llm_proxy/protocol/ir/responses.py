@@ -295,7 +295,7 @@ def _convert_tools_to_ir(tools: list) -> tuple[list[IRToolDef], dict[str, str], 
                 if not isinstance(sub, dict) or sub.get("type") != "function":
                     continue
                 sub_name = sub.get("name", "")
-                chat_name = f"{ns_name}.{sub_name}"
+                chat_name = f"{ns_name}__{sub_name}"
                 ir_tools.append(IRToolDef(
                     name=chat_name,
                     description=sub.get("description", ""),

@@ -291,7 +291,7 @@ class TestConvertToolsToChatCustomPassthrough:
         assert len(result) == 5
         names = [t["function"]["name"] for t in result]
         assert "write_to_file" in names
-        assert "multi_agent_v1.spawn_agent" in names
+        assert "multi_agent_v1__spawn_agent" in names
         assert reverse_map["write_to_file"] == "apply_patch"
         # namespace 子工具以 function_call 格式返回给客户端，不写入 reverse_tool_map
         assert "spawn_agent" not in reverse_map
@@ -561,11 +561,11 @@ class TestMcpCallStreaming:
 
     def test_namespace_tool_call_produces_function_call_with_namespace(self):
         """namespace 子工具应产出 function_call + namespace 字段的 output_item.added"""
-        nsmap = {"web_search.search": self._ns_spec("search", "web_search")}
+        nsmap = {"web_search__search": self._ns_spec("search", "web_search")}
         state = StreamState(tool_spec_map=nsmap)
 
         # 1) tool call id → output_item.added (type: function_call, namespace: web_search)
-        events1 = state.handle_tool_call_id(0, "call_mcp1", "web_search.search")
+        events1 = state.handle_tool_call_id(0, "call_mcp1", "web_search__search")
         parsed1 = _parse_events(events1)
         added = [e for e in parsed1 if e["type"] == "response.output_item.added"]
         assert len(added) == 1
@@ -599,11 +599,11 @@ class TestMcpCallStreaming:
 
     def test_mixed_namespace_and_plain_function_call_streaming(self):
         """混合 namespace 子工具和普通 function 工具时，各自产出正确事件类型"""
-        nsmap = {"web_search.search": self._ns_spec("search", "web_search")}
+        nsmap = {"web_search__search": self._ns_spec("search", "web_search")}
         state = StreamState(tool_spec_map=nsmap)
 
         # namespace 子工具 (index 0) — 使用限定的上游名
-        events1 = state.handle_tool_call_id(0, "call_mcp1", "web_search.search")
+        events1 = state.handle_tool_call_id(0, "call_mcp1", "web_search__search")
         parsed1 = _parse_events(events1)
         added_ns = [e for e in parsed1 if e["type"] == "response.output_item.added"][0]
         assert added_ns["item"]["type"] == "function_call"
@@ -644,15 +644,15 @@ class TestMcpCallStreaming:
             ],
         }]
         _, _, nsmap = convert_tools_to_chat(tools)
-        assert nsmap["mcp__web_search.search"].kind == "namespace"
-        assert nsmap["mcp__web_search.search"].name == "search"
-        assert nsmap["mcp__web_search.search"].namespace == "mcp__web_search"
-        assert nsmap["mcp__web_search.fetch_url"].kind == "namespace"
-        assert nsmap["mcp__web_search.fetch_url"].name == "fetch_url"
-        assert nsmap["mcp__web_search.fetch_url"].namespace == "mcp__web_search"
+        assert nsmap["mcp__web_search__search"].kind == "namespace"
+        assert nsmap["mcp__web_search__search"].name == "search"
+        assert nsmap["mcp__web_search__search"].namespace == "mcp__web_search"
+        assert nsmap["mcp__web_search__fetch_url"].kind == "namespace"
+        assert nsmap["mcp__web_search__fetch_url"].name == "fetch_url"
+        assert nsmap["mcp__web_search__fetch_url"].namespace == "mcp__web_search"
 
         state = StreamState(tool_spec_map=nsmap)
-        events = state.handle_tool_call_id(0, "call_ws1", "mcp__web_search.search")
+        events = state.handle_tool_call_id(0, "call_ws1", "mcp__web_search__search")
         parsed = _parse_events(events)
         added = [e for e in parsed if e["type"] == "response.output_item.added"][0]
         assert added["item"]["name"] == "search"
@@ -671,9 +671,9 @@ class TestMcpCallStreaming:
 
     def test_build_output_items_namespace_function_call(self):
         """_build_output_items 应为 namespace 子工具生成 function_call+namespace 的 item"""
-        nsmap = {"web_search.search": self._ns_spec("search", "web_search")}
+        nsmap = {"web_search__search": self._ns_spec("search", "web_search")}
         state = StreamState(tool_spec_map=nsmap)
-        state.handle_tool_call_id(0, "call_mcp1", "web_search.search")
+        state.handle_tool_call_id(0, "call_mcp1", "web_search__search")
         state.handle_tool_call_args_delta(0, '{"query": "weather"}')
         items = state._build_output_items()
         assert len(items) == 1

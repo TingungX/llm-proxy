@@ -162,7 +162,7 @@ class TestResponsesConvertStepNoTools:
 
         # tool_spec_map 应该包含 upstream 名 → CodexToolSpec
         expected = CodexToolSpec(kind="namespace", name="search", namespace="mcp__web_search")
-        assert ctx.tool_spec_map == {"mcp__web_search.search": expected}
+        assert ctx.tool_spec_map == {"mcp__web_search__search": expected}
 
 
 class TestResponsesConvertStepEarlyReturn:

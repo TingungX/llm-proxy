@@ -456,8 +456,8 @@ class TestResponsesToAnthropicRequest:
         assert len(upstream["messages"]) == 1
         assert upstream["messages"][0] == {"role": "user", "content": "Hi"}
 
-    def test_apply_patch_collapse_to_4_file_tools(self):
-        """Responses 单条 apply_patch → Anthropic 4 个标准文件工具。"""
+    def test_apply_patch_passthrough_to_anthropic(self):
+        """透传模式：Responses apply_patch → Anthropic 单个 apply_patch function tool。"""
         body = {
             "model": "gpt-5",
             "input": "Edit file",
@@ -469,7 +469,7 @@ class TestResponsesToAnthropicRequest:
         }
         upstream = convert_request("openai/responses", "anthropic", body)
         tool_names = {t["name"] for t in upstream["tools"]}
-        assert tool_names == {"write_to_file", "replace_in_file", "delete_file", "append_to_file"}
+        assert tool_names == {"apply_patch"}
 
 
 # ── 响应方向 ─────────────────────────────────────────────────────
@@ -682,8 +682,8 @@ class TestIRRequestDataclass:
 
 
 class TestApplyPatchExpansion:
-    def test_apply_patch_expands_to_4_tools(self):
-        """正向：Responses apply_patch → 4 个 IRToolDef + reverse_tool_map。"""
+    def test_apply_patch_passthrough_to_ir(self):
+        """透传：Responses apply_patch → 1 个 IRToolDef + reverse_tool_map 自映射。"""
         body = {
             "model": "gpt-5",
             "input": "Edit",
@@ -694,15 +694,13 @@ class TestApplyPatchExpansion:
             }],
         }
         ir = responses_to_ir(body)
-        assert len(ir.tools) == 4
-        names = {t.name for t in ir.tools}
-        assert names == {"write_to_file", "replace_in_file", "delete_file", "append_to_file"}
+        assert len(ir.tools) == 1
+        assert ir.tools[0].name == "apply_patch"
         rtm = ir.extensions["reverse_tool_map"]
-        # 所有 4 个标准工具都映射到 apply_patch
-        assert all(v == "apply_patch" for v in rtm.values())
+        assert rtm.get("apply_patch") == "apply_patch"
 
-    def test_4_tools_collapse_back_to_apply_patch(self):
-        """反向：4 个标准工具 → Responses apply_patch。"""
+    def test_4_tools_no_longer_collapse_to_apply_patch(self):
+        """反向：4 个独立 function tool（不是 apply_patch 派生）→ Responses function tools，透传模式不再塌缩。"""
         body = {
             "model": "gpt-5",
             "input": "Edit",
@@ -711,23 +709,14 @@ class TestApplyPatchExpansion:
                  "description": "Write", "parameters": {}},
                 {"type": "function", "name": "replace_in_file",
                  "description": "Replace", "parameters": {}},
-                {"type": "function", "name": "delete_file",
-                 "description": "Delete", "parameters": {}},
-                {"type": "function", "name": "append_to_file",
-                 "description": "Append", "parameters": {}},
             ],
         }
         ir = chat_to_ir(body)
-        # 此时 ir.tools 应包含 4 个标准工具
-        assert len(ir.tools) == 4
-        # 模拟 reverse_tool_map（apply_patch 展开时设置）
-        from llm_proxy.protocol.responses_chat.tool_replacement import build_reverse_tool_map
-        ir.extensions["reverse_tool_map"] = build_reverse_tool_map()
-        # 转回 Responses：应塌缩为单条 apply_patch custom tool
+        assert len(ir.tools) == 2
+        # 转回 Responses：透传模式不再塌缩为 apply_patch
         upstream = responses_to_upstream(ir)
-        custom_tools = [t for t in upstream["tools"] if t.get("type") == "custom"]
-        assert len(custom_tools) == 1
-        assert custom_tools[0]["name"] == "apply_patch"
+        upstream_names = {t["name"] for t in upstream["tools"]}
+        assert upstream_names == {"write_to_file", "replace_in_file"}
 
 
 class TestThinkTagExtraction:
