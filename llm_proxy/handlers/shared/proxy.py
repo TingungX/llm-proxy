@@ -527,6 +527,23 @@ class ProxyStep(HandlerStep):
             err_body = {"type": "error", "error": {"type": "proxy_error", "message": str(e) or type(e).__name__}}
             yield f"event: error\ndata: {json.dumps(err_body)}\n\n".encode()
         finally:
+            self._record_cross_protocol_usage(
+                upstream_errored, seen_stop, usage, original_body,
+                endpoint_id, model_id, rctx,
+            )
+
+    def _record_cross_protocol_usage(
+        self,
+        upstream_errored: bool,
+        seen_stop: bool,
+        usage: dict,
+        original_body: dict,
+        endpoint_id: str,
+        model_id: str,
+        rctx: dict,
+    ) -> None:
+        """记录跨协议流式请求用量（独立方法，分离 async generator 的生命周期）"""
+        try:
             if upstream_errored:
                 db.record_usage(endpoint_id, model_id, 0, 0, "error",
                                 request_id=rctx.get("request_id", ""),
@@ -545,6 +562,9 @@ class ProxyStep(HandlerStep):
                                 request_id=rctx.get("request_id", ""),
                                 client_ip=rctx.get("client_ip", ""),
                                 user_agent=rctx.get("user_agent", ""))
+        except RuntimeError:
+            # GeneratorExit / aclose() race — skip usage recording
+            pass
 
     async def _proxy_responses_direct(
         self, ctx: PipelineContext, api_base: str, upstream_api_key: str,
@@ -761,6 +781,7 @@ class ProxyStep(HandlerStep):
                     if status >= 400:
                         error_body = await resp.aread()
                         error_msg = error_body.decode()
+                        logger.error(f"Upstream error status={status} for model={model}: {error_msg[:500]}")
                         try:
                             err_data = json.loads(error_msg)
                             err_message = err_data.get("error", {}).get("message", error_msg)

@@ -4,6 +4,7 @@ import logging
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from starlette.requests import ClientDisconnect
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +17,9 @@ async def catch_all_exceptions(request: Request, call_next):
         return await call_next(request)
     except PipelineStop as ps:
         return ps.response
+    except ClientDisconnect:
+        logger.debug("Client disconnected before request body was fully read")
+        raise
     except Exception as e:
         logger.error(f"Unhandled exception: {e}", exc_info=True)
         return JSONResponse(
