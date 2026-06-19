@@ -32,8 +32,8 @@ class VisionFallbackStep(HandlerStep):
         if ctx.error_protocol == "anthropic":
             if isinstance(ctx.body.get("messages"), list):
                 ctx.body["messages"] = await replace_images_in_anthropic_messages(ctx.body["messages"])
-        elif ctx.converter == "responses_to_chat":
-            # Responses → Chat 转换路径：先替换 input 中的图片
+        elif isinstance(ctx.body.get("input"), list):
+            # Responses 格式（有 input 数组）：替换 input 中的图片
             if isinstance(ctx.body.get("input"), list):
                 ctx.body["input"] = await replace_images_in_responses_input(ctx.body["input"])
         else:

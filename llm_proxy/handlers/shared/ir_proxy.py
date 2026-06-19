@@ -3,9 +3,11 @@
 完整实现（非流式 + 流式）。当 `client_protocol` 是 "openai" 时，所有 OpenAI 客户端
 (Chat/Responses) 都走 Chat 路径；按需扩展可分别处理。
 
+支持 client_protocol="openai/responses"，用于 Responses 路由直接走 IR 转换。
+
 迁移路径（不在本步骤内）：
-1. endpoint.settings 加 "ir_enabled": true
-2. handler 根据 flag 选 IRProxyStep 或 ProxyStep
+1. Responses 路由已直接使用 IRProxyStep（替代 ProtocolSelect + ResponsesConvert + ProxyStep）
+2. Chat/Anthropic 路由仍用 ProxyStep（待后续迁移）
 3. 全量切换后删除 anthropic_openai/、responses_chat/ 通道
 """
 
@@ -29,6 +31,7 @@ from llm_proxy.protocol.ir import REGISTRY, _resolve
 from llm_proxy.protocol.ir._stream import keepalive_wrapper
 from llm_proxy.protocol.ir.types import IRStreamEvent
 from llm_proxy.state import get_state
+from llm_proxy.logging_config import REQUEST_ID_CTX
 
 logger = logging.getLogger(__name__)
 
@@ -61,11 +64,22 @@ class IRProxyStep(HandlerStep):
 
     def __init__(self, client_protocol: str):
         """Args:
-            client_protocol: 客户端使用的协议，"anthropic" 或 "openai"（OpenAI Chat/Responses 共用）
+            client_protocol: 客户端使用的协议：
+                - "anthropic": Anthropic Messages API
+                - "openai" / "openai/chat-completions": OpenAI Chat Completions
+                - "openai/responses": OpenAI Responses API
         """
         self.client_protocol = client_protocol
 
     async def execute(self, ctx: PipelineContext) -> None:
+        # ── 记录上下文（usage 记录需要） ──
+        ctx.extra["_record_ctx"] = {
+            "start_time": time.perf_counter(),
+            "request_id": REQUEST_ID_CTX.get(""),
+            "client_ip": ctx.request.client.host if ctx.request.client else "",
+            "user_agent": ctx.request.headers.get("user-agent", ""),
+        }
+
         # ── 协议解析 ──
         _, _, _, model_id, _, _ = ctx.resolved
         s = get_state()

@@ -9,11 +9,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from llm_proxy.handlers.base import PipelineContext, Pipeline
 from llm_proxy.handlers.shared.auth import AuthStep
 from llm_proxy.handlers.shared.model_resolve import ModelResolveStep
-from llm_proxy.handlers.shared.protocol_select import ProtocolSelectStep
 from llm_proxy.handlers.shared.vision_fallback import VisionFallbackStep
 from llm_proxy.handlers.shared.compression import CompressionStep
-from llm_proxy.handlers.shared.responses_convert import ResponsesConvertStep
-from llm_proxy.handlers.shared.proxy import ProxyStep
+from llm_proxy.handlers.shared.ir_proxy import IRProxyStep
 from llm_proxy.protocol.errors import make_openai_error
 
 logger = logging.getLogger(__name__)
@@ -24,11 +22,10 @@ class ResponsesHandler:
         self.pipeline = Pipeline([
             AuthStep(),
             ModelResolveStep(),
-            ProtocolSelectStep(),
+            # 工具降级逻辑已内置于 IRProxyStep
             VisionFallbackStep(),
             CompressionStep(),
-            ResponsesConvertStep(),
-            ProxyStep(),
+            IRProxyStep(client_protocol="openai/responses"),
         ])
 
     async def handle(self, request: Request) -> JSONResponse | StreamingResponse:
@@ -50,4 +47,3 @@ class ResponsesHandler:
             error_protocol="openai",
         )
         return await self.pipeline.execute(ctx)
-
