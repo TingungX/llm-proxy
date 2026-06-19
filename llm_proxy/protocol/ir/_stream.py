@@ -52,8 +52,14 @@ def parse_sse_line(line: str) -> dict | None | object:
 
 
 def sse_format(event_type: str, data: dict) -> bytes:
-    """构造 Anthropic / Responses 风格的 SSE 事件（带 event 头）。"""
-    payload = json.dumps(data, ensure_ascii=False)
+    """构造 Anthropic / Responses 风格的 SSE 事件（带 event 头）。
+
+    规范要求：每个 data payload 顶层必须带 `type` 字段，且与 `event:` 头镜像。
+    Codex / Claude Code 等客户端只解析 data 的 `type`，不认 `event:` 头；
+    缺失 `type` 会被判为"未收到该事件"（如 stream closed before response.completed）。
+    因此这里无条件把 `type` 注入到 data 顶层（data 已提供同名 key 时不覆盖）。
+    """
+    payload = json.dumps({"type": event_type, **data}, ensure_ascii=False)
     return f"event: {event_type}\ndata: {payload}\n\n".encode()
 
 

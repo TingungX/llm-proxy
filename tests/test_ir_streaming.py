@@ -96,7 +96,7 @@ class TestSSELineParser:
 class TestSSEFormat:
     def test_sse_format(self):
         b = sse_format("message_start", {"id": "x"})
-        assert b == b'event: message_start\ndata: {"id": "x"}\n\n'
+        assert b == b'event: message_start\ndata: {"type": "message_start", "id": "x"}\n\n'
 
     def test_sse_format_data_only(self):
         b = sse_format_data_only({"delta": {"content": "hi"}})
