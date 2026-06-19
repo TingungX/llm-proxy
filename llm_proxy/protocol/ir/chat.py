@@ -480,6 +480,11 @@ def _message_ir_to_chat(msg: IRMessage) -> list[dict[str, Any]]:
     role = msg.role
     content = msg.content
 
+    # developer role 是 OpenAI 引入的新 role，部分上游（如 DeepSeek）不兼容
+    # 标准 Chat Completions 无 developer，应降级为 system
+    if role == "developer":
+        role = "system"
+
     if role == "tool":
         # tool 消息：每个 IRToolResultBlock 生成一条独立的 tool 消息
         # Chat 格式要求每个 tool result 有自己的 tool_call_id
