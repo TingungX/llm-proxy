@@ -28,6 +28,7 @@ from llm_proxy.protocol.ir._stream import (
     parse_sse_line,
     sse_format,
 )
+from llm_proxy.protocol.responses_chat.tool_replacement import repair_apply_patch_dsl, APPLY_PATCH_TOOL_DESCRIPTION
 from llm_proxy.protocol.ir.types import (
     IRStreamEvent,
     IRContentBlock,
@@ -264,14 +265,16 @@ def _convert_tools_to_ir(tools: list) -> tuple[list[IRToolDef], dict[str, str], 
             # 透传：apply_patch 与其他 custom 工具一致，直接降级为单个 function tool
             params = _normalize_params(tool.get("parameters"))
             if not params.get("properties"):
+                # apply_patch 用完整 DSL 描述让上游模型理解格式，其他工具用简短描述
+                input_desc = APPLY_PATCH_TOOL_DESCRIPTION if name == "apply_patch" else "Tool input"
                 params = {
                     "type": "object",
-                    "properties": {"input": {"type": "string", "description": "Tool input (e.g., apply_patch DSL text)."}},
+                    "properties": {"input": {"type": "string", "description": input_desc}},
                     "required": [],
                 }
             ir_tools.append(IRToolDef(
                 name=name,
-                description=tool.get("description", ""),
+                description=tool.get("description") or (APPLY_PATCH_TOOL_DESCRIPTION if name == "apply_patch" else ""),
                 parameters=clean_schema(params),
             ))
             reverse_tool_map[name] = name
@@ -348,9 +351,11 @@ def _normalize_params(params) -> dict:
 # ── 响应：IR → Responses ──────────────────────────────────────────
 
 
-def response_from_ir(ir: IRResponse) -> dict[str, Any]:
+def response_from_ir(ir: IRResponse, *, reverse_tool_map: dict | None = None, tool_spec_map: dict | None = None) -> dict[str, Any]:
     """IRResponse → OpenAI Responses API 响应体。"""
     output: list[dict] = []
+    _reverse = reverse_tool_map or {}
+    _spec = tool_spec_map or {}
     # 收集所有 text blocks 合并到一个 message item（Responses API 规范：
     # 同一 response 的 output 中，assistant role 的 message 应只有一个）
     text_parts: list[dict] = []
@@ -382,13 +387,46 @@ def response_from_ir(ir: IRResponse) -> dict[str, Any]:
                     "content": text_parts,
                 })
                 text_parts = []
-            output.append({
-                "type": "function_call",
-                "id": block.id or f"call_{uuid.uuid4().hex[:24]}",
-                "call_id": block.id or f"call_{uuid.uuid4().hex[:24]}",
-                "name": block.name,
-                "arguments": safe_json_dumps(block.input, default="{}"),
-            })
+
+            downstream_name = _reverse.get(block.name)
+            spec = _spec.get(block.name)
+
+            if downstream_name is not None:
+                # 1) reverse_tool_map 命中 → custom_tool_call
+                args_raw = safe_json_dumps(block.input, default="{}")
+                if block.name == "apply_patch" and isinstance(block.input, dict):
+                    dsl = block.input.get("input", "")
+                    if isinstance(dsl, str):
+                        args_raw = repair_apply_patch_dsl(dsl).dsl
+                output.append({
+                    "type": "custom_tool_call",
+                    "id": f"fc_{block.id}" if block.id else f"fc_{uuid.uuid4().hex[:16]}",
+                    "name": downstream_name,
+                    "status": "completed",
+                    "call_id": block.id or f"call_{uuid.uuid4().hex[:24]}",
+                    "input": args_raw,
+                })
+            elif spec is not None and spec.get("kind") == "namespace" and spec.get("namespace"):
+                # 2) namespace 子工具 → function_call + 原始名称 + namespace
+                output.append({
+                    "type": "function_call",
+                    "id": f"fc_{block.id}" if block.id else f"fc_{uuid.uuid4().hex[:16]}",
+                    "name": spec["name"],
+                    "namespace": spec["namespace"],
+                    "arguments": safe_json_dumps(block.input, default="{}"),
+                    "status": "completed",
+                    "call_id": block.id or f"call_{uuid.uuid4().hex[:24]}",
+                })
+            else:
+                # 3) 普通工具 → function_call
+                output.append({
+                    "type": "function_call",
+                    "id": f"fc_{block.id}" if block.id else f"fc_{uuid.uuid4().hex[:16]}",
+                    "call_id": block.id or f"call_{uuid.uuid4().hex[:24]}",
+                    "name": block.name,
+                    "arguments": safe_json_dumps(block.input, default="{}"),
+                    "status": "completed",
+                })
 
     # flush 剩余的 text parts
     if text_parts:
@@ -1313,7 +1351,12 @@ async def format_ir_as_sse(
                 # 透传模式：final_input 原样作为 custom_tool_call.input
                 final_input = data.get("input", {})
                 if isinstance(final_input, dict):
-                    input_text = safe_json_dumps(final_input, default="{}")
+                    if current_tool_downstream_name == "apply_patch":
+                        # 解包 {"input": "<DSL>"} → 裸 DSL 文本 + DSL 修复
+                        dsl = final_input.get("input", "")
+                        input_text = repair_apply_patch_dsl(dsl).dsl if isinstance(dsl, str) else safe_json_dumps(final_input, default="{}")
+                    else:
+                        input_text = safe_json_dumps(final_input, default="{}")
                 else:
                     input_text = str(final_input)
                 tool_args_buf[current_tool_call_id] = input_text

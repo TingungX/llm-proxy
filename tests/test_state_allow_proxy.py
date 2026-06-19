@@ -10,7 +10,7 @@ def test_allow_proxy_defaults_to_false():
         }
     }
     s = State(cfg)
-    assert s.allow_proxy_map == {"glm-5": False}
+    assert s.allow_proxy_map == {"test-model-a": False}
 
 
 def test_allow_proxy_explicit_true():
@@ -20,7 +20,7 @@ def test_allow_proxy_explicit_true():
         }
     }
     s = State(cfg)
-    assert s.allow_proxy_map == {"glm-5": True}
+    assert s.allow_proxy_map == {"test-model-a": True}
 
 
 def test_allow_proxy_key_is_lowercase():
@@ -30,8 +30,8 @@ def test_allow_proxy_key_is_lowercase():
         }
     }
     s = State(cfg)
-    assert "glm-5-pro" in s.allow_proxy_map
-    assert s.allow_proxy_map["glm-5-pro"] is True
+    assert "test-model-a-pro" in s.allow_proxy_map
+    assert s.allow_proxy_map["test-model-a-pro"] is True
 
 
 def test_allow_proxy_explicit_false_still_false():

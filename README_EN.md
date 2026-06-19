@@ -19,6 +19,18 @@ Supported protocol conversions:
 
 → **Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses — all three request formats can route to any upstream model through their respective paths.**
 
+## Protocol Matrix
+
+| Client Format | Supported Upstream Formats | Route | Current Conversion Path |
+|---------------|----------------------------|-------|--------------------------|
+| Anthropic Messages | Anthropic / Chat | `/v1/messages` | Same-protocol passthrough / `anthropic_openai/` legacy channel |
+| OpenAI Chat Completions | Chat / Responses | `/v1/chat/completions` | Same-protocol passthrough / `responses_chat/` legacy channel |
+| OpenAI Responses API | Responses / Chat / Anthropic | `/v1/responses` | **IR channel** (`protocol/ir/`) |
+
+All three request formats can route to any target format. `/v1/responses` already routes directly through the IR abstraction layer (`IRProxyStep`); the other two routes are still being migrated to the IR channel. Any single request between two protocols goes through exactly one IR conversion (`client → IR → upstream`), with no cascading conversion overhead.
+
+> Migration target: also wire `/v1/messages` and `/v1/chat/completions` into `IRProxyStep`; after full cutover, delete the `anthropic_openai/` and `responses_chat/` legacy channels.
+
 ---
 
 ## Table of Contents
@@ -42,8 +54,9 @@ Supported protocol conversions:
 
 LLM Proxy deeply integrates with Codex Desktop's OpenAI Responses API, with full tool conversion support:
 
-- **Tool conversion**: `apply_patch` (custom) auto-expands into 4 standard file tools (`write_to_file` / `replace_in_file` / `append_to_file` / `delete_file`), then reverses back into `custom_tool_call` events on the response path
-- **Non-standard tool downgrade**: `namespace` recursively flattened, `web_search` downgraded to standard function, other `custom` tools passed through
+- **apply_patch passthrough + DSL repair**: `apply_patch` is downgraded to a single function tool; upstream `arguments` are passed through verbatim as `custom_tool_call.input` to Codex. The return path runs [`repair_apply_patch_dsl`](llm_proxy/protocol/responses_chat/tool_replacement.py) to fix common DSL format issues (missing `*** Begin Patch` / `*** End Patch`, malformed `@@` hunk headers, wrong casing on `Add File` / `Update File` / `Delete File` / `Move to` keywords, etc.).
+- **apply_patch tool description injection**: the server replaces the tool description with `APPLY_PATCH_TOOL_DESCRIPTION`, which explicitly enumerates the `***` marker prefix, the `@@`-on-its-own-line rule, the line-prefix rules (` ` / `- ` / `+ `), and the strict character-level context matching requirement — so the model avoids common pitfalls before writing.
+- **Non-standard tool downgrade**: `namespace` is recursively flattened (sub-tools named with `__` to satisfy upstreams that enforce `^[a-zA-Z0-9_-]+$`), `web_search` is executed client-side, other `custom` tools are passed through
 - **Think tag extraction**: `<think>` tags from upstream responses are extracted into reasoning/thinking blocks
 - **Protocol conversion**: Automatic bidirectional conversion regardless of upstream format (Chat Completions or Anthropic Messages)
 
@@ -63,15 +76,15 @@ Point your tool's `api_base` to this proxy. **One proxy serves all your tools.**
 
 | Feature | Description |
 |---------|-------------|
-| **Full Protocol Interop** | Anthropic / Chat / Responses — any protocol can be routed to any upstream via the IR abstraction layer in a single hop |
+| **Full Protocol Interop** | Anthropic / Chat / Responses — any protocol routes to any upstream. `/v1/responses` already runs through the IR abstraction layer; the other two routes use legacy channels during the migration window |
 | **Unified IR Abstraction Layer** | `protocol/ir/` — zero-dependency intermediate representation with ProtocolConverter registry pattern; adding a new protocol means implementing a single subclass |
-| **Legacy Channel Compatibility** | `anthropic_openai/` and `responses_chat/` legacy channels preserved in parallel for gradual migration |
+| **Legacy Channels in Migration** | `anthropic_openai/` serves Anthropic cross-protocol; `responses_chat/` serves Chat→Responses conversion and apply_patch DSL repair |
 | **Multi-Upstream Aggregation** | One proxy for DeepSeek, MiniMax, GLM (iFlytek), OpenCode, and more |
 | **RTK (Input Compression / Beta)** | Built-in input compression tool (Rust Token Killer), strips CLI output noise from tool_results, truncates long code blocks, collapses blank lines |
 | **Endpoint Authentication** | API-Key-based isolation, each endpoint independently configures available models |
 | **Model Routing & Fallback** | Model family failover chain, auto-switch on 429/503 |
 | **Request Tracking** | Unique Request ID per call, structured logging, web admin panel filtering |
-| **Tool Format Compatibility** | Auto-conversion for namespace, apply_patch, and other non-standard tool types |
+| **Tool Format Compatibility** | apply_patch passthrough + DSL repair; namespace flattened; other custom tools passed through |
 | **Admin Panel** | Preact + Vite web console for endpoint/model/usage/log management |
 
 ---
@@ -88,12 +101,13 @@ Handler Pipeline (Auth → ModelResolve → ProtocolSelect → ... → Proxy)
   │
   └── Cross-protocol ──→ Protocol conversion layer
                            │
-                           ├── New path (IRProxyStep)
+                           ├── IR channel (IRProxyStep) ★ currently used by /v1/responses
                            │   └── client_body → IRRequest → upstream_body
                            │   └── upstream SSE → IRStreamEvent → client SSE
                            │
-                           └── Legacy path (ProxyStep)
-                               └── anthropic_openai / responses_chat direct conversion
+                           └── Legacy channel (ProxyStep) ★ /v1/messages and /v1/chat/completions during migration
+                               ├── anthropic_openai: Anthropic ↔ Chat
+                               └── responses_chat: Chat → Responses (includes apply_patch DSL repair)
 ```
 
 The protocol conversion layer is built around `protocol/ir/`:
@@ -261,7 +275,7 @@ Endpoints (API key auth, model allowlist, family routing) are configured at runt
 |--------|------|-------------|
 | POST | `/v1/messages` | Anthropic Messages format (passthrough or cross-protocol) |
 | POST | `/v1/chat/completions` | OpenAI Chat Completions format (passthrough or cross-protocol) |
-| POST | `/v1/responses` | OpenAI Responses format (with apply_patch/namespace tool conversion) |
+| POST | `/v1/responses` | OpenAI Responses format (apply_patch passthrough + DSL repair; namespace/web_search downgrade) |
 | POST | `/v1/messages/count_tokens` | Token counting |
 | GET | `/v1/models` | Model list |
 

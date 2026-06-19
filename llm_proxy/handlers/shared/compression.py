@@ -69,4 +69,8 @@ class CompressionStep(HandlerStep):
         if merged.get("enabled") and "strategies" not in merged:
             merged["strategies"] = _DEFAULT_STRATEGIES
 
-        return CompressionConfig(**merged)
+        # 只保留 CompressionConfig 接受的字段，防止 max_input_tokens 等额外键导致 TypeError
+        valid_keys = {"enabled", "strategies", "truncate_max_lines", "truncate_indicator", "collapse_max_blank_lines", "shorten_paths_enabled"}
+        filtered = {k: v for k, v in merged.items() if k in valid_keys}
+
+        return CompressionConfig(**filtered)

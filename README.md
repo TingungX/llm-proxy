@@ -38,13 +38,18 @@
 
 ## 协议互转矩阵
 
-| 客户端格式 | 上游支持格式 | 路由入口 | 转换路径 |
+| 客户端格式 | 上游支持格式 | 路由入口 | 当前转换路径 |
 |------------|------------|----------|----------|
-| Anthropic Messages | Anthropic / Chat / Responses | `/v1/messages` | 同协议透传 / IR 中转 |
-| OpenAI Chat Completions | Chat / Responses / Anthropic | `/v1/chat/completions` | 同协议透传 / IR 中转 |
-| OpenAI Responses API | Responses / Chat / Anthropic | `/v1/responses` | 同协议透传 / IR 中转 |
+| Anthropic Messages | Anthropic / Chat | `/v1/messages` | 同协议透传 / `anthropic_openai/` 旧通道 |
+| OpenAI Chat Completions | Chat / Responses | `/v1/chat/completions` | 同协议透传 / `responses_chat/` 旧通道 |
+| OpenAI Responses API | Responses / Chat / Anthropic | `/v1/responses` | **IR 通道**（`protocol/ir/`）|
 
-所有三种请求格式均可经由 IR 抽象层中转到任意目标格式。任意两个协议间的单次请求仅经过一次 IR 转换（`client → IR → upstream`），不产生级联转换损耗。
+所有三种请求格式均可路由到任意目标格式；目前 `/v1/responses` 已直接走 IR 抽象层（`IRProxyStep`），
+其他两个路由仍在逐步迁移到 IR 通道。任意两个协议间的单次请求仅经过一次 IR 转换（`client → IR → upstream`），
+不产生级联转换损耗。
+
+> 迁移目标：把 `/v1/messages` 和 `/v1/chat/completions` 也接入 IRProxyStep，全量切换后删除
+> `anthropic_openai/` 和 `responses_chat/` 旧通道。
 
 ---
 
@@ -54,8 +59,16 @@
 
 LLM Proxy 全面兼容 Codex Desktop 的 OpenAI Responses API 通信协议：
 
-- **工具转换**：`apply_patch` (custom) 自动展开为 4 个标准文件工具（`write_to_file` / `replace_in_file` / `append_to_file` / `delete_file`），上游返回后反向还原为 `custom_tool_call` 事件
-- **非标准工具降级**：`namespace` 递归展开、`web_search` 降级为标准 function、其他 `custom` 工具透传
+- **apply_patch 透传 + DSL 修复**：`apply_patch` 直接降级为单个 function tool，
+  上游返回的 `arguments` 原样作为 `custom_tool_call.input` 给 Codex。
+  返回路径经过 [`repair_apply_patch_dsl`](llm_proxy/protocol/responses_chat/tool_replacement.py)
+  修复常见的 DSL 格式问题（缺 `*** Begin Patch` / `*** End Patch`、`@@` hunk header
+  不规范、`Add File` / `Update File` / `Delete File` / `Move to` 关键字大小写错误等）
+- **apply_patch 工具描述注入**：服务端把工具描述替换为 `APPLY_PATCH_TOOL_DESCRIPTION`，
+  显式列出 marker `***` 前缀、`@@` 单独成行、行前缀 ` ` / `- ` / `+ ` 规则、
+  context 字符级匹配要求等，让模型在写之前就规避常见错误
+- **非标准工具降级**：`namespace` 递归展开（子工具命名用 `__` 分隔，避开部分上游的
+  `^[a-zA-Z0-9_-]+$` 限制）、`web_search` 客户端本地执行、其他 `custom` 工具透传
 - **think 标签自动提取**：上游返回的 `<think>` 标签内容自动提取为 reasoning / thinking blocks
 - **协议转换**：无论上游是 Chat Completions 还是 Anthropic Messages，自动完成双向转换
 
@@ -75,9 +88,9 @@ LLM Proxy 全面兼容 Codex Desktop 的 OpenAI Responses API 通信协议：
 
 | 功能 | 说明 |
 |------|------|
-| **全协议互转** | Anthropic / Chat / Responses 三种协议任意互转，通过 IR 抽象层一次中转 |
+| **全协议互转** | Anthropic / Chat / Responses 三种协议任意互转；`/v1/responses` 已走 IR 抽象层，其他两个路由由旧通道提供迁移期兼容 |
 | **统一 IR 抽象层** | `protocol/ir/` 零外部依赖的中间表示层，ProtocolConverter 注册表模式，新增协议只需实现一个子类 |
-| **旧通道兼容** | `anthropic_openai/` 和 `responses_chat/` 旧通道保留并行，逐步迁移 |
+| **旧通道迁移期运行** | `anthropic_openai/` 服务 Anthropic 跨协议；`responses_chat/` 服务 Chat→Responses 转换与 apply_patch DSL 修复 |
 | **多上游聚合** | 一个代理接入 DeepSeek、MiniMax、GLM、OpenCode 等多个模型提供商 |
 | **RTK 输入压缩** | 内置输入压缩工具（Rust Token Killer），压缩 tool_result 中的 CLI 输出噪声 |
 | **端点认证与隔离** | 基于 API Key 的端点隔离，每个端点独立配置可用模型 |
@@ -99,12 +112,13 @@ Handler Pipeline (Auth → ModelResolve → ProtocolSelect → ... → Proxy)
   │
   └── 跨协议 ──→ 协议转换层
                     │
-                    ├── 新路径 (IRProxyStep)
+                    ├── IR 通道（IRProxyStep）★ 当前 /v1/responses 在用
                     │   └── client_body → IRRequest → upstream_body
                     │   └── upstream SSE → IRStreamEvent → client SSE
                     │
-                    └── 旧路径 (ProxyStep)
-                        └── anthropic_openai / responses_chat 直接转换
+                    └── 旧通道（ProxyStep）★ /v1/messages 和 /v1/chat/completions 迁移期使用
+                        ├── anthropic_openai：Anthropic ↔ Chat
+                        └── responses_chat：Chat → Responses（含 apply_patch DSL 修复）
 ```
 
 协议转换层的核心是 `protocol/ir/`：

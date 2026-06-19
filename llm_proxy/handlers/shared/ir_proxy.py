@@ -184,7 +184,11 @@ class IRProxyStep(HandlerStep):
 
         # IR → client
         ir_response = REGISTRY[upstream_proto].response_to_ir(upstream_resp_body)
-        client_body = REGISTRY[client_proto].response_from_ir(ir_response)
+        client_body = REGISTRY[client_proto].response_from_ir(
+            ir_response,
+            reverse_tool_map=ir_request.extensions.get("reverse_tool_map"),
+            tool_spec_map=ir_request.extensions.get("tool_spec_map"),
+        )
 
         # 记录 usage
         usage = ir_response.usage or {}

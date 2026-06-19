@@ -38,7 +38,7 @@ async def api_create_endpoint(request: Request):
     if db.get_endpoint(endpoint_id):
         return JSONResponse({"error": "Endpoint with this API Key already exists"}, status_code=400)
 
-    db.create_endpoint(endpoint_id, name, api_key, models, settings, enabled, accept_protocols, family_routing)
+    db.create_endpoint(endpoint_id, name, api_key, models, settings, enabled, accept_protocols, is_default=False, family_routing=family_routing)
     return {"status": "ok", "endpoint_id": endpoint_id}
 
 

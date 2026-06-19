@@ -1,12 +1,14 @@
 """配置加载/保存/重载"""
 
 import json
+import os
 import logging
 import warnings
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent.parent
-CONFIG_PATH = BASE_DIR / "config.json"
+_CONFIG_DEFAULT = BASE_DIR / "config.json"
+CONFIG_PATH = Path(os.environ.get("LLM_PROXY_CONFIG_PATH", str(_CONFIG_DEFAULT)))
 
 logger = logging.getLogger(__name__)
 

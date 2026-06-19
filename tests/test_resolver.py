@@ -80,9 +80,9 @@ def test_normalize_unknown():
 def test_build_model_map():
     mm = build_model_map(TEST_CONFIG)
     assert "deepseek-v4-pro" in mm
-    assert "minimax-m2.7" in mm
-    assert mm["glm-5"][2] == "astron-code-latest"
-    assert mm["glm-5"][3] is None
+    assert "test-model-b" in mm
+    assert mm["test-model-a"][2] == "astron-code-latest"
+    assert mm["test-model-a"][3] is None
 
 
 def test_resolve_opus_47():
@@ -99,7 +99,7 @@ def test_resolve_opus_46_with_upstream_model():
     assert result is not None
     api_base, api_key, upstream, cfg_key, protocol = result
     assert upstream == "astron-code-latest"
-    assert cfg_key == "glm-5"
+    assert cfg_key == "test-model-a"
     assert protocol is None
 
 

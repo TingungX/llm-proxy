@@ -28,18 +28,24 @@ from llm_proxy.protocol.ir.anthropic import (
     response_to_ir as anthropic_response_to_ir,
     to_ir as anthropic_to_ir,
     to_upstream as anthropic_to_upstream,
+    parse_stream_to_ir as anthropic_parse_stream,
+    format_ir_as_sse as anthropic_format_sse,
 )
 from llm_proxy.protocol.ir.chat import (
     response_from_ir as chat_response_from_ir,
     response_to_ir as chat_response_to_ir,
     to_ir as chat_to_ir,
     to_upstream as chat_to_upstream,
+    parse_stream_to_ir as chat_parse_stream,
+    format_ir_as_sse as chat_format_sse,
 )
 from llm_proxy.protocol.ir.responses import (
     response_from_ir as responses_response_from_ir,
     response_to_ir as responses_response_to_ir,
     to_ir as responses_to_ir,
     to_upstream as responses_to_upstream,
+    parse_stream_to_ir as responses_parse_stream,
+    format_ir_as_sse as responses_format_sse,
 )
 from llm_proxy.protocol.ir.types import (
     IRContentBlock,
@@ -71,7 +77,7 @@ class ProtocolConverter:
     def response_to_ir(self, body: dict) -> IRResponse:  # pragma: no cover - abstract
         raise NotImplementedError
 
-    def response_from_ir(self, ir: IRResponse) -> dict:  # pragma: no cover - abstract
+    def response_from_ir(self, ir: IRResponse, *, reverse_tool_map: dict | None = None, tool_spec_map: dict | None = None) -> dict:  # pragma: no cover - abstract
         raise NotImplementedError
 
     # ── 流式（异步）──
@@ -110,8 +116,16 @@ class AnthropicConverter(ProtocolConverter):
     def response_to_ir(self, body):
         return anthropic_response_to_ir(body)
 
-    def response_from_ir(self, ir):
+    def response_from_ir(self, ir, *, reverse_tool_map=None, tool_spec_map=None):
         return anthropic_response_from_ir(ir)
+
+    async def parse_stream_to_ir(self, resp, model):
+        async for event in anthropic_parse_stream(resp, model):
+            yield event
+
+    async def format_ir_as_sse(self, events, model, *, reverse_tool_map=None, tool_spec_map=None):
+        async for chunk in anthropic_format_sse(events, model, reverse_tool_map=reverse_tool_map, tool_spec_map=tool_spec_map):
+            yield chunk
 
 
 class ChatConverter(ProtocolConverter):
@@ -124,8 +138,16 @@ class ChatConverter(ProtocolConverter):
     def response_to_ir(self, body):
         return chat_response_to_ir(body)
 
-    def response_from_ir(self, ir):
+    def response_from_ir(self, ir, *, reverse_tool_map=None, tool_spec_map=None):
         return chat_response_from_ir(ir)
+
+    async def parse_stream_to_ir(self, resp, model):
+        async for event in chat_parse_stream(resp, model):
+            yield event
+
+    async def format_ir_as_sse(self, events, model, *, reverse_tool_map=None, tool_spec_map=None):
+        async for chunk in chat_format_sse(events, model, reverse_tool_map=reverse_tool_map, tool_spec_map=tool_spec_map):
+            yield chunk
 
 
 class ResponsesConverter(ProtocolConverter):
@@ -138,8 +160,16 @@ class ResponsesConverter(ProtocolConverter):
     def response_to_ir(self, body):
         return responses_response_to_ir(body)
 
-    def response_from_ir(self, ir):
-        return responses_response_from_ir(ir)
+    def response_from_ir(self, ir, *, reverse_tool_map=None, tool_spec_map=None):
+        return responses_response_from_ir(ir, reverse_tool_map=reverse_tool_map, tool_spec_map=tool_spec_map)
+
+    async def parse_stream_to_ir(self, resp, model):
+        async for event in responses_parse_stream(resp, model):
+            yield event
+
+    async def format_ir_as_sse(self, events, model, *, reverse_tool_map=None, tool_spec_map=None):
+        async for chunk in responses_format_sse(events, model, reverse_tool_map=reverse_tool_map, tool_spec_map=tool_spec_map):
+            yield chunk
 
 
 # 协议名 → 转换器实例的注册表
