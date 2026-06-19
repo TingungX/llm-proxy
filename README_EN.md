@@ -58,6 +58,9 @@ LLM Proxy deeply integrates with Codex Desktop's OpenAI Responses API, with full
 - **apply_patch tool description injection**: the server replaces the tool description with `APPLY_PATCH_TOOL_DESCRIPTION`, which explicitly enumerates the `***` marker prefix, the `@@`-on-its-own-line rule, the line-prefix rules (` ` / `- ` / `+ `), and the strict character-level context matching requirement — so the model avoids common pitfalls before writing.
 - **Non-standard tool downgrade**: `namespace` is recursively flattened (sub-tools named with `__` to satisfy upstreams that enforce `^[a-zA-Z0-9_-]+$`), `web_search` is executed client-side, other `custom` tools are passed through
 - **Think tag extraction**: `<think>` tags from upstream responses are extracted into reasoning/thinking blocks
+- **SSE event type safety**: Every SSE data payload automatically injects the `type` field (mirroring the `event:` header).
+  Codex only reads the `type` field from the data JSON, not the `event:` header; missing `type` causes
+  "stream closed before response.completed" errors
 - **Protocol conversion**: Automatic bidirectional conversion regardless of upstream format (Chat Completions or Anthropic Messages)
 
 See [`config.toml.example`](config.toml.example) to configure Codex Desktop with this proxy.

@@ -70,6 +70,9 @@ LLM Proxy 全面兼容 Codex Desktop 的 OpenAI Responses API 通信协议：
 - **非标准工具降级**：`namespace` 递归展开（子工具命名用 `__` 分隔，避开部分上游的
   `^[a-zA-Z0-9_-]+$` 限制）、`web_search` 客户端本地执行、其他 `custom` 工具透传
 - **think 标签自动提取**：上游返回的 `<think>` 标签内容自动提取为 reasoning / thinking blocks
+- **SSE 事件 type 安全**：每个 SSE data payload 自动注入 `type` 字段（与 `event:` 头镜像），
+  Codex 只解析 data JSON 的 `type`，不认 `event:` 头；缺失会导致 "stream closed before
+  response.completed" 错误
 - **协议转换**：无论上游是 Chat Completions 还是 Anthropic Messages，自动完成双向转换
 
 参考 [`config.toml.example`](config.toml.example) 快速配置 Codex Desktop 接入。
