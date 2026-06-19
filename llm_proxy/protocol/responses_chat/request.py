@@ -461,7 +461,7 @@ def to_responses_response(chat_body: dict, original_model: str, reverse_tool_map
                 # 解包 {"input": "..."} 为原始 DSL 文本
                 args_str = repair_apply_patch_dsl(_unwrap_input_arg(args_str)).dsl
                 output.append({
-                    "id": f"fc_{tc.get('id', '')}",
+                    "id": f"fc_{uuid.uuid4().hex[:24]}",
                     "type": "custom_tool_call",
                     "name": downstream_name,
                     "status": "completed",
@@ -474,7 +474,7 @@ def to_responses_response(chat_body: dict, original_model: str, reverse_tool_map
                 if not args:
                     args = "{}"
                 output.append({
-                    "id": f"fc_{tc.get('id', '')}",
+                    "id": f"fc_{uuid.uuid4().hex[:24]}",
                     "type": "function_call",
                     "name": spec.name,
                     "namespace": spec.namespace,
@@ -488,7 +488,7 @@ def to_responses_response(chat_body: dict, original_model: str, reverse_tool_map
                 if not args:
                     args = "{}"
                 output.append({
-                    "id": f"fc_{tc.get('id', '')}",
+                    "id": f"fc_{uuid.uuid4().hex[:24]}",
                     "type": "function_call",
                     "status": "completed",
                     "call_id": tc.get("id", ""),

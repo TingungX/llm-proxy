@@ -63,6 +63,7 @@ class StreamState:
         self.func_args_buf: dict[int, str] = {}
         self.func_names: dict[int, str] = {}
         self.func_call_ids: dict[int, str] = {}
+        self.func_item_ids: dict[int, str] = {}
         self.func_item_added: dict[int, bool] = {}
         self.reverse_tool_map: dict[str, str] = reverse_tool_map or {}
         self.tool_spec_map: dict[str, "CodexToolSpec"] = tool_spec_map or {}
@@ -234,6 +235,7 @@ class StreamState:
         if self.in_text_block:
             events.extend(self.close_text_block())
         self.func_call_ids[idx] = tc_id
+        self.func_item_ids[idx] = _gen_id("fc_")
         self.func_names[idx] = name
         self.in_func_block = True
         self.func_args_buf.setdefault(idx, "")
@@ -244,7 +246,7 @@ class StreamState:
         if downstream_name is not None:
             # 1) reverse_tool_map 命中 → custom_tool_call
             item = {
-                "id": f"fc_{tc_id}",
+                "id": self.func_item_ids[idx],
                 "type": "custom_tool_call",
                 "status": "in_progress",
                 "call_id": tc_id,
@@ -254,7 +256,7 @@ class StreamState:
         elif spec is not None and spec.kind == "namespace" and spec.namespace:
             # 2) namespace 子工具 → function_call + 原始名称 + namespace
             item = {
-                "id": f"fc_{tc_id}",
+                "id": self.func_item_ids[idx],
                 "type": "function_call",
                 "status": "in_progress",
                 "call_id": tc_id,
@@ -265,7 +267,7 @@ class StreamState:
         else:
             # 3) 普通函数 → function_call
             item = {
-                "id": f"fc_{tc_id}",
+                "id": self.func_item_ids[idx],
                 "type": "function_call",
                 "status": "in_progress",
                 "call_id": tc_id,
@@ -288,7 +290,7 @@ class StreamState:
         if name in self.reverse_tool_map:
             return []  # custom_tool_call 不流式 delta
         output_index = self._func_output_index(idx)
-        item_id = f"fc_{self.func_call_ids[idx]}"
+        item_id = self.func_item_ids[idx]
         # namespace 子工具也使用标准 function_call_arguments 事件（Codex 不认 mcp_call 事件）
         event_type = "response.function_call_arguments.delta"
         return [_make_sse_event({
@@ -306,6 +308,7 @@ class StreamState:
         for idx in sorted(self.func_args_buf.keys()):
             args = self.func_args_buf[idx] or "{}"
             call_id = self.func_call_ids[idx]
+            item_id = self.func_item_ids[idx]
             name = self.func_names[idx]
             output_index = self._func_output_index(idx)
             downstream_name = self.reverse_tool_map.get(name)
@@ -320,7 +323,7 @@ class StreamState:
 
                 events.append(_make_sse_event({
                     "type": "response.custom_tool_call_input.delta",
-                    "item_id": f"fc_{call_id}",
+                    "item_id": item_id,
                     "call_id": call_id,
                     "delta": args,
                 }))
@@ -329,7 +332,7 @@ class StreamState:
                     "output_index": output_index,
                     "sequence_number": self._next_seq(),
                     "item": {
-                        "id": f"fc_{call_id}",
+                        "id": item_id,
                         "type": "custom_tool_call",
                         "name": downstream_name,
                         "status": "completed",
@@ -343,7 +346,7 @@ class StreamState:
                     # 2) namespace 子工具 → function_call + 原始名称 + namespace
                     events.append(_make_sse_event({
                         "type": "response.function_call_arguments.done",
-                        "item_id": f"fc_{call_id}",
+                        "item_id": item_id,
                         "output_index": output_index,
                         "sequence_number": self._next_seq(),
                         "arguments": args,
@@ -353,7 +356,7 @@ class StreamState:
                         "output_index": output_index,
                         "sequence_number": self._next_seq(),
                         "item": {
-                            "id": f"fc_{call_id}",
+                            "id": item_id,
                             "type": "function_call",
                             "name": spec.name,
                             "namespace": spec.namespace,
@@ -366,7 +369,7 @@ class StreamState:
                     # 3) 普通函数 → function_call
                     events.append(_make_sse_event({
                         "type": "response.function_call_arguments.done",
-                        "item_id": f"fc_{call_id}",
+                        "item_id": item_id,
                         "output_index": output_index,
                         "sequence_number": self._next_seq(),
                         "arguments": args,
@@ -376,7 +379,7 @@ class StreamState:
                         "output_index": output_index,
                         "sequence_number": self._next_seq(),
                         "item": {
-                            "id": f"fc_{call_id}",
+                            "id": item_id,
                             "type": "function_call",
                             "status": "completed",
                             "arguments": args,
@@ -462,6 +465,7 @@ class StreamState:
             })
         for idx in sorted(self.func_args_buf.keys()):
             call_id = self.func_call_ids[idx]
+            item_id = self.func_item_ids[idx]
             name = self.func_names[idx]
             args = self.func_args_buf[idx] or "{}"
             downstream_name = self.reverse_tool_map.get(name)
@@ -472,7 +476,7 @@ class StreamState:
                 # 解包 {"input": "..."} 为原始 DSL 文本
                 args = repair_apply_patch_dsl(_unwrap_input_arg(args)).dsl
                 items.append({
-                    "id": f"fc_{call_id}",
+                    "id": item_id,
                     "type": "custom_tool_call",
                     "name": downstream_name,
                     "status": "completed",
@@ -484,7 +488,7 @@ class StreamState:
                 if spec is not None and spec.kind == "namespace" and spec.namespace:
                     # 2) namespace 子工具 → function_call + 原始名称 + namespace
                     items.append({
-                        "id": f"fc_{call_id}",
+                        "id": item_id,
                         "type": "function_call",
                         "name": spec.name,
                         "namespace": spec.namespace,
@@ -495,7 +499,7 @@ class StreamState:
                 else:
                     # 3) 普通函数 → function_call
                     items.append({
-                        "id": f"fc_{call_id}",
+                        "id": item_id,
                         "type": "function_call",
                         "status": "completed",
                         "arguments": args,

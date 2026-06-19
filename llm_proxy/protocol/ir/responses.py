@@ -400,7 +400,7 @@ def response_from_ir(ir: IRResponse, *, reverse_tool_map: dict | None = None, to
                         args_raw = repair_apply_patch_dsl(dsl).dsl
                 output.append({
                     "type": "custom_tool_call",
-                    "id": f"fc_{block.id}" if block.id else f"fc_{uuid.uuid4().hex[:16]}",
+                    "id": f"fc_{uuid.uuid4().hex[:24]}",
                     "name": downstream_name,
                     "status": "completed",
                     "call_id": block.id or f"call_{uuid.uuid4().hex[:24]}",
@@ -410,7 +410,7 @@ def response_from_ir(ir: IRResponse, *, reverse_tool_map: dict | None = None, to
                 # 2) namespace 子工具 → function_call + 原始名称 + namespace
                 output.append({
                     "type": "function_call",
-                    "id": f"fc_{block.id}" if block.id else f"fc_{uuid.uuid4().hex[:16]}",
+                    "id": f"fc_{uuid.uuid4().hex[:24]}",
                     "name": spec["name"],
                     "namespace": spec["namespace"],
                     "arguments": safe_json_dumps(block.input, default="{}"),
@@ -421,7 +421,7 @@ def response_from_ir(ir: IRResponse, *, reverse_tool_map: dict | None = None, to
                 # 3) 普通工具 → function_call
                 output.append({
                     "type": "function_call",
-                    "id": f"fc_{block.id}" if block.id else f"fc_{uuid.uuid4().hex[:16]}",
+                    "id": f"fc_{uuid.uuid4().hex[:24]}",
                     "call_id": block.id or f"call_{uuid.uuid4().hex[:24]}",
                     "name": block.name,
                     "arguments": safe_json_dumps(block.input, default="{}"),
@@ -1270,7 +1270,7 @@ async def format_ir_as_sse(
                 yield ev
 
             upstream_name = data.get("name", "")
-            tool_call_id = data.get("id") or f"fc_{uuid.uuid4().hex[:24]}"
+            tool_call_id = data.get("id") or f"call_{uuid.uuid4().hex[:24]}"
             current_item_id = new_item_id("fc")
             last_function_call_id = current_item_id
             current_tool_call_id = tool_call_id
