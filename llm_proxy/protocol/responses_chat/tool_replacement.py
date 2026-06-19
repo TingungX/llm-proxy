@@ -1,580 +1,321 @@
-"""apply_patch DSL 与标准文件工具（write_to_file / replace_in_file / delete_file）之间的转换。
+"""apply_patch DSL 修复工具。
 
-正向：解析 apply_patch 的 patch 文本，提取每个文件段的路径和内容/替换信息。
-反向：将标准工具调用参数生成 apply_patch 格式的 patch 文本。
+当上游模型以自定义工具透传模式调用 apply_patch 时，返回的 input 参数字符串
+可能不完整（缺少 *** Begin Patch、*** End Patch，或夹杂语音文本）。
+repair_apply_patch_dsl 负责修复这些格式问题，保证 Codex 能正确解析。
 
-apply_patch DSL 完整语法：
-  patch: "*** Begin Patch" file_section+ "*** End Patch"
-  file_section: add_hunk | delete_hunk | update_hunk
-  add_hunk: "*** Add File: " filename LF add_line+
-  add_line: "+" /(.*)/ LF
-  delete_hunk: "*** Delete File: " filename LF
-  update_hunk: "*** Update File: " filename LF change_move? change
-  change_move: "*** Move to: " filename LF
-  change: (change_context | change_line)+ eof_line?
-  change_context: ("@@" | "@@ " /(.+)/) LF
-  change_line: ("+" | "-" | " ") /(.*)/ LF
-  eof_line: "*** End of File" LF
+修复后会返回 RepairResult，stream.py 拿到后会用 .dsl 作为 custom_tool_call.input。
+如果被修复，.dsl 顶部会嵌入一行紧凑的 # 注释，告知模型：
+  - 工具修了什么
+  - 让模型下次能写出正确格式
+注释行被 apply_patch 解析器自动忽略，不影响 patch 执行。
 """
 
 import logging
 import re
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# 标准文件工具定义（发给上游模型）
-# ---------------------------------------------------------------------------
-
-WRITE_TOOL_DEF: dict = {
-    "type": "function",
-    "function": {
-        "name": "write_to_file",
-        "description": (
-            "Creates a new file with the specified content. "
-            "If the file already exists, it will be completely overwritten. "
-            "For modifying existing files, prefer replace_in_file instead. "
-            "For long content, prefer append_to_file to add content in smaller chunks."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "filePath": {
-                    "type": "string",
-                    "description": "Absolute path of the target file.",
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Full content to write to the file.",
-                },
-            },
-            "required": ["filePath", "content"],
-        },
-    },
-}
-
-REPLACE_TOOL_DEF: dict = {
-    "type": "function",
-    "function": {
-        "name": "replace_in_file",
-        "description": (
-            "Performs exact string replacements in an existing file. "
-            "The old_str must match the file content exactly and must be unique within the file. "
-            "Include enough surrounding context lines to ensure uniqueness. "
-            "NEVER use old_str that could match multiple locations. "
-            "NEVER use empty old_str. When appending to a file, include the last few lines "
-            "of the file as old_str and add new content in new_str. "
-            "To rename or move the file, provide destinationPath with the new path."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "filePath": {
-                    "type": "string",
-                    "description": "Absolute path of the target file.",
-                },
-                "old_str": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": (
-                        "The exact text to be replaced. Must not be empty. "
-                        "Include surrounding context lines to disambiguate."
-                    ),
-                },
-                "new_str": {
-                    "type": "string",
-                    "description": (
-                        "The replacement text. Include the same surrounding "
-                        "context lines that were in old_str."
-                    ),
-                },
-                "destinationPath": {
-                    "type": "string",
-                    "description": (
-                        "Optional new absolute path for the file. "
-                        "When provided, the file is moved/renamed to this path after the replacement. "
-                        "Use this when the operation includes a rename or move."
-                    ),
-                },
-            },
-            "required": ["filePath", "old_str", "new_str"],
-        },
-    },
-}
-
-DELETE_TOOL_DEF: dict = {
-    "type": "function",
-    "function": {
-        "name": "delete_file",
-        "description": (
-            "Deletes an existing file permanently. "
-            "This is a destructive operation. Only use when the user explicitly requests deletion."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "filePath": {
-                    "type": "string",
-                    "description": "Absolute path of the file to delete.",
-                },
-            },
-            "required": ["filePath"],
-        },
-    },
-}
-
-APPEND_TOOL_DEF: dict = {
-    "type": "function",
-    "function": {
-        "name": "append_to_file",
-        "description": (
-            "Appends content to the end of an existing file. "
-            "Use this when adding new content to the end of a file without modifying existing content. "
-            "Do NOT use replace_in_file with empty old_str for appending — use append_to_file instead."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "filePath": {
-                    "type": "string",
-                    "description": "Absolute path of the target file.",
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Content to append to the end of the file.",
-                },
-            },
-            "required": ["filePath", "content"],
-        },
-    },
-}
-
-# Tool name aliases for lenient argument extraction
-_PATH_KEYS = ("filePath", "file_path", "path", "filepath")
-_CONTENT_KEYS = ("content", "contents", "text")
-_OLD_STR_KEYS = ("old_str", "oldStr", "old_string", "old")
-_NEW_STR_KEYS = ("new_str", "newStr", "new_string", "new")
-_DEST_PATH_KEYS = ("destinationPath", "destination_path", "dest_path", "destPath", "new_path")
-
-
-def _extract_arg(args: dict, keys: tuple[str, ...]) -> str | None:
-    """从参数字典中按优先级取第一个存在的 key 值。"""
-    for k in keys:
-        v = args.get(k)
-        if v is not None and isinstance(v, str):
-            return v
-    return None
-
+APPLY_PATCH_TOOL_DESCRIPTION: str = (
+    "Edit files using the apply_patch DSL. "
+    "The single input string parameter must contain a patch with this structure: "
+    "Begin Patch, Action File lines, change lines, End Patch. "
+    "Actions are 'Add File' (new file, all lines start with plus), "
+    "'Update File' (diff with minus for removed, plus for added, space for context; "
+    "optional 'at' anchor and 'Move to: path' for rename), "
+    "'Delete File' (no body). "
+    "A patch can contain multiple file sections. "
+    "Common failure: 'is not a valid hunk header' usually means a plus prefix "
+    "is missing on a content line - every line inside Add/Update must start with plus, minus, or space."
+)
 
 # ---------------------------------------------------------------------------
-# 正向转换：apply_patch DSL → 标准工具调用参数
+# DSL marker 正则
+# 必须行首匹配，避免在文件内容行中间误匹配（如 +// TODO: *** End Patch）
+# 兼容各种不标准写法：***, ****, ** *, * * *
 # ---------------------------------------------------------------------------
 
-_BEGIN_RE = re.compile(r"\*{3}\s*Begin\s+Patch", re.IGNORECASE)
+_BEGIN_RE = re.compile(
+    r"^[ \t]*(?:\*{3,4}|\*\*\s\*|\*\s\*\s\*)\s*Begin\s+Patch",
+    re.IGNORECASE | re.MULTILINE,
+)
+_END_RE = re.compile(
+    r"^[ \t]*(?:\*{3,4}|\*\*\s\*|\*\s\*\s\*)\s*End\s+Patch",
+    re.IGNORECASE | re.MULTILINE,
+)
 _ADD_FILE_RE = re.compile(r"\*{3}\s*Add\s+File\s*:\s*(.+)", re.IGNORECASE)
 _UPDATE_FILE_RE = re.compile(r"\*{3}\s*Update\s+File\s*:\s*(.+)", re.IGNORECASE)
 _DELETE_FILE_RE = re.compile(r"\*{3}\s*Delete\s+File\s*:\s*(.+)", re.IGNORECASE)
 _MOVE_TO_RE = re.compile(r"\*{3}\s*Move\s+to\s*:\s*(.+)", re.IGNORECASE)
-_END_OF_FILE_RE = re.compile(r"\*{3}\s*End\s+of\s+File", re.IGNORECASE)
-_END_RE = re.compile(r"\*{3}\s*End\s+Patch", re.IGNORECASE)
+# ---------------------------------------------------------------------------
+# 文件操作关键字大小写归一化
+# apply_patch 严格校验 Add File / Update File / Delete File / Move to 的大小写，
+# 模型常见错误：update File、Update file、ADD FILE 等。需纠正为标准 Title Case。
+# ---------------------------------------------------------------------------
+_HEADER_NORMALIZE_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (_ADD_FILE_RE, r"*** Add File: \1"),
+    (_UPDATE_FILE_RE, r"*** Update File: \1"),
+    (_DELETE_FILE_RE, r"*** Delete File: \1"),
+    (_MOVE_TO_RE, r"*** Move to: \1"),
+]
+# ---------------------------------------------------------------------------
+# @@ hunk header 归一化
+# 模型有时把 @@ 当成 unified-diff 的 hunk header（@@ -19,5 +19,6 @@），
+# 或当成 anchor（@@ def some_function:）。apply_patch 期望 @@ 单独成行。
+# 匹配以 @@ 起始行、后跟空白 + 至少一个非空白字符的行，截断为裸 @@。
+# ---------------------------------------------------------------------------
+_HUNK_HEADER_REPAIR_RE = re.compile(r"^@@[ \t]+\S[^\n]*$", re.MULTILINE)
+
+# 归一化 regex：捕获前导空白 + 非标准前缀 + Begin/End Patch
+# [\s*#] 允许字符之间有空格，所以能匹配 ** * / * * *
+_NORMALIZE_BEGIN = re.compile(
+    r"^([ \t]*)(?:[\*#][\s*#]*){2,}[ \t_]*begin[ \t_]*(?:of[ \t_]*)?patch[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_NORMALIZE_END = re.compile(
+    r"^([ \t]*)(?:[\*#][\s*#]*){2,}[ \t_]*end[ \t_]*(?:of[ \t_]*)?patch[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
-def parse_apply_patch_to_simple(input_text: str) -> list[dict] | None:
-    """尝试将 apply_patch 的 patch 文本解析为标准工具调用参数列表。
+# ---------------------------------------------------------------------------
+# 修复结果
+# ---------------------------------------------------------------------------
 
-    返回列表中每个元素格式：
-        {"tool": "write_to_file", "args": {"filePath": ..., "content": ...}}
-        {"tool": "replace_in_file", "args": {"filePath": ..., "old_str": ..., "new_str": ..., destinationPath?}}
-        {"tool": "delete_file", "args": {"filePath": ...}}
+@dataclass
+class RepairResult:
+    """DSL 修复结果。
 
-    返回 None — 解析失败（格式错误或段内解析失败）
+    Attributes:
+        dsl: 修复后的完整 DSL。Codex harness 强校验首末两行（首行必须为
+             ``*** Begin Patch``、末行必须为 ``*** End Patch``），所以
+             修复结果保持 DSL 字符串本身的封闭性，不注入任何注记。
+        repairs: 修复项描述列表（人类可读短句）。空列表表示无修复。
     """
-    if not input_text or not isinstance(input_text, str):
-        return None
+    dsl: str
+    repairs: list[str] = field(default_factory=list)
 
-    # 提取 Begin Patch 和 End Patch 之间的内容
-    # 兼容无 Begin Patch 前缀的输入（Codex 有时不带前缀）
-    begin_match = _BEGIN_RE.search(input_text)
-    if begin_match:
-        body_start = begin_match.end()
-    else:
-        # 无 Begin Patch：尝试从第一个文件头开始
-        first_header = None
-        for pat in (_ADD_FILE_RE, _UPDATE_FILE_RE, _DELETE_FILE_RE):
-            m = pat.search(input_text)
-            if m and (first_header is None or m.start() < first_header.start()):
-                first_header = m
-        if first_header is None:
-            return None
-        body_start = first_header.start()
+    @property
+    def was_repaired(self) -> bool:
+        return bool(self.repairs)
 
-    end_match = _END_RE.search(input_text, body_start)
-    if end_match:
-        body_text = input_text[body_start:end_match.start()]
-    else:
-        body_text = input_text[body_start:]
 
-    # 按文件头分割为段
-    segments: list[tuple[str, str, list[str]]] = []  # [(action, path, lines)]
-    current_action: str | None = None
-    current_path: str | None = None
-    current_lines: list[str] = []
+# 注记注入历史（已废弃，见 ad_hoc 笔记 2026-06-19T11-25）：
+#   顶部 prepend → Codex harness 首行检查拒收
+#   末尾 append  → Codex harness 末行检查拒收
+# 修复反馈改走 logger 留痕，DSL 字符串保持首末两行字面匹配。
 
-    for line in body_text.splitlines():
-        add_match = _ADD_FILE_RE.match(line)
-        update_match = _UPDATE_FILE_RE.match(line)
-        delete_match = _DELETE_FILE_RE.match(line)
 
-        if add_match:
-            if current_action is not None:
-                segments.append((current_action, current_path, current_lines))
-            current_action = "add"
-            current_path = add_match.group(1).strip()
-            current_lines = []
-        elif update_match:
-            if current_action is not None:
-                segments.append((current_action, current_path, current_lines))
-            current_action = "update"
-            current_path = update_match.group(1).strip()
-            current_lines = []
-        elif delete_match:
-            if current_action is not None:
-                segments.append((current_action, current_path, current_lines))
-            current_action = "delete"
-            current_path = delete_match.group(1).strip()
-            current_lines = []
-        elif _END_OF_FILE_RE.match(line):
-            # End of File 标记段结束
-            if current_action is not None:
-                segments.append((current_action, current_path, current_lines))
-            current_action = None
-            current_path = None
-            current_lines = []
+# ---------------------------------------------------------------------------
+# DSL 修复
+# ---------------------------------------------------------------------------
+
+
+def repair_apply_patch_dsl(dsl: str) -> RepairResult:
+    """修复 apply_patch DSL 格式问题，返回 RepairResult。
+
+    上游模型有时输出不完整的 DSL：缺少 *** Begin Patch、
+    缺少 *** End Patch，或在补丁前后夹杂语音文本。
+
+    修复策略（按优先级）：
+    - 两者都有 → 截断到 Begin..End 之间的纯净 DSL
+    - 有 Begin 无 End → 补 End
+    - 无 Begin 有 End → 在 End 之前的第一个文件头前插入 Begin
+    - 无 Begin 无 End → 在第一个文件头前插入 Begin，末尾补 End
+    - 无文件头 → 原样返回
+    """
+    if not dsl or not isinstance(dsl, str):
+        return RepairResult(dsl=dsl or "", repairs=[])
+
+    original = dsl
+    text = dsl.strip()
+    if not text:
+        return RepairResult(dsl="", repairs=[])
+
+    repairs: list[str] = []
+    stripped = len(original) - len(text)
+    if stripped:
+        repairs.append(f"stripped {stripped} leading/trailing whitespace char(s)")
+
+    # Step 1: 归一化 marker（** * Begin → *** Begin 等）
+    before = text
+    new_text = _NORMALIZE_BEGIN.sub(r"\1*** Begin Patch", text)
+    new_text = _NORMALIZE_END.sub(r"\1*** End Patch", new_text)
+    if new_text != before:
+        # 区分 Begin / End 归一化
+        end_only = _NORMALIZE_END.sub(r"\1*** End Patch", text)
+        begin_only = _NORMALIZE_BEGIN.sub(r"\1*** Begin Patch", text)
+        if begin_only != text:
+            repairs.append("normalized Begin marker")
+        if end_only != text:
+            repairs.append("normalized End marker")
+        text = new_text
+
+    # Step 2: 归一化 @@ hunk header（@@ -19,5 +19,6 @@ → @@）
+    text, hh_count = _normalize_hunk_headers(text)
+    if hh_count:
+        if hh_count == 1:
+            repairs.append("normalized @@ hunk header")
         else:
-            # diff 内容行：@@ / +/-/空格前缀 / *** Move to:
-            stripped = line.strip()
-            move_match = _MOVE_TO_RE.match(line)
-            if move_match or stripped.startswith("@@") or line.startswith("+") or line.startswith("-") or line.startswith(" "):
-                current_lines.append(line)
+            repairs.append(f"normalized {hh_count} @@ hunk headers")
 
-    # 最后一段
-    if current_action is not None:
-        segments.append((current_action, current_path, current_lines))
+    # Step 3: 归一化文件操作关键字大小写（update File → Update File 等）
+    # 注：Step 2 和 Step 3 链式执行，Step 2 的输出是 Step 3 的输入，
+    # 避免覆盖丢失修复结果。
+    header_repairs = _normalize_file_headers(text)
+    if header_repairs:
+        text = header_repairs["text"]
+        repairs.extend(header_repairs["repairs"])
 
-    if not segments:
-        return None
+    # Step 4: 找 Begin/End 位置（基于归一化后的文本）
+    begin_matches = list(_BEGIN_RE.finditer(text))
+    end_matches = list(_END_RE.finditer(text))
+    begin_match = begin_matches[0] if begin_matches else None
+    end_match = end_matches[0] if end_matches else None
 
-    # 逐段解析
-    results: list[dict] = []
-    for action, path, lines in segments:
-        parsed = _parse_segment(action, path, lines)
-        if parsed is None:
-            # 段级降级：不影响其他段
-            logger.warning("Segment parse failed: action=%s path=%s, degrading segment", action, path)
-            path_hint = path[:80] if path else "unknown"
-            results.append({
-                "tool": "_degraded_user_message",
-                "args": {
-                    "content": f"[File {path_hint} was modified — patch segment could not be converted]",
-                },
-            })
+    # Step 4: 按情况处理
+    if begin_match and end_match and begin_match.start() < end_match.end():
+        new_text = text[begin_match.start():end_match.end()]
+        if new_text != text:
+            repairs.append("trimmed surrounding text")
+        text = new_text
+    elif begin_match and not end_match:
+        text = text.rstrip() + "\n*** End Patch"
+        repairs.append("appended missing *** End Patch")
+    elif not begin_match and end_match:
+        first_header = _find_first_header(text, 0, end_match.start())
+        if first_header:
+            text = "*** Begin Patch\n" + text[first_header.start():]
+            repairs.append("inserted missing *** Begin Patch")
         else:
-            results.append(parsed)
+            # End 在行首/文件头之前：降级到无 Begin 无 End 路径
+            first_header = _find_first_header(text)
+            if first_header:
+                text = "*** Begin Patch\n" + text[first_header.start():]
+                text = text.rstrip() + "\n*** End Patch"
+                repairs.append("wrapped with Begin/End markers")
+            else:
+                return RepairResult(dsl=dsl, repairs=[])  # 无法定位插入位置
+    elif not begin_match and not end_match:
+        first_header = _find_first_header(text)
+        if first_header:
+            text = "*** Begin Patch\n" + text[first_header.start():]
+            text = text.rstrip() + "\n*** End Patch"
+            repairs.append("wrapped with Begin/End markers")
+        else:
+            return RepairResult(dsl=dsl, repairs=[])  # 无文件头，无法修复
 
-    return results
+    # Step 5: 组装最终 DSL。Codex harness 强校验首末两行（首行必须为
+    #         ``*** Begin Patch``、末行必须为 ``*** End Patch``），所以
+    #         修复后不在 DSL 内追加任何内容；修复信息走 logger 留痕。
+    #
+    # 临时 DEBUG 日志：触发时打 WARNING 级别（含 before/after），
+    # 用于排查 `***` 标记丢失等真机问题。确认无问题后可降级回 INFO / 删掉。
+    if repairs:
+        _log_repair_diff(original, text, repairs)
+        logger.info("repair_apply_patch_dsl: applied %d repair(s): %s",
+                    len(repairs), "; ".join(repairs))
+    final_dsl = text
 
-
-def _parse_segment(action: str, path: str, lines: list[str]) -> dict | None:
-    """解析单个文件段为工具调用参数。"""
-
-    # 所有工具都要求 filePath 非空
-    if not path or not path.strip():
-        logger.warning("Segment has empty filePath: action=%s", action)
-        return None
-
-    if action == "add":
-        plus_lines = [ln[1:] for ln in lines if ln.startswith("+")]
-        content = "\n".join(plus_lines)
-        # write_to_file 要求 content 非空（空文件无意义，且可能与 replace 语义混淆）
-        if not content and not plus_lines:
-            logger.warning("Add File has no '+' lines (empty content): %s", path)
-            return None
-        return {
-            "tool": "write_to_file",
-            "args": {"filePath": path, "content": content},
-        }
-
-    if action == "delete":
-        return {
-            "tool": "delete_file",
-            "args": {"filePath": path},
-        }
-
-    if action == "update":
-        # 提取 Move to 目标路径
-        dest_path: str | None = None
-        content_lines: list[str] = []
-        for ln in lines:
-            move_match = _MOVE_TO_RE.match(ln)
-            if move_match:
-                dest_path = move_match.group(1).strip()
-                continue
-            content_lines.append(ln)
-
-        minus_lines = [ln[1:] for ln in content_lines if ln.startswith("-")]
-        plus_lines = [ln[1:] for ln in content_lines if ln.startswith("+")]
-        context_lines = [ln[1:] for ln in content_lines if ln.startswith(" ")]
-
-        # 无 diff 行 + 无 Move to → 空段
-        if not minus_lines and not plus_lines and dest_path is None:
-            logger.warning("Update File segment has no '-'/'+' lines and no Move to: %s", path)
-            return None
-
-        # Move to only（无内容修改）
-        if not minus_lines and not plus_lines and dest_path is not None:
-            # 安全：占位 old_str/new_str 为单个空格（minLength=1）
-            return {
-                "tool": "replace_in_file",
-                "args": {
-                    "filePath": path,
-                    "old_str": " ",
-                    "new_str": " ",
-                    "destinationPath": dest_path,
-                },
-            }
-
-        # 有 diff 行但无 '-' 行 → 只有 '+' 行的 Update File
-        old_str = "\n".join(minus_lines)
-        if not old_str:
-            # 有 context 行 → 用 context 行作为锚点构造 replace_in_file
-            # 这对齐 Claude Code 的行为：用已有内容作为 old_str，追加新内容
-            if context_lines:
-                old_str = "\n".join(context_lines)
-                new_str = "\n".join(context_lines + plus_lines)
-                args = {
-                    "filePath": path,
-                    "old_str": old_str,
-                    "new_str": new_str,
-                }
-                if dest_path is not None:
-                    args["destinationPath"] = dest_path
-                return {"tool": "replace_in_file", "args": args}
-
-            # 无 context 行也无 '-' 行 → 只有 '+' 行的追加操作
-            if plus_lines:
-                # 有 Move to → 必须用 replace_in_file（append_to_file 不支持 destinationPath）
-                if dest_path is not None:
-                    logger.debug("Update File has only '+' lines with Move to, degrading to user message: %s", path)
-                    return {
-                        "tool": "_degraded_user_message",
-                        "args": {
-                            "content": f"[File {path} was modified (rename to {dest_path}, append) — appended content]\n" + "\n".join(plus_lines),
-                        },
-                    }
-                logger.debug("Update File has only '+' lines and no context (append), converting to append_to_file: %s", path)
-                return {
-                    "tool": "append_to_file",
-                    "args": {
-                        "filePath": path,
-                        "content": "\n".join(plus_lines),
-                    },
-                }
-            # 无 '-' 也无 '+' 行（只有 @@ 行）→ 无效段
-            logger.warning("Update File has no '-' or '+' lines: %s", path)
-            return None
-
-        args = {
-            "filePath": path,
-            "old_str": old_str,
-            "new_str": "\n".join(plus_lines),
-        }
-        if dest_path is not None:
-            args["destinationPath"] = dest_path
-        return {"tool": "replace_in_file", "args": args}
-
-    return None
+    return RepairResult(dsl=final_dsl, repairs=repairs)
 
 
-# ---------------------------------------------------------------------------
-# 反向转换：简单函数调用参数 → apply_patch DSL
-# ---------------------------------------------------------------------------
+def _normalize_file_headers(text: str) -> dict | None:
+    """纠正文件操作关键字的大小写。
 
-def write_to_apply_patch(file_path: str, content: str) -> str:
-    """将 write_to_file 调用转为 apply_patch Add File 格式。"""
-    lines = content.split("\n")
-    body = "\n".join(f"+{ln}" for ln in lines)
-    return "*** Begin Patch\n*** Add File: {}\n{}\n*** End Patch".format(file_path, body)
-
-
-def delete_to_apply_patch(file_path: str) -> str:
-    """将 delete_file 调用转为 apply_patch Delete File 格式。"""
-    return "*** Begin Patch\n*** Delete File: {}\n*** End Patch".format(file_path)
-
-
-def append_to_apply_patch(file_path: str, content: str) -> str:
-    """将 append_to_file 调用转为 apply_patch Update File 格式（只有 '+' 行）。
-
-    Codex 的 apply_patch 执行器支持只有 '+' 行的 Update File，等同于追加到文件末尾。
-    """
-    lines = content.split("\n")
-    body = "\n".join(f"+{ln}" for ln in lines)
-    return "*** Begin Patch\n*** Update File: {}\n@@\n{}\n*** End Patch".format(file_path, body)
-
-
-def replace_to_apply_patch(file_path: str, old_str: str, new_str: str, dest_path: str | None = None) -> str:
-    """将 replace_in_file 调用转为 apply_patch Update File 格式。
-
-    对 old_str / new_str 做逐行 diff：提取公共前缀/后缀作为 context 行（空格前缀），
-    差异部分作为 -/+ 行。模型如果在 old_str / new_str 中都带 context，
-    patch 对 Codex 的 apply_patch 解析器就是有效的。
-
-    当 dest_path 非空时，在 Update File 行后插入 *** Move to: 行。
-    """
-    old_lines = old_str.split("\n")
-    new_lines = new_str.split("\n")
-
-    # 公共前缀：从头匹配到第一个差异行
-    prefix_len = 0
-    min_len = min(len(old_lines), len(new_lines))
-    while prefix_len < min_len and old_lines[prefix_len] == new_lines[prefix_len]:
-        prefix_len += 1
-
-    # 公共后缀：从尾向前匹配（不重叠前缀部分）
-    suffix_len = 0
-    while (
-        suffix_len < len(old_lines) - prefix_len
-        and suffix_len < len(new_lines) - prefix_len
-        and old_lines[-(suffix_len + 1)] == new_lines[-(suffix_len + 1)]
-    ):
-        suffix_len += 1
-
-    context_prefix = old_lines[:prefix_len]
-    removed = old_lines[prefix_len : len(old_lines) - suffix_len]
-    added = new_lines[prefix_len : len(new_lines) - suffix_len]
-    context_suffix = old_lines[len(old_lines) - suffix_len :]
-
-    parts = ["*** Begin Patch", "*** Update File: {}".format(file_path)]
-    if dest_path:
-        parts.append("*** Move to: {}".format(dest_path))
-    parts.append("@@")
-    for ln in context_prefix:
-        parts.append(" {}".format(ln))
-    for ln in removed:
-        parts.append("-{}".format(ln))
-    for ln in added:
-        parts.append("+{}".format(ln))
-    for ln in context_suffix:
-        parts.append(" {}".format(ln))
-    parts.append("*** End Patch")
-    return "\n".join(parts)
-
-
-# ---------------------------------------------------------------------------
-# 反向映射表
-# ---------------------------------------------------------------------------
-
-def build_reverse_tool_map() -> dict[str, str]:
-    """返回上游 tool name -> 下游 custom tool name 的映射。"""
-    return {
-        "write_to_file": "apply_patch",
-        "replace_in_file": "apply_patch",
-        "delete_file": "apply_patch",
-        "append_to_file": "apply_patch",
-    }
-
-
-# ---------------------------------------------------------------------------
-# 从反向工具的函数参数中提取文件路径和输入文本（用于 StreamState 消费）
-# ---------------------------------------------------------------------------
-
-class ReverseConversionError(ValueError):
-    """反向转换失败，携带错误信息供上层构造错误 tool result。"""
-
-    def __init__(self, tool_name: str, reason: str, detail: str = ""):
-        self.tool_name = tool_name
-        self.reason = reason
-        self.detail = detail
-        msg = f"reverse conversion failed for {tool_name}: {reason}"
-        if detail:
-            msg += f" — {detail}"
-        super().__init__(msg)
-
-
-def reverse_tool_args_to_apply_patch(tool_name: str, args: dict) -> str:
-    """将上游工具调用的 arguments 转为 apply_patch 的 input 字符串。
-
-    Args:
-        tool_name: 上游 tool name（"write_to_file" / "replace_in_file" / "delete_file"）
-        args: 解析后的 arguments dict
+    apply_patch 严格校验 ``*** Add File:`` / ``*** Update File:`` /
+    ``*** Delete File:`` / ``*** Move to:`` 的大小写。
+    模型常见错误：update File、Update file、ADD FILE 等。
 
     Returns:
-        apply_patch 格式的 patch 字符串
-
-    Raises:
-        ReverseConversionError: 参数验证失败，携带原因和修正建议
+        dict with "text" (str) and "repairs" (list[str]) if any normalization
+        was applied, otherwise None.
     """
-    if tool_name == "write_to_file":
-        file_path = _extract_arg(args, _PATH_KEYS)
-        content = _extract_arg(args, _CONTENT_KEYS)
-        if file_path is None or content is None:
-            raise ReverseConversionError(
-                tool_name,
-                "filePath and content are required",
-                "write_to_file requires both filePath and content parameters. "
-                "For long content, consider using append_to_file to add content in smaller chunks.",
-            )
-        if not content:
-            raise ReverseConversionError(
-                tool_name,
-                "content must not be empty",
-                "Provide actual file content, or use append_to_file to build the file incrementally.",
-            )
-        return write_to_apply_patch(file_path, content)
+    repairs: list[str] = []
+    new_text = text
+    for pat, replacement in _HEADER_NORMALIZE_PATTERNS:
+        changed = False
+        lines = new_text.split("\n")
+        for i, line in enumerate(lines):
+            m = pat.match(line)
+            if m:
+                normalized = pat.sub(replacement, line)
+                if normalized != line:
+                    lines[i] = normalized
+                    changed = True
+        if changed:
+            new_text = "\n".join(lines)
+            # 提取关键字名用于日志：*** Update File: → "Update File"
+            kw = replacement.split(":")[0].replace("*** ", "")
+            repairs.append(f"normalized *** {kw}: casing")
 
-    if tool_name == "replace_in_file":
-        file_path = _extract_arg(args, _PATH_KEYS)
-        old_str = _extract_arg(args, _OLD_STR_KEYS)
-        new_str = _extract_arg(args, _NEW_STR_KEYS)
-        dest_path = _extract_arg(args, _DEST_PATH_KEYS)
-        if file_path is None or old_str is None or new_str is None:
-            raise ReverseConversionError(
-                tool_name,
-                "filePath, old_str, and new_str are required",
-                "replace_in_file requires filePath, old_str, and new_str parameters.",
-            )
-        if not old_str:
-            raise ReverseConversionError(
-                tool_name,
-                "old_str must not be empty",
-                "When appending to a file, use append_to_file instead. "
-                "For replace_in_file, include the last few lines of the file as old_str "
-                "and add new content in new_str.",
-            )
-        return replace_to_apply_patch(file_path, old_str, new_str, dest_path=dest_path)
+    if not repairs:
+        return None
+    return {"text": new_text, "repairs": repairs}
 
-    if tool_name == "delete_file":
-        file_path = _extract_arg(args, _PATH_KEYS)
-        if file_path is None:
-            raise ReverseConversionError(
-                tool_name,
-                "filePath is required",
-                "delete_file requires a filePath parameter.",
-            )
-        return delete_to_apply_patch(file_path)
 
-    if tool_name == "append_to_file":
-        file_path = _extract_arg(args, _PATH_KEYS)
-        content = _extract_arg(args, _CONTENT_KEYS)
-        if file_path is None or content is None:
-            raise ReverseConversionError(
-                tool_name,
-                "filePath and content are required",
-                "append_to_file requires both filePath and content parameters.",
-            )
-        return append_to_apply_patch(file_path, content)
+def _log_repair_diff(original: str, repaired: str, repairs: list[str]) -> None:
+    """临时 DEBUG：WARNING 级别打 before/after，用于真机排查 `***` 丢失等。
 
-    raise ReverseConversionError(
-        tool_name,
-        "unknown tool name",
-        f"Expected one of: write_to_file, replace_in_file, append_to_file, delete_file. Got: {tool_name}",
+    包含：
+    - 原 DSL 全文（截断到 1000 字符）
+    - 修后 DSL 全文（截断到 1000 字符）
+    - repairs 列表
+    - 首末行各 80 字符（快速比对）
+    """
+    def _trunc(s: str, n: int = 1000) -> str:
+        if len(s) <= n:
+            return s
+        return s[:n] + f"... [truncated, total {len(s)} chars]"
+
+    first_orig = original.splitlines()[0][:80] if original else "(empty)"
+    last_orig = original.rstrip().splitlines()[-1][:80] if original.strip() else "(empty)"
+    first_repaired = repaired.splitlines()[0][:80] if repaired else "(empty)"
+    last_repaired = repaired.rstrip().splitlines()[-1][:80] if repaired.strip() else "(empty)"
+
+    logger.warning(
+        "apply_patch repair fired: repairs=%s | "
+        "original[first_line=%r, last_line=%r, total_len=%d] | "
+        "repaired[first_line=%r, last_line=%r, total_len=%d] | "
+        "original_full=%r | repaired_full=%r",
+        repairs,
+        first_orig, last_orig, len(original),
+        first_repaired, last_repaired, len(repaired),
+        _trunc(original),
+        _trunc(repaired),
     )
+
+
+def _find_first_header(text: str, start: int = 0, end: int = -1) -> re.Match | None:
+    """扫描范围内的第一个文件头位置。"""
+    first = None
+    end = end if end >= 0 else len(text)
+    for pat in (_ADD_FILE_RE, _UPDATE_FILE_RE, _DELETE_FILE_RE):
+        m = pat.search(text, start, end)
+        if m and (first is None or m.start() < first.start()):
+            first = m
+    return first
+
+
+def _normalize_hunk_headers(text: str) -> tuple[str, int]:
+    """截断 @@ hunk header 行的尾部内容。
+
+    apply_patch 期望 @@ 单独成行（可选前导/尾随空白）。
+    模型误把 @@ 当 unified-diff 头时常见三种：
+      - "@@ -19,5 +19,6 @@"（unified diff 元数据）
+      - "@@ def some_function:"（function anchor）
+      - "@@ # comment"（任意文本）
+
+    Returns:
+        (new_text, count) — 归一化后的文本和被归一化的行数。
+    """
+    count = 0
+
+    def _strip(m: re.Match) -> str:
+        nonlocal count
+        count += 1
+        return "@@"
+
+    new_text = _HUNK_HEADER_REPAIR_RE.sub(_strip, text)
+    return new_text, count

@@ -1,6 +1,7 @@
 """代理转发步骤 — 根据协议和转换方式选择代理路径"""
 
 import asyncio
+import httpx
 import json
 import logging
 import time
@@ -44,6 +45,7 @@ _STATUS_CODE_MAP = {
 }
 _RETRY_STATUSES = (429, 503)
 _RETRY_MAX = 3
+_RETRYABLE_CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout)
 
 
 def _make_error(ctx: PipelineContext, message: str, error_type: str = "api_error", status_code: int = 400):
@@ -330,13 +332,25 @@ class ProxyStep(HandlerStep):
                 seen_stop = True
 
         try:
-            client = _client_for(model_id)
-            async with client.stream("POST", target_url, json=out_body, headers=req_headers, timeout=120.0) as resp:
-                logger.debug(f"Anthropic stream response status: {resp.status_code}")
-                async for chunk in sse_stream(resp, on_event=track_usage):
-                    yield chunk
-        except Exception as e:
-            logger.error(f"Anthropic stream error: {e}", exc_info=True)
+            for attempt in range(_RETRY_MAX + 1):
+                try:
+                    client = _client_for(model_id)
+                    async with client.stream("POST", target_url, json=out_body, headers=req_headers, timeout=120.0) as resp:
+                        logger.debug(f"Anthropic stream response status: {resp.status_code}")
+                        async for chunk in sse_stream(resp, on_event=track_usage):
+                            yield chunk
+                        return
+
+                except _RETRYABLE_CONNECT_ERRORS as e:
+                    if attempt < _RETRY_MAX:
+                        wait = 2 ** attempt
+                        logger.warning(f"Anthropic stream connect error: {e}, retrying in {wait}s (attempt {attempt + 1}/{_RETRY_MAX + 1})")
+                        await asyncio.sleep(wait)
+                        continue
+                    logger.error(f"Anthropic stream connect error after {_RETRY_MAX + 1} attempts: {e}", exc_info=True)
+                except Exception as e:
+                    logger.error(f"Anthropic stream error: {e}", exc_info=True)
+                    break
         finally:
             _rctx = record_ctx or {}
             if seen_stop and usage["input_tokens"]:
@@ -502,30 +516,45 @@ class ProxyStep(HandlerStep):
                 seen_stop = True
 
         try:
-            client = _client_for(model_id)
-            async with client.stream("POST", target_url, json=chat_body, headers=req_headers, timeout=120.0) as resp:
-                logger.debug(f"Cross-protocol stream response status: {resp.status_code}")
+            for attempt in range(_RETRY_MAX + 1):
+                try:
+                    client = _client_for(model_id)
+                    async with client.stream("POST", target_url, json=chat_body, headers=req_headers, timeout=120.0) as resp:
+                        logger.debug(f"Cross-protocol stream response status: {resp.status_code}")
 
-                if resp.status_code >= 400:
+                        if resp.status_code >= 400:
+                            upstream_errored = True
+                            error_body = await resp.aread()
+                            error_msg = error_body.decode()
+                            logger.error(f"Cross-protocol upstream error: {resp.status_code} {error_msg[:500]}")
+                            err_event = {
+                                "type": "error",
+                                "error": {"type": "api_error", "message": f"Upstream error ({resp.status_code}): {error_msg[:200]}"},
+                            }
+                            yield f"event: error\ndata: {json.dumps(err_event)}\n\n".encode()
+                            return
+
+                        async for chunk in create_anthropic_sse_stream(resp, model, on_event=track_usage):
+                            yield chunk
+                        return
+
+                except _RETRYABLE_CONNECT_ERRORS as e:
+                    if attempt < _RETRY_MAX:
+                        wait = 2 ** attempt
+                        logger.warning(f"Transient connect error: {e}, retrying in {wait}s (attempt {attempt + 1}/{_RETRY_MAX + 1})")
+                        await asyncio.sleep(wait)
+                        continue
                     upstream_errored = True
-                    error_body = await resp.aread()
-                    error_msg = error_body.decode()
-                    logger.error(f"Cross-protocol upstream error: {resp.status_code} {error_msg[:500]}")
-                    err_event = {
-                        "type": "error",
-                        "error": {"type": "api_error", "message": f"Upstream error ({resp.status_code}): {error_msg[:200]}"},
-                    }
-                    yield f"event: error\ndata: {json.dumps(err_event)}\n\n".encode()
+                    logger.error(f"Cross-protocol connect error after {_RETRY_MAX + 1} attempts: {e}", exc_info=True)
+                    err_body = {"type": "error", "error": {"type": "proxy_error", "message": str(e) or type(e).__name__}}
+                    yield f"event: error\ndata: {json.dumps(err_body)}\n\n".encode()
                     return
-
-                async for chunk in create_anthropic_sse_stream(resp, model, on_event=track_usage):
-                    yield chunk
-
-        except Exception as e:
-            upstream_errored = True
-            logger.error(f"Cross-protocol stream error: {e}", exc_info=True)
-            err_body = {"type": "error", "error": {"type": "proxy_error", "message": str(e) or type(e).__name__}}
-            yield f"event: error\ndata: {json.dumps(err_body)}\n\n".encode()
+                except Exception as e:
+                    upstream_errored = True
+                    logger.error(f"Cross-protocol stream error: {e}", exc_info=True)
+                    err_body = {"type": "error", "error": {"type": "proxy_error", "message": str(e) or type(e).__name__}}
+                    yield f"event: error\ndata: {json.dumps(err_body)}\n\n".encode()
+                    return
         finally:
             self._record_cross_protocol_usage(
                 upstream_errored, seen_stop, usage, original_body,
@@ -602,7 +631,7 @@ class ProxyStep(HandlerStep):
             raise
         except Exception as e:
             logger.error(f"Responses direct proxy failed: {e}", exc_info=True)
-            raise PipelineStop(_make_error(ctx, f"Upstream error: {e}", "proxy_error", 502))
+            raise PipelineStop(_make_error(ctx, f"Upstream error: {str(e) or type(e).__name__}", "proxy_error", 502))
 
         if resp.status_code >= 400:
             upstream_error = resp_body.get("error")
@@ -634,47 +663,67 @@ class ProxyStep(HandlerStep):
         had_error = False
 
         try:
-            client = _client_for(model_id)
-            async with client.stream("POST", target_url, json=body, headers=headers, timeout=120.0) as resp:
-                logger.debug(f"Direct stream response status: {resp.status_code}")
-                if resp.status_code >= 400:
-                    error_body = await resp.aread()
-                    error_msg = error_body.decode()
-                    try:
-                        err_data = json.loads(error_msg)
-                        err_message = err_data.get("error", {}).get("message", error_msg)
-                        err_code = err_data.get("error", {}).get("code") or _status_to_code(resp.status_code)
-                    except json.JSONDecodeError:
-                        err_message, err_code = error_msg, _status_to_code(resp.status_code)
+            for attempt in range(_RETRY_MAX + 1):
+                try:
+                    client = _client_for(model_id)
+                    async with client.stream("POST", target_url, json=body, headers=headers, timeout=120.0) as resp:
+                        logger.debug(f"Direct stream response status: {resp.status_code}")
+                        if resp.status_code >= 400:
+                            error_body = await resp.aread()
+                            error_msg = error_body.decode()
+                            try:
+                                err_data = json.loads(error_msg)
+                                err_message = err_data.get("error", {}).get("message", error_msg)
+                                err_code = err_data.get("error", {}).get("code") or _status_to_code(resp.status_code)
+                            except json.JSONDecodeError:
+                                err_message, err_code = error_msg, _status_to_code(resp.status_code)
+                            yield make_sse_event(
+                                {"error": {"code": err_code, "message": err_message}},
+                                event_type="error",
+                            )
+                            yield make_response_completed_event(model, f"resp_{uuid.uuid4().hex[:16]}")
+                            yield b"data: [DONE]\n\n"
+                            return
+
+                        async for line in resp.aiter_lines():
+                            if line:
+                                yield line.encode() if isinstance(line, str) else line
+                                if line.startswith("data: ") and not line.endswith("[DONE]"):
+                                    try:
+                                        data = json.loads(line[6:])
+                                        if "usage" in data:
+                                            u = data["usage"]
+                                            usage["input_tokens"] = u.get("input_tokens", 0)
+                                            usage["output_tokens"] = u.get("output_tokens", 0)
+                                    except json.JSONDecodeError:
+                                        pass
+                        return
+
+                except _RETRYABLE_CONNECT_ERRORS as e:
+                    if attempt < _RETRY_MAX:
+                        wait = 2 ** attempt
+                        logger.warning(f"Direct stream connect error: {e}, retrying in {wait}s (attempt {attempt + 1}/{_RETRY_MAX + 1})")
+                        await asyncio.sleep(wait)
+                        continue
+                    had_error = True
+                    logger.error(f"Direct stream connect error after {_RETRY_MAX + 1} attempts: {e}", exc_info=True)
                     yield make_sse_event(
-                        {"error": {"code": err_code, "message": err_message}},
+                        {"error": {"code": "proxy_error", "message": str(e) or type(e).__name__}},
                         event_type="error",
                     )
                     yield make_response_completed_event(model, f"resp_{uuid.uuid4().hex[:16]}")
                     yield b"data: [DONE]\n\n"
                     return
-
-                async for line in resp.aiter_lines():
-                    if line:
-                        yield line.encode() if isinstance(line, str) else line
-                        if line.startswith("data: ") and not line.endswith("[DONE]"):
-                            try:
-                                data = json.loads(line[6:])
-                                if "usage" in data:
-                                    u = data["usage"]
-                                    usage["input_tokens"] = u.get("input_tokens", 0)
-                                    usage["output_tokens"] = u.get("output_tokens", 0)
-                            except json.JSONDecodeError:
-                                pass
-        except Exception as e:
-            had_error = True
-            logger.error(f"Direct stream error: {e}", exc_info=True)
-            yield make_sse_event(
-                {"error": {"code": "proxy_error", "message": str(e) or type(e).__name__}},
-                event_type="error",
-            )
-            yield make_response_completed_event(model, f"resp_{uuid.uuid4().hex[:16]}")
-            yield b"data: [DONE]\n\n"
+                except Exception as e:
+                    had_error = True
+                    logger.error(f"Direct stream error: {e}", exc_info=True)
+                    yield make_sse_event(
+                        {"error": {"code": "proxy_error", "message": str(e) or type(e).__name__}},
+                        event_type="error",
+                    )
+                    yield make_response_completed_event(model, f"resp_{uuid.uuid4().hex[:16]}")
+                    yield b"data: [DONE]\n\n"
+                    return
         finally:
             status = "error" if had_error else "success"
             db.record_usage(endpoint_id, model_id,
@@ -735,7 +784,7 @@ class ProxyStep(HandlerStep):
                 raise
             except Exception as e:
                 logger.error(f"Request to upstream failed: {e}", exc_info=True)
-                raise PipelineStop(_make_error(ctx, f"Upstream error: {e}", "proxy_error", 502))
+                raise PipelineStop(_make_error(ctx, f"Upstream error: {str(e) or type(e).__name__}", "proxy_error", 502))
 
             if resp.status_code >= 400:
                 upstream_error = resp_body.get("error")
@@ -817,7 +866,7 @@ class ProxyStep(HandlerStep):
                     continue
                 logger.error(f"Stream request error after {_RETRY_MAX + 1} attempts: {e}", exc_info=True)
                 yield make_sse_event(
-                    {"error": {"code": "proxy_error", "message": f"{type(e).__name__}: {e}"}},
+                    {"error": {"code": "proxy_error", "message": f"{type(e).__name__}: {str(e) or type(e).__name__}"}},
                     event_type="error",
                 )
                 yield make_response_completed_event(model, f"resp_{uuid.uuid4().hex[:16]}")
@@ -890,15 +939,37 @@ class ProxyStep(HandlerStep):
 
     async def _chat_stream_gen(self, target_url: str, headers: dict, body: dict, model_id: str):
         """Chat Completions 流式透传"""
-        client = _client_for(model_id)
-        try:
-            async with client.stream("POST", target_url, json=body, headers=headers, timeout=120.0) as resp:
-                logger.debug(f"Chat stream response status: {resp.status_code}")
-                async for chunk in resp.aiter_bytes():
-                    yield chunk
-        except Exception as e:
-            logger.error(f"Chat stream error: {e}", exc_info=True)
-            yield b"data: [DONE]\n\n"
+        for attempt in range(_RETRY_MAX + 1):
+            try:
+                client = _client_for(model_id)
+                async with client.stream("POST", target_url, json=body, headers=headers, timeout=120.0) as resp:
+                    logger.debug(f"Chat stream response status: {resp.status_code}")
+                    async for chunk in resp.aiter_bytes():
+                        yield chunk
+                    return
+
+            except _RETRYABLE_CONNECT_ERRORS as e:
+                if attempt < _RETRY_MAX:
+                    wait = 2 ** attempt
+                    logger.warning(f"Chat stream connect error: {e}, retrying in {wait}s (attempt {attempt + 1}/{_RETRY_MAX + 1})")
+                    await asyncio.sleep(wait)
+                    continue
+                logger.error(f"Chat stream connect error after {_RETRY_MAX + 1} attempts: {e}", exc_info=True)
+                yield make_sse_event(
+                    {"error": {"code": "proxy_error", "message": str(e) or type(e).__name__}},
+                    event_type="error",
+                )
+                yield b"data: [DONE]\n\n"
+                return
+            except Exception as e:
+                logger.error(f"Chat stream error: {e}", exc_info=True)
+                yield make_sse_event(
+                    {"error": {"code": "proxy_error", "message": str(e) or type(e).__name__}},
+                    event_type="error",
+                )
+                yield b"data: [DONE]\n\n"
+                return
+        yield b"data: [DONE]\n\n"
 
     async def _proxy_chat_to_responses(
         self, ctx: PipelineContext, api_base: str, upstream_api_key: str,

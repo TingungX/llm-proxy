@@ -45,13 +45,6 @@ from llm_proxy.protocol.ir.types import (
     IRToolResultBlock,
     IRToolUseBlock,
 )
-from llm_proxy.protocol.responses_chat.tool_replacement import (
-    APPEND_TOOL_DEF,
-    DELETE_TOOL_DEF,
-    REPLACE_TOOL_DEF,
-    WRITE_TOOL_DEF,
-)
-
 
 # ── Anthropic → IR → Chat（与 anthropic_to_chat 行为对齐）────
 

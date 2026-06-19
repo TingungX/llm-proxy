@@ -9,3 +9,6 @@ import llm_proxy.routes.config     # noqa: F401
 import llm_proxy.routes.usage      # noqa: F401
 import llm_proxy.routes.endpoints  # noqa: F401
 import llm_proxy.routes.latency    # noqa: F401
+import llm_proxy.routes.logs       # noqa: F401
+import llm_proxy.routes.openai     # noqa: F401
+import llm_proxy.routes.responses  # noqa: F401

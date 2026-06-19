@@ -1,569 +1,424 @@
-"""Tests for llm_proxy.adapters.tool_replacement."""
+"""Tests for llm_proxy.protocol.responses_chat.tool_replacement."""
 
-import pytest
 from llm_proxy.protocol.responses_chat.tool_replacement import (
-    WRITE_TOOL_DEF,
-    REPLACE_TOOL_DEF,
-    DELETE_TOOL_DEF,
-    parse_apply_patch_to_simple,
-    write_to_apply_patch,
-    delete_to_apply_patch,
-    replace_to_apply_patch,
-    build_reverse_tool_map,
-    reverse_tool_args_to_apply_patch,
-    ReverseConversionError,
+    APPLY_PATCH_TOOL_DESCRIPTION,
+    RepairResult,
+    repair_apply_patch_dsl,
 )
 
 
-class TestParseApplyPatchToSimple:
-    """parse_apply_patch_to_simple 现在返回 list[dict] | None。"""
+class TestApplyPatchToolDescription:
+    """APPLY_PATCH_TOOL_DESCRIPTION 内容契约。"""
 
-    def test_add_file_basic(self):
-        result = parse_apply_patch_to_simple(
-            "*** Begin Patch\n*** Add File: /tmp/a.py\n+print(1)\n*** End Patch"
-        )
-        assert result == [
-            {"tool": "write_to_file", "args": {"filePath": "/tmp/a.py", "content": "print(1)"}},
-        ]
+    def test_is_nonempty_string(self):
+        assert isinstance(APPLY_PATCH_TOOL_DESCRIPTION, str)
+        assert len(APPLY_PATCH_TOOL_DESCRIPTION) > 50
 
-    def test_add_file_multiline(self):
-        result = parse_apply_patch_to_simple(
-            "*** Add File: /tmp/a.py\n+def foo():\n+    return 1\n*** End Patch"
-        )
-        assert result is not None and len(result) == 1
-        assert result[0]["tool"] == "write_to_file"
-        assert result[0]["args"]["filePath"] == "/tmp/a.py"
-        assert result[0]["args"]["content"] == "def foo():\n    return 1"
+    def test_mentions_add_update_delete_actions(self):
+        for kw in ("Add File", "Update File", "Delete File"):
+            assert kw in APPLY_PATCH_TOOL_DESCRIPTION
 
-    def test_add_file_without_end_marker(self):
-        result = parse_apply_patch_to_simple(
-            "*** Add File: /tmp/a.py\n+print(1)"
-        )
-        assert result == [
-            {"tool": "write_to_file", "args": {"filePath": "/tmp/a.py", "content": "print(1)"}},
-        ]
+    def test_mentions_plus_prefix_rule(self):
+        assert "plus" in APPLY_PATCH_TOOL_DESCRIPTION.lower()
+        assert "minus" in APPLY_PATCH_TOOL_DESCRIPTION.lower()
 
-    def test_multi_file_no_begin_no_end(self):
-        """完全裸格式：多文件，无 Begin Patch 也无 End Patch。"""
-        result = parse_apply_patch_to_simple(
-            "*** Add File: /tmp/a.py\n+print(1)\n"
-            "*** Update File: /tmp/b.py\n@@\n-old\n+new\n"
-            "*** Delete File: /tmp/c.py"
-        )
-        assert result is not None and len(result) == 3
-        assert result[0] == {"tool": "write_to_file", "args": {"filePath": "/tmp/a.py", "content": "print(1)"}}
-        assert result[1] == {"tool": "replace_in_file", "args": {"filePath": "/tmp/b.py", "old_str": "old", "new_str": "new"}}
-        assert result[2] == {"tool": "delete_file", "args": {"filePath": "/tmp/c.py"}}
+    def test_mentions_move_to_rename(self):
+        assert "Move to" in APPLY_PATCH_TOOL_DESCRIPTION
 
-    def test_update_file_basic(self):
-        result = parse_apply_patch_to_simple(
-            "*** Begin Patch\n*** Update File: /tmp/a.py\n@@\n-old_line\n+new_line\n*** End Patch"
-        )
-        assert result == [
-            {"tool": "replace_in_file", "args": {"filePath": "/tmp/a.py", "old_str": "old_line", "new_str": "new_line"}},
-        ]
+    def test_under_1500_characters(self):
+        assert len(APPLY_PATCH_TOOL_DESCRIPTION) < 1500
 
-    def test_update_file_multiline(self):
-        result = parse_apply_patch_to_simple(
-            "*** Update File: /tmp/a.py\n@@\n-line1\n-line2\n+lineA\n+lineB\n*** End Patch"
-        )
-        assert result is not None and len(result) == 1
-        assert result[0]["tool"] == "replace_in_file"
-        assert result[0]["args"]["filePath"] == "/tmp/a.py"
-        assert result[0]["args"]["old_str"] == "line1\nline2"
-        assert result[0]["args"]["new_str"] == "lineA\nlineB"
 
-    def test_delete_file(self):
-        result = parse_apply_patch_to_simple(
-            "*** Begin Patch\n*** Delete File: /tmp/a.py\n*** End Patch"
-        )
-        assert result == [
-            {"tool": "delete_file", "args": {"filePath": "/tmp/a.py"}},
-        ]
+def _dsl(result) -> str:
+    """helper: extract .dsl from RepairResult"""
+    if isinstance(result, RepairResult):
+        return result.dsl
+    return result  # backward compat for any leftover tests
 
-    def test_multi_file_patch(self):
-        result = parse_apply_patch_to_simple(
+
+def _repairs(result) -> list:
+    if isinstance(result, RepairResult):
+        return result.repairs
+    return []
+
+
+class TestRepairApplyPatchDsl:
+    """repair_apply_patch_dsl 鲁棒性测试。"""
+
+    # === 基本 Marker 修复 ===
+
+    def test_both_begin_and_end_preserved(self):
+        dsl = "*** Begin Patch\n*** Add File: /tmp/a.py\n+x\n*** End Patch"
+        r = repair_apply_patch_dsl(dsl)
+        assert _dsl(r) == dsl
+        assert not r.was_repaired
+
+    def test_missing_end_appended(self):
+        dsl = "*** Begin Patch\n*** Add File: /tmp/a.py\n+x"
+        r = repair_apply_patch_dsl(dsl)
+        assert _dsl(r).rstrip().endswith("*** End Patch")
+        assert "appended missing *** End Patch" in r.repairs
+
+    def test_missing_begin_inserted_before_first_header(self):
+        dsl = "*** Add File: /tmp/a.py\n+x\n*** End Patch"
+        r = repair_apply_patch_dsl(dsl)
+        # 移除可能的 # 注记行后,标准 DSL 开头
+        dsl_part = r.dsl.split("\n\n", 1)[-1] if r.was_repaired else r.dsl
+        assert dsl_part.startswith("*** Begin Patch\n")
+        assert "inserted missing *** Begin Patch" in r.repairs
+
+    def test_missing_both_wrap_extracted_headers(self):
+        dsl = "*** Add File: /tmp/a.py\n+x"
+        r = repair_apply_patch_dsl(dsl)
+        # B2：注记在尾部，按 # 前缀切
+        dsl_part = r.dsl.split("\n# llm-proxy", 1)[0] if r.was_repaired else r.dsl
+        assert dsl_part.startswith("*** Begin Patch\n")
+        assert dsl_part.rstrip().endswith("*** End Patch")
+        assert "*** Add File: /tmp/a.py" in dsl_part
+        assert "wrapped with Begin/End markers" in r.repairs
+
+    def test_speech_text_around_patch_trimmed(self):
+        dsl = "Here is the patch:\n*** Begin Patch\n*** Add File: /tmp/a.py\n+x\n*** End Patch\nHope that helps!"
+        r = repair_apply_patch_dsl(dsl)
+        dsl_part = r.dsl.split("\n# llm-proxy", 1)[0] if r.was_repaired else r.dsl
+        assert dsl_part.startswith("*** Begin Patch")
+        assert dsl_part.rstrip().endswith("*** End Patch")
+        assert "Here is the patch" not in dsl_part
+        assert "Hope that helps" not in dsl_part
+        assert "trimmed surrounding text" in r.repairs
+
+    def test_case_and_whitespace_tolerance(self):
+        dsl = "** * BEGIN  patch\n*** Add File: /tmp/a.py\n+x\n*** END  Patch"
+        r = repair_apply_patch_dsl(dsl)
+        # 归一化后：标准 *** Begin/End Patch
+        assert "*** Begin Patch" in _dsl(r)
+        assert "*** End Patch" in _dsl(r)
+        assert "** * BEGIN  patch" not in _dsl(r)
+        assert "*** END  Patch" not in _dsl(r)
+        # Begin 和 End 都被归一化
+        assert "normalized Begin marker" in r.repairs
+        assert "normalized End marker" in r.repairs
+
+    def test_duplicate_end_keeps_single(self):
+        dsl = "*** Begin Patch\n*** Add File: /tmp/a.py\n+x\n*** End Patch\n*** End Patch"
+        r = repair_apply_patch_dsl(dsl)
+        assert _dsl(r).count("*** End Patch") == 1
+        # B2：注记在尾部，标准 DSL 部分以 End Patch 结尾
+        dsl_part = _dsl(r).split("\n# llm-proxy", 1)[0]
+        assert dsl_part.rstrip().endswith("*** End Patch")
+
+    def test_no_file_headers_returns_unchanged(self):
+        dsl = "no markers here, just text"
+        r = repair_apply_patch_dsl(dsl)
+        assert not r.was_repaired
+        assert _dsl(r) == dsl
+
+    def test_empty_input_returns_empty(self):
+        r1 = repair_apply_patch_dsl("")
+        r2 = repair_apply_patch_dsl("   \n  ")
+        assert r1.dsl == ""
+        assert r2.dsl == ""
+        assert not r1.was_repaired
+        assert not r2.was_repaired
+
+    def test_none_input_returns_empty_repair_result(self):
+        r = repair_apply_patch_dsl(None)
+        # None 输入返回 RepairResult(dsl="", repairs=[]) — 调用方可以安全地访问 .dsl
+        assert r.dsl == ""
+        assert r.repairs == []
+        assert not r.was_repaired
+
+    def test_only_begin_no_content(self):
+        dsl = "*** Begin Patch\n*** End Patch"
+        r = repair_apply_patch_dsl(dsl)
+        assert not r.was_repaired  # 无文件头，无法修复
+        assert r.dsl == dsl
+
+    def test_multiple_begin(self):
+        dsl = "*** Begin Patch\n*** Begin Patch\n*** Add File: /tmp/a.py\n+x\n*** End Patch"
+        r = repair_apply_patch_dsl(dsl)
+        dsl_part = r.dsl.split("\n\n", 1)[-1] if r.was_repaired else r.dsl
+        assert dsl_part.startswith("*** Begin Patch")
+        assert dsl_part.rstrip().endswith("*** End Patch")
+        assert dsl_part.count("*** End Patch") == 1
+
+    def test_newlines_before_begin(self):
+        dsl = "\n\n\n*** Begin Patch\n*** Add File: /tmp/a.py\n+x\n*** End Patch"
+        r = repair_apply_patch_dsl(dsl)
+        # 无修复时无 # 注记
+        assert r.dsl == dsl.strip() or r.dsl.startswith("*** Begin Patch")
+
+    def test_newlines_after_end(self):
+        dsl = "*** Begin Patch\n*** Add File: /tmp/a.py\n+x\n*** End Patch\n\n\n"
+        r = repair_apply_patch_dsl(dsl)
+        # 实际 DSL 部分（去掉可能的注记）应该无尾随空行
+        dsl_part = r.dsl.split("\n\n", 1)[-1] if r.was_repaired else r.dsl
+        assert dsl_part.rstrip().endswith("*** End Patch")
+        assert dsl_part == dsl_part.strip()
+
+    # === 模型"忘记 End Patch"的所有变体 — 最常见的错误 ===
+
+    def test_missing_end_pure(self):
+        dsl = "*** Begin Patch\n*** Add File: /a.py\n+line1\n+line2"
+        r = repair_apply_patch_dsl(dsl)
+        dsl_part = r.dsl.split("\n\n", 1)[-1] if r.was_repaired else r.dsl
+        assert dsl_part.startswith("*** Begin Patch")
+        assert dsl_part.rstrip().endswith("*** End Patch")
+        assert "appended missing *** End Patch" in r.repairs
+
+    def test_missing_end_multi_file(self):
+        dsl = "*** Begin Patch\n*** Add File: /a.py\n+line1\n*** Update File: /b.py\n@@\n-old\n+new"
+        r = repair_apply_patch_dsl(dsl)
+        dsl_part = r.dsl.split("\n\n", 1)[-1] if r.was_repaired else r.dsl
+        assert dsl_part.rstrip().endswith("*** End Patch")
+        assert "*** Add File: /a.py" in dsl_part
+        assert "*** Update File: /b.py" in dsl_part
+
+    def test_missing_end_with_trailing_text(self):
+        dsl = "*** Begin Patch\n*** Add File: /a.py\n+x\n\nThis is the new content."
+        r = repair_apply_patch_dsl(dsl)
+        dsl_part = r.dsl.split("\n\n", 1)[-1] if r.was_repaired else r.dsl
+        assert dsl_part.rstrip().endswith("*** End Patch")
+
+    def test_end_of_file_not_end_patch(self):
+        # *** End of File 是合法的段内结束标记
+        dsl = "*** Begin Patch\n*** Update File: /a.py\n@@\n-old\n+new\n*** End of File"
+        r = repair_apply_patch_dsl(dsl)
+        dsl_part = r.dsl.split("\n\n", 1)[-1] if r.was_repaired else r.dsl
+        assert "*** End of File" in dsl_part
+        assert dsl_part.rstrip().endswith("*** End Patch")
+        assert "appended missing *** End Patch" in r.repairs
+
+    def test_end_lowercase_normalized(self):
+        dsl = "*** Begin Patch\n*** Add File: /a.py\n+x\n*** end patch"
+        r = repair_apply_patch_dsl(dsl)
+        assert "*** end patch" not in _dsl(r)
+        assert "*** End Patch" in _dsl(r)
+        assert "normalized End marker" in r.repairs
+
+    def test_end_no_space_normalized(self):
+        dsl = "*** Begin Patch\n*** Add File: /a.py\n+x\n*** EndPatch"
+        r = repair_apply_patch_dsl(dsl)
+        assert "*** EndPatch" not in _dsl(r)
+        assert "*** End Patch" in _dsl(r)
+
+    def test_end_uppercase_normalized(self):
+        dsl = "*** Begin Patch\n*** Add File: /a.py\n+x\n*** END PATCH"
+        r = repair_apply_patch_dsl(dsl)
+        assert "*** END PATCH" not in _dsl(r)
+        assert "*** End Patch" in _dsl(r)
+
+    def test_end_of_patch_normalized(self):
+        dsl = "*** Begin Patch\n*** Add File: /a.py\n+x\n*** End of Patch"
+        r = repair_apply_patch_dsl(dsl)
+        assert "*** End of Patch" not in _dsl(r)
+        assert "*** End Patch" in _dsl(r)
+
+    def test_end_hash_prefix_normalized(self):
+        dsl = "*** Begin Patch\n*** Add File: /a.py\n+x\n### End Patch"
+        r = repair_apply_patch_dsl(dsl)
+        assert "### End Patch" not in _dsl(r)
+        assert "*** End Patch" in _dsl(r)
+
+    def test_end_underscore_normalized(self):
+        dsl = "*** Begin Patch\n*** Add File: /a.py\n+x\n*** End_of_Patch"
+        r = repair_apply_patch_dsl(dsl)
+        assert "*** End_of_Patch" not in _dsl(r)
+        assert "*** End Patch" in _dsl(r)
+
+
+class TestHunkHeaderNormalization:
+    """@@ hunk header 归一化：模型可能误用 unified-diff 语法或 anchor 语法。"""
+
+    def test_bare_atat_preserved(self):
+        """裸 @@（无尾随内容）不应被修复。"""
+        dsl = "*** Begin Patch\n*** Update File: foo.py\n@@\n-a\n+b\n*** End Patch"
+        r = repair_apply_patch_dsl(dsl)
+        assert not any("@@" in rep and "hunk" in rep for rep in r.repairs)
+
+    def test_unified_diff_style_atat_normalized(self):
+        """@@ -19,5 +19,6 @@ → @@（unified-diff 误用）。"""
+        dsl = (
             "*** Begin Patch\n"
-            "*** Add File: /tmp/a.py\n+print(1)\n"
-            "*** Update File: /tmp/b.py\n@@\n-old\n+new\n"
-            "*** Delete File: /tmp/c.py\n"
+            "*** Update File: foo.py\n"
+            "@@ -19,5 +19,6 @@\n"
+            "-a\n"
+            "+b\n"
             "*** End Patch"
         )
-        assert result is not None
-        assert len(result) == 3
-        assert result[0] == {"tool": "write_to_file", "args": {"filePath": "/tmp/a.py", "content": "print(1)"}}
-        assert result[1] == {"tool": "replace_in_file", "args": {"filePath": "/tmp/b.py", "old_str": "old", "new_str": "new"}}
-        assert result[2] == {"tool": "delete_file", "args": {"filePath": "/tmp/c.py"}}
+        r = repair_apply_patch_dsl(dsl)
+        dsl_body = _dsl(r)
+        assert "@@ -19" not in dsl_body
+        assert "+19,6" not in dsl_body
+        assert "@@\n" in dsl_body
+        assert any("@@" in rep and "hunk header" in rep for rep in r.repairs)
 
-    def test_empty_input_returns_none(self):
-        assert parse_apply_patch_to_simple("") is None
-        assert parse_apply_patch_to_simple(None) is None
-
-    def test_malformed_returns_none(self):
-        assert parse_apply_patch_to_simple("not a patch") is None
-        assert parse_apply_patch_to_simple("*** Begin Patch\n*** End Patch") is None
-
-    def test_ignores_context_and_at_lines(self):
-        result = parse_apply_patch_to_simple(
-            "*** Update File: /tmp/a.py\n@@\n keep\n-old\n+new\n keep2\n*** End Patch"
-        )
-        assert result is not None and len(result) == 1
-        assert result[0]["args"]["old_str"] == "old"
-        assert result[0]["args"]["new_str"] == "new"
-
-    def test_update_only_plus_lines_converts_to_append(self):
-        """Update File 只有 '+' 行 → 转为 append_to_file。"""
-        result = parse_apply_patch_to_simple(
-            "*** Update File: /tmp/a.py\n@@\n+def new_func():\n+    pass\n*** End Patch"
-        )
-        assert result is not None
-        assert len(result) == 1
-        assert result[0]["tool"] == "append_to_file"
-        assert "def new_func():" in result[0]["args"]["content"]
-        assert result[0]["args"]["filePath"] == "/tmp/a.py"
-
-    def test_update_only_plus_lines_mixed_with_normal(self):
-        """多文件 patch 中一个段只有 '+' 行，其他段正常。"""
-        result = parse_apply_patch_to_simple(
+    def test_atat_with_function_anchor_normalized(self):
+        """@@ def some_function: → @@（anchor 误用）。"""
+        dsl = (
             "*** Begin Patch\n"
-            "*** Add File: /tmp/a.py\n+print(1)\n"
-            "*** Update File: /tmp/b.py\n@@\n+appended\n"
+            "*** Update File: foo.py\n"
+            "@@ def some_function:\n"
+            "-old\n"
+            "+new\n"
             "*** End Patch"
         )
-        assert result is not None
-        assert len(result) == 2
-        # 第一个段正常
-        assert result[0]["tool"] == "write_to_file"
-        # 第二个段转为 append_to_file
-        assert result[1]["tool"] == "append_to_file"
+        r = repair_apply_patch_dsl(dsl)
+        dsl_body = _dsl(r)
+        assert "@@ def" not in dsl_body
+        assert "some_function" not in dsl_body
 
-    def test_move_to_with_content(self):
-        """Update File + Move to + diff → replace_in_file 含 destinationPath。"""
-        result = parse_apply_patch_to_simple(
+    def test_multiple_bad_atat_all_normalized(self):
+        """多个坏 @@ 行全部归一化，注记含数量。"""
+        dsl = (
             "*** Begin Patch\n"
-            "*** Update File: /tmp/old.py\n"
-            "*** Move to: /tmp/new.py\n"
-            "@@\n-old_code\n+new_code\n"
+            "*** Update File: foo.py\n"
+            "@@ -1,3 +1,3 @@\n"
+            "-a\n"
+            "+b\n"
+            "@@ -10,3 +10,3 @@\n"
+            "-c\n"
+            "+d\n"
             "*** End Patch"
         )
-        assert result is not None and len(result) == 1
-        assert result[0]["tool"] == "replace_in_file"
-        assert result[0]["args"]["filePath"] == "/tmp/old.py"
-        assert result[0]["args"]["destinationPath"] == "/tmp/new.py"
-        assert result[0]["args"]["old_str"] == "old_code"
-        assert result[0]["args"]["new_str"] == "new_code"
+        r = repair_apply_patch_dsl(dsl)
+        dsl_body = _dsl(r)
+        assert dsl_body.count("@@\n") >= 2
+        assert "-1,3" not in dsl_body
+        assert "-10,3" not in dsl_body
+        assert any(rep == "normalized 2 @@ hunk headers" for rep in r.repairs)
 
-    def test_move_to_no_content(self):
-        """Update File + Move to，无 diff 行 → replace_in_file 含 destinationPath，占位 old_str/new_str。"""
-        result = parse_apply_patch_to_simple(
+    def test_added_line_with_atat_preserved(self):
+        """hunk body 中 +@@marker 不应被误判为 hunk header。"""
+        dsl = (
             "*** Begin Patch\n"
-            "*** Update File: /tmp/old.py\n"
-            "*** Move to: /tmp/new.py\n"
+            "*** Update File: foo.py\n"
+            "@@\n"
+            "-old_marker\n"
+            "+@@new_marker\n"
             "*** End Patch"
         )
-        assert result is not None and len(result) == 1
-        assert result[0]["tool"] == "replace_in_file"
-        assert result[0]["args"]["filePath"] == "/tmp/old.py"
-        assert result[0]["args"]["destinationPath"] == "/tmp/new.py"
-        assert result[0]["args"]["old_str"] == " "
-        assert result[0]["args"]["new_str"] == " "
+        r = repair_apply_patch_dsl(dsl)
+        assert "@@new_marker" in _dsl(r)
+        assert not any("hunk header" in rep for rep in r.repairs)
+class TestRepairResult:
+    """RepairResult 封闭 DSL 契约（B1：修复不向 DSL 注入任何内容）。
 
-    def test_move_to_only_no_diff(self):
-        """Update File + Move to，无任何 diff 和 context → 仍应生成 replace_in_file。"""
-        result = parse_apply_patch_to_simple(
+    Codex harness 强校验首末两行字面匹配（首行 `*** Begin Patch`、
+    末行 `*** End Patch`），所以修复后的 dsl 字符串不能注入任何注记；
+    修复反馈改走 logger 留痕，repairs 字段保留供日志使用。
+    """
+
+    def test_no_repair_dsl_unchanged(self):
+        """无修复时 .dsl 等于原文本。"""
+        dsl = "*** Begin Patch\n*** Add File: /a.py\n+x\n*** End Patch"
+        r = repair_apply_patch_dsl(dsl)
+        assert not r.was_repaired
+        assert r.repairs == []
+        assert r.dsl == dsl
+
+    def test_repaired_dsl_has_no_injected_lines(self):
+        """修复后 dsl 不含 # llm-proxy auto-repaired 注记行。"""
+        dsl = "*** Begin Patch\n*** Add File: /a.py\n+x"
+        r = repair_apply_patch_dsl(dsl)
+        assert r.was_repaired
+        assert "# llm-proxy" not in r.dsl
+
+    def test_repaired_dsl_starts_with_begin_patch(self):
+        """修复后 dsl 首行必须是 *** Begin Patch（Codex harness 首行检查）。"""
+        dsl = "*** Add File: /a.py\n+x\n*** End Patch"  # 缺 Begin
+        r = repair_apply_patch_dsl(dsl)
+        assert r.was_repaired
+        assert r.dsl.startswith("*** Begin Patch"), r.dsl
+
+    def test_repaired_dsl_ends_with_end_patch(self):
+        """修复后 dsl 末行必须是 *** End Patch（Codex harness 末行检查）。"""
+        dsl = "*** Begin Patch\n*** Add File: /a.py\n+x"  # 缺 End
+        r = repair_apply_patch_dsl(dsl)
+        assert r.was_repaired
+        assert r.dsl.rstrip().endswith("*** End Patch"), r.dsl
+
+    def test_multi_repair_dsl_keeps_outer_envelope(self):
+        """多项修复时 dsl 仍保持首末两行字面匹配 + 内部不注 # 注记。"""
+        dsl = "** * Begin Patch\n*** Add File: /a.py\n+x\n*** END PATCH"
+        r = repair_apply_patch_dsl(dsl)
+        assert r.was_repaired
+        assert "normalized Begin marker" in r.repairs
+        assert "normalized End marker" in r.repairs
+        assert r.dsl.startswith("*** Begin Patch")
+        assert r.dsl.rstrip().endswith("*** End Patch")
+        # 内部不含 # 注记
+        for line in r.dsl.split("\n"):
+            assert not line.startswith("# llm-proxy"), f"unexpected note in DSL: {line!r}"
+
+    def test_repairs_field_still_populated_for_logger(self):
+        """repairs 字段保留供 logger 留痕用，不依赖 DSL 注记通道。"""
+        dsl = "*** Begin Patch\n*** Update File: foo.py\n@@ -1,1 +1,1 @@\n-a\n+b\n*** End Patch"
+        r = repair_apply_patch_dsl(dsl)
+        assert r.was_repaired
+        assert "normalized @@ hunk header" in r.repairs
+class TestFileHeaderCasingNormalization:
+    """文件操作关键字大小写归一化：模型常见 update File / Update file 等错误。"""
+
+    def test_update_file_lowercase_u_normalized(self):
+        """update File: → Update File:"""
+        dsl = "*** Begin Patch\n*** update File: /tmp/a.py\n@@\n-old\n+new\n*** End Patch"
+        r = repair_apply_patch_dsl(dsl)
+        assert "*** Update File: /tmp/a.py" in _dsl(r)
+        assert "*** update File" not in _dsl(r)
+        assert any("Update File" in rep and "casing" in rep for rep in r.repairs)
+
+    def test_update_file_lowercase_f_normalized(self):
+        """Update file: → Update File:"""
+        dsl = "*** Begin Patch\n*** Update file: /tmp/a.py\n@@\n-old\n+new\n*** End Patch"
+        r = repair_apply_patch_dsl(dsl)
+        assert "*** Update File: /tmp/a.py" in _dsl(r)
+        assert "*** Update file" not in _dsl(r)
+        assert any("Update File" in rep and "casing" in rep for rep in r.repairs)
+
+    def test_add_file_uppercase_normalized(self):
+        """ADD FILE: → Add File:"""
+        dsl = "*** Begin Patch\n*** ADD FILE: /tmp/a.py\n+x\n*** End Patch"
+        r = repair_apply_patch_dsl(dsl)
+        assert "*** Add File: /tmp/a.py" in _dsl(r)
+        assert "*** ADD FILE" not in _dsl(r)
+        assert any("Add File" in rep and "casing" in rep for rep in r.repairs)
+
+    def test_delete_file_mixed_casing_normalized(self):
+        """delete FILE: → Delete File:"""
+        dsl = "*** Begin Patch\n*** delete FILE: /tmp/a.py\n*** End Patch"
+        r = repair_apply_patch_dsl(dsl)
+        assert "*** Delete File: /tmp/a.py" in _dsl(r)
+        assert "*** delete FILE" not in _dsl(r)
+        assert any("Delete File" in rep and "casing" in rep for rep in r.repairs)
+
+    def test_move_to_lowercase_normalized(self):
+        """move to: → Move to:"""
+        dsl = "*** Begin Patch\n*** Update File: /tmp/a.py\n*** move to: /tmp/b.py\n@@\n-old\n+new\n*** End Patch"
+        r = repair_apply_patch_dsl(dsl)
+        assert "*** Move to: /tmp/b.py" in _dsl(r)
+        assert "*** move to" not in _dsl(r)
+        assert any("Move to" in rep and "casing" in rep for rep in r.repairs)
+
+    def test_correct_casing_no_repair(self):
+        """标准大小写不应触发修复。"""
+        dsl = "*** Begin Patch\n*** Update File: /tmp/a.py\n@@\n-old\n+new\n*** End Patch"
+        r = repair_apply_patch_dsl(dsl)
+        assert not any("casing" in rep for rep in r.repairs)
+
+    def test_multiple_wrong_casing_all_normalized(self):
+        """多个文件头大小写错误都应被纠正。"""
+        dsl = (
             "*** Begin Patch\n"
-            "*** Update File: src/app.py\n"
-            "*** Move to: src/main.py\n"
+            "*** update File: /tmp/a.py\n@@\n-old\n+new\n"
+            "*** ADD FILE: /tmp/b.py\n+x\n"
             "*** End Patch"
         )
-        assert result is not None and len(result) == 1
-        assert result[0]["tool"] == "replace_in_file"
-        assert result[0]["args"]["destinationPath"] == "src/main.py"
-
-    def test_update_with_move_to_empty_old_str(self):
-        """Update File + Move to + 只有 '+' 行 → 降级为 user message（append_to_file 不支持 Move to）。"""
-        result = parse_apply_patch_to_simple(
-            "*** Begin Patch\n"
-            "*** Update File: /tmp/old.py\n"
-            "*** Move to: /tmp/new.py\n"
-            "@@\n+new_line\n"
-            "*** End Patch"
-        )
-        assert result is not None
-        assert len(result) == 1
-        assert result[0]["tool"] == "_degraded_user_message"
-        assert "new_line" in result[0]["args"]["content"]
-
-    def test_end_of_file_marker(self):
-        """*** End of File 标记正确分割段。"""
-        result = parse_apply_patch_to_simple(
-            "*** Begin Patch\n"
-            "*** Update File: /tmp/a.py\n@@\n-old1\n+new1\n"
-            "*** End of File\n"
-            "*** Update File: /tmp/b.py\n@@\n-old2\n+new2\n"
-            "*** End Patch"
-        )
-        assert result is not None
-        assert len(result) == 2
-        assert result[0]["args"]["filePath"] == "/tmp/a.py"
-        assert result[0]["args"]["old_str"] == "old1"
-        assert result[1]["args"]["filePath"] == "/tmp/b.py"
-        assert result[1]["args"]["old_str"] == "old2"
-
-    def test_update_only_plus_with_context_uses_context_as_anchor(self):
-        """有 context 行但无 - 行 → 用 context 行构造 replace_in_file（对齐 Claude Code）。"""
-        result = parse_apply_patch_to_simple(
-            "*** Update File: /tmp/a.py\n@@\n existing line\n+new line\n*** End Patch"
-        )
-        assert result is not None
-        assert len(result) == 1
-        assert result[0]["tool"] == "replace_in_file"
-        assert result[0]["args"]["old_str"] == "existing line"
-        assert result[0]["args"]["new_str"] == "existing line\nnew line"
-
-    def test_update_only_plus_with_multiline_context(self):
-        """多行 context + 多行追加。"""
-        result = parse_apply_patch_to_simple(
-            "*** Update File: /tmp/a.py\n@@\n line1\n line2\n+new1\n+new2\n*** End Patch"
-        )
-        assert result is not None
-        assert result[0]["tool"] == "replace_in_file"
-        assert result[0]["args"]["old_str"] == "line1\nline2"
-        assert result[0]["args"]["new_str"] == "line1\nline2\nnew1\nnew2"
-
-    def test_update_only_plus_with_context_and_move_to(self):
-        """context + Move to + 只有+行。"""
-        result = parse_apply_patch_to_simple(
-            "*** Update File: /tmp/a.py\n*** Move to: /tmp/b.py\n@@\n existing\n+appended\n*** End Patch"
-        )
-        assert result is not None
-        assert result[0]["tool"] == "replace_in_file"
-        assert result[0]["args"]["old_str"] == "existing"
-        assert result[0]["args"]["new_str"] == "existing\nappended"
-        assert result[0]["args"]["destinationPath"] == "/tmp/b.py"
-
-
-class TestWriteToApplyPatch:
-    def test_basic(self):
-        result = write_to_apply_patch("/tmp/a.py", "print(1)")
-        assert "*** Begin Patch" in result
-        assert "*** Add File: /tmp/a.py" in result
-        assert "+print(1)" in result
-        assert "*** End Patch" in result
-
-    def test_multiline(self):
-        result = write_to_apply_patch("/tmp/a.py", "line1\nline2")
-        assert "+line1\n+line2" in result
-
-
-class TestDeleteToApplyPatch:
-    def test_basic(self):
-        result = delete_to_apply_patch("/tmp/a.py")
-        assert "*** Begin Patch" in result
-        assert "*** Delete File: /tmp/a.py" in result
-        assert "*** End Patch" in result
-
-
-class TestReplaceToApplyPatch:
-    def test_basic_no_context(self):
-        """old_str / new_str have no common prefix/suffix — no context lines."""
-        result = replace_to_apply_patch("/tmp/a.py", "old", "new")
-        assert "*** Begin Patch" in result
-        assert "*** Update File: /tmp/a.py" in result
-        assert "-old" in result
-        assert "+new" in result
-        assert "*** End Patch" in result
-
-    def test_with_context_single_line_change(self):
-        """Model included surrounding context in both old_str and new_str."""
-        result = replace_to_apply_patch(
-            "/tmp/a.py",
-            "line1\nold2\nline3",
-            "line1\nnew2\nline3",
-        )
-        lines = result.split("\n")
-        # Verify context lines (space prefix)
-        assert " line1" in result
-        assert " line3" in result
-        # Verify the change
-        assert "-old2" in result
-        assert "+new2" in result
-        # Verify order: context before, diff, context after
-        space_idx = [i for i, ln in enumerate(lines) if ln.startswith(" ")]
-        minus_idx = [i for i, ln in enumerate(lines) if ln.startswith("-")]
-        plus_idx = [i for i, ln in enumerate(lines) if ln.startswith("+")]
-        assert len(space_idx) == 2
-        assert space_idx[0] < minus_idx[0]  # context before change
-        assert minus_idx[0] < space_idx[1]  # change before context after
-        assert plus_idx[0] > minus_idx[0]   # + after -
-
-    def test_pure_deletion(self):
-        """Model removes a line, keeps surrounding context."""
-        result = replace_to_apply_patch(
-            "/tmp/a.py",
-            "line1\nline2\nline3",
-            "line1\nline3",
-        )
-        assert " line1" in result
-        assert " line3" in result
-        assert "-line2" in result
-        assert "+" not in result.replace("*** Add File:", "").replace("*** Update File:", "").split("\n")[0]  # no + lines
-
-    def test_pure_addition(self):
-        """Model adds a line, keeps surrounding context."""
-        result = replace_to_apply_patch(
-            "/tmp/a.py",
-            "line1\nline3",
-            "line1\nline2\nline3",
-        )
-        assert " line1" in result
-        assert " line3" in result
-        assert "+line2" in result
-        # No - lines (after removing context lines' leading space)
-        non_context = [ln for ln in result.split("\n") if not ln.startswith(" ") and ln not in ("@@",)]
-        assert not any(ln.startswith("-") for ln in non_context)
-
-    def test_multiline_change_with_context(self):
-        """Multiple lines changed, with context on both sides."""
-        result = replace_to_apply_patch(
-            "/tmp/a.py",
-            "ctx1\nold1\nold2\nold3\nctx2",
-            "ctx1\nnew1\nnew2\nctx2",
-        )
-        assert " ctx1" in result
-        assert " ctx2" in result
-        assert "-old1" in result
-        assert "-old2" in result
-        assert "-old3" in result
-        assert "+new1" in result
-        assert "+new2" in result
-
-    def test_line_endings_preserved(self):
-        """Content with trailing newlines handled correctly."""
-        result = replace_to_apply_patch(
-            "/tmp/a.py",
-            "line1\nline2\n",
-            "line1\nline2_new\n",
-        )
-        assert " line1" in result
-        # The trailing empty string from split should be a common suffix line
-        assert "+line2_new" in result
-        assert "-line2" in result
-
-    def test_with_destination_path(self):
-        """dest_path 非空时，输出包含 *** Move to: 行。"""
-        result = replace_to_apply_patch(
-            "/tmp/old.py", "old_code", "new_code", dest_path="/tmp/new.py"
-        )
-        assert "*** Update File: /tmp/old.py" in result
-        assert "*** Move to: /tmp/new.py" in result
-        assert "-old_code" in result
-        assert "+new_code" in result
-        assert "*** End Patch" in result
-        # Move to 行应在 Update File 行之后、@@ 之前
-        lines = result.split("\n")
-        update_idx = next(i for i, ln in enumerate(lines) if ln.startswith("*** Update File"))
-        move_idx = next(i for i, ln in enumerate(lines) if ln.startswith("*** Move to"))
-        at_idx = next(i for i, ln in enumerate(lines) if ln.startswith("@@"))
-        assert update_idx < move_idx < at_idx
-
-    def test_without_destination_path(self):
-        """dest_path 为 None 时，不含 *** Move to: 行。"""
-        result = replace_to_apply_patch("/tmp/a.py", "old", "new")
-        assert "*** Move to:" not in result
-
-
-class TestBuildReverseToolMap:
-    def test_returns_expected(self):
-        result = build_reverse_tool_map()
-        assert result == {
-            "write_to_file": "apply_patch",
-            "replace_in_file": "apply_patch",
-            "delete_file": "apply_patch",
-            "append_to_file": "apply_patch",
-        }
-
-
-class TestReverseToolArgsToApplyPatch:
-    def test_write_to_file(self):
-        result = reverse_tool_args_to_apply_patch(
-            "write_to_file",
-            {"filePath": "/tmp/a.py", "content": "print(1)"},
-        )
-        assert "*** Add File: /tmp/a.py" in result
-        assert "+print(1)" in result
-
-    def test_write_to_file_alt_keys(self):
-        result = reverse_tool_args_to_apply_patch(
-            "write_to_file",
-            {"file_path": "/tmp/a.py", "content": "x"},
-        )
-        assert "*** Add File: /tmp/a.py" in result
-
-    def test_replace_in_file(self):
-        result = reverse_tool_args_to_apply_patch(
-            "replace_in_file",
-            {"filePath": "/tmp/a.py", "old_str": "old", "new_str": "new"},
-        )
-        assert "*** Update File: /tmp/a.py" in result
-        assert "-old" in result
-        assert "+new" in result
-
-    def test_replace_with_destination(self):
-        result = reverse_tool_args_to_apply_patch(
-            "replace_in_file",
-            {"filePath": "/tmp/old.py", "old_str": "old", "new_str": "new", "destinationPath": "/tmp/new.py"},
-        )
-        assert "*** Update File: /tmp/old.py" in result
-        assert "*** Move to: /tmp/new.py" in result
-        assert "-old" in result
-        assert "+new" in result
-
-    def test_replace_without_destination(self):
-        result = reverse_tool_args_to_apply_patch(
-            "replace_in_file",
-            {"filePath": "/tmp/a.py", "old_str": "old", "new_str": "new"},
-        )
-        assert "*** Move to:" not in result
-
-    def test_delete_file(self):
-        result = reverse_tool_args_to_apply_patch(
-            "delete_file",
-            {"filePath": "/tmp/a.py"},
-        )
-        assert "*** Delete File: /tmp/a.py" in result
-        assert "*** End Patch" in result
-
-    def test_delete_file_alt_keys(self):
-        result = reverse_tool_args_to_apply_patch(
-            "delete_file",
-            {"file_path": "/tmp/b.py"},
-        )
-        assert "*** Delete File: /tmp/b.py" in result
-
-    def test_missing_args_raises_error(self):
-        with pytest.raises(ReverseConversionError):
-            reverse_tool_args_to_apply_patch("write_to_file", {"filePath": "/tmp/a.py"})
-
-    def test_unknown_tool_raises_error(self):
-        with pytest.raises(ReverseConversionError):
-            reverse_tool_args_to_apply_patch("unknown_tool", {})
-
-    def test_replace_in_file_empty_old_str_raises_error(self):
-        with pytest.raises(ReverseConversionError) as exc_info:
-            reverse_tool_args_to_apply_patch(
-                "replace_in_file",
-                {"filePath": "/tmp/a.py", "old_str": "", "new_str": "new"},
-            )
-        assert "old_str must not be empty" in str(exc_info.value)
-
-    def test_delete_file_missing_path_raises_error(self):
-        with pytest.raises(ReverseConversionError):
-            reverse_tool_args_to_apply_patch("delete_file", {})
-
-
-class TestToolDefs:
-    def test_write_tool_def(self):
-        assert WRITE_TOOL_DEF["type"] == "function"
-        fn = WRITE_TOOL_DEF["function"]
-        assert fn["name"] == "write_to_file"
-        assert "filePath" in fn["parameters"]["properties"]
-        assert "content" in fn["parameters"]["properties"]
-        assert fn["parameters"]["required"] == ["filePath", "content"]
-        # 安全加固：描述明确语义
-        assert "overwritten" in fn["description"] or "overwrite" in fn["description"]
-
-    def test_replace_tool_def(self):
-        assert REPLACE_TOOL_DEF["type"] == "function"
-        fn = REPLACE_TOOL_DEF["function"]
-        assert fn["name"] == "replace_in_file"
-        assert "filePath" in fn["parameters"]["properties"]
-        assert "old_str" in fn["parameters"]["properties"]
-        assert "new_str" in fn["parameters"]["properties"]
-        assert fn["parameters"]["properties"]["old_str"].get("minLength") == 1
-        # 安全加固：destinationPath 可选参数
-        assert "destinationPath" in fn["parameters"]["properties"]
-        assert "destinationPath" not in fn["parameters"]["required"]
-        # 安全加固：描述引导模型行为
-        assert "unique" in fn["description"].lower()
-
-    def test_delete_tool_def(self):
-        assert DELETE_TOOL_DEF["type"] == "function"
-        fn = DELETE_TOOL_DEF["function"]
-        assert fn["name"] == "delete_file"
-        assert "filePath" in fn["parameters"]["properties"]
-        assert fn["parameters"]["required"] == ["filePath"]
-        # 安全加固：描述强调破坏性
-        assert "destructive" in fn["description"].lower()
-
-
-class TestValidationSafety:
-    """校验安全：借鉴 Claude Code 方案，对转换产出的参数做完整性校验。"""
-
-    def test_add_file_empty_path_returns_degraded(self):
-        """Add File 空 filePath → 降级段（不影响其他段）。"""
-        result = parse_apply_patch_to_simple("*** Add File: \n+content\n*** End Patch")
-        assert result is not None
-        assert result[0]["tool"] == "_degraded_user_message"
-
-    def test_update_file_empty_path_returns_none(self):
-        """Update File 空 filePath → 降级段（不影响其他段）。"""
-        result = parse_apply_patch_to_simple("*** Update File: \n@@\n-old\n+new\n*** End Patch")
-        assert result is not None
-        assert result[0]["tool"] == "_degraded_user_message"
-
-    def test_delete_file_empty_path_returns_degraded(self):
-        """Delete File 空 filePath → 降级段（不影响其他段）。"""
-        result = parse_apply_patch_to_simple("*** Delete File: \n*** End Patch")
-        assert result is not None
-        assert result[0]["tool"] == "_degraded_user_message"
-
-    def test_add_file_no_plus_lines_returns_degraded(self):
-        """Add File 没有 '+' 行（空 content）→ 降级段。"""
-        result = parse_apply_patch_to_simple("*** Add File: /tmp/a.py\n*** End Patch")
-        assert result is not None
-        assert result[0]["tool"] == "_degraded_user_message"
-
-    def test_add_file_empty_plus_line_is_ok(self):
-        """Add File 有 '+' 行但内容为空字符串（创建空文件）→ 合法。"""
-        result = parse_apply_patch_to_simple("*** Add File: /tmp/a.py\n+\n*** End Patch")
-        assert result is not None
-        assert result[0]["tool"] == "write_to_file"
-        assert result[0]["args"]["content"] == ""
-
-    def test_reverse_write_empty_content_raises_error(self):
-        """反向转换：write_to_file content 为空字符串 → ReverseConversionError。"""
-        with pytest.raises(ReverseConversionError) as exc_info:
-            reverse_tool_args_to_apply_patch("write_to_file", {"filePath": "/tmp/a.py", "content": ""})
-        assert "content must not be empty" in str(exc_info.value)
-
-    def test_reverse_replace_empty_old_str_raises_error(self):
-        """反向转换：replace_in_file old_str 为空 → ReverseConversionError（已存在，验证仍在）。"""
-        with pytest.raises(ReverseConversionError) as exc_info:
-            reverse_tool_args_to_apply_patch("replace_in_file", {
-                "filePath": "/tmp/a.py", "old_str": "", "new_str": "new"
-            })
-        assert "old_str must not be empty" in str(exc_info.value)
-
-    def test_update_only_plus_lines_single_segment_converts_to_append(self):
-        """单段 only-plus Update File → append_to_file。"""
-        result = parse_apply_patch_to_simple(
-            "*** Update File: /tmp/a.py\n@@\n+appended\n*** End Patch"
-        )
-        assert result is not None
-        assert result[0]["tool"] == "append_to_file"
-        assert result[0]["args"]["filePath"] == "/tmp/a.py"
-        assert result[0]["args"]["content"] == "appended"
-
-    def test_update_only_plus_lines_mixed_preserves_normal(self):
-        """多段 patch 中正常段不受影响。"""
-        result = parse_apply_patch_to_simple(
-            "*** Begin Patch\n"
-            "*** Add File: /tmp/a.py\n+print(1)\n"
-            "*** Update File: /tmp/b.py\n@@\n+appended\n"
-            "*** End Patch"
-        )
-        assert result is not None
-        assert len(result) == 2
-        assert result[0]["tool"] == "write_to_file"
-        assert result[1]["tool"] == "append_to_file"
+        r = repair_apply_patch_dsl(dsl)
+        dsl_body = _dsl(r)
+        assert "*** Update File: /tmp/a.py" in dsl_body
+        assert "*** Add File: /tmp/b.py" in dsl_body
+        assert "*** update File" not in dsl_body
+        assert "*** ADD FILE" not in dsl_body
+        casing_repairs = [rep for rep in r.repairs if "casing" in rep]
+        assert len(casing_repairs) == 2

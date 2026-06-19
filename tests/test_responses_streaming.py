@@ -461,8 +461,8 @@ class TestToResponsesResponseCustomPassthrough:
         assert len(custom_items) == 1
         item = custom_items[0]
         assert item["name"] == "apply_patch"
-        parsed = json.loads(item["input"])
-        assert "*** Begin Patch" in parsed["input"]
+        assert "*** Begin Patch" in item["input"]
+        assert "*** Add File: /tmp/x.txt" in item["input"]
 
     def test_mixed_apply_patch_and_custom_in_response(self):
         """透传：apply_patch 和 spawn_agent 都走 JSON 透传"""
@@ -500,8 +500,8 @@ class TestToResponsesResponseCustomPassthrough:
         assert "apply_patch" in names
         assert "spawn_agent" in names
         apply_item = [i for i in custom_items if i["name"] == "apply_patch"][0]
-        apply_parsed = json.loads(apply_item["input"])
-        assert "*** Begin Patch" in apply_parsed["input"]
+        assert "*** Begin Patch" in apply_item["input"]
+        assert "*** Add File: a.txt" in apply_item["input"]
         spawn_item = [i for i in custom_items if i["name"] == "spawn_agent"][0]
         parsed = json.loads(spawn_item["input"])
         assert parsed["task_name"] == "task1"

@@ -356,8 +356,8 @@ class TestCustomToolPassthrough:
         assert item.get("type") == "custom_tool_call"
         assert item.get("name") == "apply_patch"
         input_text = item.get("input", "")
-        parsed = json.loads(input_text)
-        assert "*** Begin Patch" in parsed["input"]
+        assert "*** Begin Patch" in input_text
+        assert "*** Add File: /tmp/x.txt" in input_text
 
     def test_mixed_apply_patch_and_custom_tools(self):
         """透传：apply_patch 和 spawn_agent 都走 JSON 透传"""
@@ -374,8 +374,9 @@ class TestCustomToolPassthrough:
         assert len(done_events) == 2
         patch_item = done_events[0].get("item", {})
         assert patch_item.get("name") == "apply_patch"
-        patch_parsed = json.loads(patch_item.get("input", ""))
-        assert "*** Begin Patch" in patch_parsed["input"]
+        patch_input = patch_item.get("input", "")
+        assert "*** Begin Patch" in patch_input
+        assert "*** Add File: a.txt" in patch_input
         spawn_item = done_events[1].get("item", {})
         assert spawn_item.get("name") == "spawn_agent"
         parsed = json.loads(spawn_item.get("input", ""))

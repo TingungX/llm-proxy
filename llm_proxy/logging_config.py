@@ -51,4 +51,3 @@ def setup_logging(level: int | None = None) -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-

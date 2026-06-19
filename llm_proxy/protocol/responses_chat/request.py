@@ -14,7 +14,11 @@ from typing import Optional
 
 from llm_proxy.infra import db
 
-from llm_proxy.protocol.responses_chat.stream import StreamState
+from llm_proxy.protocol.responses_chat.stream import StreamState, _unwrap_input_arg
+from llm_proxy.protocol.responses_chat.tool_replacement import (
+    APPLY_PATCH_TOOL_DESCRIPTION,
+    repair_apply_patch_dsl,
+)
 from llm_proxy.protocol.think_tag import strip_think_tags
 
 logger = logging.getLogger(__name__)
@@ -105,11 +109,11 @@ def convert_tools_to_chat(tools: list) -> tuple[list, dict[str, str], dict[str, 
             if not params.get("properties"):
                 params = {
                     "type": "object",
-                    "properties": {"input": {"type": "string", "description": "Tool input (e.g., apply_patch DSL text)."}},
+                    "properties": {"input": {"type": "string", "description": APPLY_PATCH_TOOL_DESCRIPTION}},
                     "required": [],
                 }
             result.append(_make_chat_function_tool(
-                name, tool.get("description", ""), params
+                name, tool.get("description") or APPLY_PATCH_TOOL_DESCRIPTION, params
             ))
             reverse_tool_map[name] = name
             tool_spec_map[name] = CodexToolSpec(kind="custom", name=name)
@@ -288,18 +292,25 @@ def convert_input_to_messages(input_data, instructions: str | None = None) -> li
                 continue
 
             if item_type in ("custom", "custom_tool_call"):
-                # 透传模式：apply_patch 与其他 custom 工具一致，input 原样作为 function arguments
                 name = item.get("name", "")
                 input_text = item.get("input", "")
                 if not isinstance(input_text, str):
                     input_text = json.dumps(input_text, ensure_ascii=False)
                 call_id = item.get("call_id", "") or item.get("id", "")
+                try:
+                    parsed = json.loads(input_text)
+                    if isinstance(parsed, dict):
+                        arguments = input_text
+                    else:
+                        arguments = json.dumps({"input": input_text}, ensure_ascii=False)
+                except (json.JSONDecodeError, TypeError):
+                    arguments = json.dumps({"input": input_text}, ensure_ascii=False)
                 pending_tool_calls.append({
                     "id": call_id,
                     "type": "function",
                     "function": {
                         "name": name,
-                        "arguments": input_text,
+                        "arguments": arguments,
                     },
                 })
                 logger.debug(f"Passthrough custom_tool_call to function: {name}")
@@ -447,6 +458,8 @@ def to_responses_response(chat_body: dict, original_model: str, reverse_tool_map
                 args_str = func.get("arguments", "{}")
                 if not isinstance(args_str, str):
                     args_str = json.dumps(args_str, ensure_ascii=False)
+                # 解包 {"input": "..."} 为原始 DSL 文本
+                args_str = repair_apply_patch_dsl(_unwrap_input_arg(args_str)).dsl
                 output.append({
                     "id": f"fc_{tc.get('id', '')}",
                     "type": "custom_tool_call",

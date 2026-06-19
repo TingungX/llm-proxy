@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from llm_proxy.protocol.responses_chat.request import CodexToolSpec
+from llm_proxy.protocol.responses_chat.tool_replacement import repair_apply_patch_dsl
 from llm_proxy.protocol.think_tag import ThinkTagStateMachine
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,29 @@ def _make_sse_event(data: dict) -> bytes:
 
 def _gen_id(prefix: str = "") -> str:
     return prefix + uuid.uuid4().hex[:24]
+
+
+def _unwrap_input_arg(args: str) -> str:
+    """如果 args 是 {"input": "..."} 的 JSON（单 key），解包返回内层字符串。
+
+    透传模式下，非 JSON 的 custom 工具 input（如 DSL 文本）被包装为
+    {"input": "<DSL>"}，模型调用时参数形如 {"input": "<DSL>"}。
+    Codex 的 custom_tool_call 期望 input 是原始 DSL 文本，需去掉外层包装。
+
+    也兼容模型直接传裸字符串（JSON string literal）的情况。
+    如果 args 是多 key 的 JSON 对象，说明 input 本身就是合法 JSON，不解包。
+    """
+    if not args or not isinstance(args, str):
+        return args
+    try:
+        obj = json.loads(args)
+        if isinstance(obj, dict) and len(obj) == 1 and "input" in obj and isinstance(obj["input"], str):
+            return obj["input"]
+        if isinstance(obj, str):
+            return obj
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return args
 
 
 class StreamState:
@@ -290,6 +314,9 @@ class StreamState:
                 # 透传模式：arguments 原样作为 custom_tool_call.input
                 if not isinstance(args, str):
                     args = json.dumps(args, ensure_ascii=False)
+                # 模型调用时参数被包在 {"input": "..."} 中，Codex 期望的是
+                # 原始 DSL 文本而非 JSON 对象，这里解包 input 字段。
+                args = repair_apply_patch_dsl(_unwrap_input_arg(args)).dsl
 
                 events.append(_make_sse_event({
                     "type": "response.custom_tool_call_input.delta",
@@ -442,6 +469,8 @@ class StreamState:
                 # 透传模式：arguments 原样作为 custom_tool_call.input
                 if not isinstance(args, str):
                     args = json.dumps(args, ensure_ascii=False)
+                # 解包 {"input": "..."} 为原始 DSL 文本
+                args = repair_apply_patch_dsl(_unwrap_input_arg(args)).dsl
                 items.append({
                     "id": f"fc_{call_id}",
                     "type": "custom_tool_call",
