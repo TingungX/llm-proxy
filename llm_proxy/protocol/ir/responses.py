@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 import time
 from typing import Any, AsyncIterator
@@ -235,6 +236,25 @@ def _extract_reasoning_text(item: dict) -> str:
         for s in summary:
             if isinstance(s, dict) and s.get("type") == "summary_text":
                 return s.get("text", "")
+    return ""
+
+
+def _extract_dsl_from_raw(raw_str: str) -> str:
+    """从上游发来的非严格 JSON args 字符串中提取 apply_patch DSL。
+
+    MiniMax M3 等上游可能发送含字面 \\n 的非严格 JSON（IR Chat parser 解析失败，
+    返回 {"_raw": "..."}）。DSL 通常在 `{"input": "..."}` 字段里，本函数用正则
+    提取该字段的字符串值。
+
+    Returns: 提取出的 DSL 文本，未匹配则返回空串。
+    """
+    if not raw_str:
+        return ""
+    # 匹配 "input": "<DSL>"，允许 <DSL> 中含字面 \n
+    m = re.search(r'"input"\s*:\s*"((?:[^"\\]|\\.)*)"', raw_str, flags=re.DOTALL)
+    if m:
+        # 反转义 \\n → \n（DSL 用真实换行）
+        return m.group(1).replace("\\n", "\n").replace('\\"', '"').replace("\\\\", "\\")
     return ""
 
 
@@ -1158,13 +1178,14 @@ async def format_ir_as_sse(
 
         if etype == "message_start":
             response_id = data.get("id") or response_id
-            # Anthropic model → Responses model
+            # 使用 client 侧映射名（model 参数 = ctx.response_model or actual_model）
+            # 而非 data["model"]（上游原始名）
             if data.get("model"):
                 yield sse_format("response.in_progress", {
                     "sequence_number": next_seq(),
                     "response": {
                         "id": response_id,
-                        "model": data["model"],
+                        "model": model,
                         "status": "in_progress",
                         "output": [],
                     },
@@ -1354,7 +1375,13 @@ async def format_ir_as_sse(
                     if current_tool_downstream_name == "apply_patch":
                         # 解包 {"input": "<DSL>"} → 裸 DSL 文本 + DSL 修复
                         dsl = final_input.get("input", "")
-                        input_text = repair_apply_patch_dsl(dsl).dsl if isinstance(dsl, str) else safe_json_dumps(final_input, default="{}")
+                        # 兜底：上游（如 MiniMax M3）可能发送含字面 \n 的非严格 JSON，
+                        # IR Chat parser 此时返回 {"_raw": "..."}；正则提取 DSL
+                        if not dsl and "_raw" in final_input:
+                            raw_str = final_input["_raw"]
+                            if isinstance(raw_str, str):
+                                dsl = _extract_dsl_from_raw(raw_str)
+                        input_text = repair_apply_patch_dsl(dsl).dsl if (isinstance(dsl, str) and dsl) else safe_json_dumps(final_input, default="{}")
                     else:
                         input_text = safe_json_dumps(final_input, default="{}")
                 else:

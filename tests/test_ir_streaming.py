@@ -647,10 +647,11 @@ class TestResponsesFormat:
         assert "custom_tool_call" in text
         # 必须含 apply_patch 名字
         assert '"name": "apply_patch"' in text
-        # 必须含反向构造的 apply_patch DSL
-        assert "*** Add File" in text
+        # 透传模式：上游 write_to_file 的参数 JSON 序列化后作为 input
+        assert "filePath" in text
         assert "/tmp/x.py" in text
-        assert "+print" in text
+        assert "content" in text
+        assert "print('hi')" in text
 
     async def test_tool_spec_map_adds_namespace_field(self):
         """tool_spec_map 命中的 tool → function_call + namespace 字段。"""
