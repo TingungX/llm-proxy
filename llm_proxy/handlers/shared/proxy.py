@@ -32,6 +32,23 @@ from llm_proxy.services.vision_service import replace_images_in_anthropic_messag
 
 logger = logging.getLogger(__name__)
 
+# ── SSE 模型名替换 ──────────────────────────────────────────────
+import re
+
+def _replace_sse_model(chunk: bytes, new_model: str) -> bytes:
+    """Replace the first 'model' field value in an SSE data chunk."""
+    if b'"model"' not in chunk:
+        return chunk
+    try:
+        return re.sub(
+            b'"model"\\s*:\\s*"[^"]*"',
+            f'"model": "{new_model}"'.encode("utf-8"),
+            chunk,
+            count=1,
+        )
+    except Exception:
+        return chunk
+
 _ANTHROPIC_FWD_HEADERS = {"anthropic-version", "anthropic-beta"}
 _STATUS_CODE_MAP = {
     400: "invalid_request_error",
@@ -243,6 +260,7 @@ class ProxyStep(HandlerStep):
         if stream:
             ctx.response = StreamingResponse(
                 self._anthropic_stream_gen(target_url, req_headers, out_body, body, endpoint_id, model_id,
+                                            response_model=ctx.response_model,
                                             record_ctx=ctx.extra.get("_record_ctx", {})),
                 media_type="text/event-stream",
             )
@@ -284,6 +302,8 @@ class ProxyStep(HandlerStep):
         self._record_usage(ctx, endpoint_id, model_id,
                            usage.get("input_tokens", 0),
                            usage.get("output_tokens", 0))
+        if ctx.response_model:
+            resp_body["model"] = ctx.response_model
         ctx.response = JSONResponse(resp_body, status_code=status_code)
 
     async def _anthropic_request(
@@ -310,11 +330,13 @@ class ProxyStep(HandlerStep):
     async def _anthropic_stream_gen(
         self, target_url: str, req_headers: dict, out_body: dict,
         original_body: dict, endpoint_id: str, model_id: str,
+        response_model: str = "",
         record_ctx: dict | None = None,
     ):
         """Anthropic 流式生成器"""
         usage = {"input_tokens": 0, "output_tokens": 0}
         seen_stop = False
+        first_event = True
 
         def track_usage(event_type, data):
             nonlocal seen_stop
@@ -331,6 +353,13 @@ class ProxyStep(HandlerStep):
             elif event_type == "message_stop":
                 seen_stop = True
 
+        def wrap_chunk(chunk: bytes) -> bytes:
+            nonlocal first_event
+            if first_event and response_model:
+                chunk = _replace_sse_model(chunk, response_model)
+                first_event = False
+            return chunk
+
         try:
             for attempt in range(_RETRY_MAX + 1):
                 try:
@@ -338,7 +367,7 @@ class ProxyStep(HandlerStep):
                     async with client.stream("POST", target_url, json=out_body, headers=req_headers, timeout=120.0) as resp:
                         logger.debug(f"Anthropic stream response status: {resp.status_code}")
                         async for chunk in sse_stream(resp, on_event=track_usage):
-                            yield chunk
+                            yield wrap_chunk(chunk)
                         return
 
                 except _RETRYABLE_CONNECT_ERRORS as e:
@@ -403,7 +432,7 @@ class ProxyStep(HandlerStep):
         if stream:
             ctx.response = StreamingResponse(
                 self._cross_protocol_stream_gen(
-                    target_url, req_headers, chat_body, body, actual_model, endpoint_id, model_id,
+                    target_url, req_headers, chat_body, body, ctx.response_model or actual_model, endpoint_id, model_id,
                     record_ctx=ctx.extra.get("_record_ctx", {}),
                 ),
                 media_type="text/event-stream",
@@ -481,6 +510,8 @@ class ProxyStep(HandlerStep):
 
         # 5. 转换响应
         anthropic_response = chat_to_anthropic(resp_body)
+        if ctx.response_model:
+            anthropic_response["model"] = ctx.response_model
         usage = anthropic_response.get("usage", {})
         self._record_usage(ctx, endpoint_id, model_id,
                            usage.get("input_tokens", 0),
@@ -613,6 +644,7 @@ class ProxyStep(HandlerStep):
         if stream:
             ctx.response = StreamingResponse(
                 self._responses_direct_stream(target_url, req_headers, body, actual_model, endpoint_id, model_id,
+                                              response_model=ctx.response_model,
                                               record_ctx=ctx.extra.get("_record_ctx", {})),
                 media_type="text/event-stream",
             )
@@ -650,17 +682,21 @@ class ProxyStep(HandlerStep):
         self._record_usage(ctx, endpoint_id, model_id,
                            usage.get("input_tokens", 0),
                            usage.get("output_tokens", 0))
+        if ctx.response_model:
+            resp_body["model"] = ctx.response_model
         ctx.response = JSONResponse(resp_body)
 
     async def _responses_direct_stream(
         self, target_url: str, headers: dict, body: dict,
         model: str, endpoint_id: str, model_id: str,
+        response_model: str = "",
         record_ctx: dict | None = None,
     ):
         """Responses 直接透传流式"""
         rctx = record_ctx or {}
         usage = {"input_tokens": 0, "output_tokens": 0}
         had_error = False
+        first_model_event = True
 
         try:
             for attempt in range(_RETRY_MAX + 1):
@@ -681,14 +717,21 @@ class ProxyStep(HandlerStep):
                                 {"error": {"code": err_code, "message": err_message}},
                                 event_type="error",
                             )
-                            yield make_response_completed_event(model, f"resp_{uuid.uuid4().hex[:16]}")
+                            yield make_response_completed_event(response_model or model, f"resp_{uuid.uuid4().hex[:16]}")
                             yield b"data: [DONE]\n\n"
                             return
 
                         async for line in resp.aiter_lines():
                             if line:
+                                # 替换首个 model 事件中的模型名
+                                if first_model_event and response_model and line.startswith("data: ") and '"model"' in line:
+                                    chunk = line.encode() if isinstance(line, str) else line
+                                    chunk = _replace_sse_model(chunk, response_model)
+                                    line = chunk.decode() if isinstance(line, str) else chunk
+                                    first_model_event = False
                                 yield line.encode() if isinstance(line, str) else line
-                                if line.startswith("data: ") and not line.endswith("[DONE]"):
+                                if isinstance(line, str) and line.startswith("data: ") and not line.endswith("[DONE]"):
+
                                     try:
                                         data = json.loads(line[6:])
                                         if "usage" in data:
@@ -711,7 +754,7 @@ class ProxyStep(HandlerStep):
                         {"error": {"code": "proxy_error", "message": str(e) or type(e).__name__}},
                         event_type="error",
                     )
-                    yield make_response_completed_event(model, f"resp_{uuid.uuid4().hex[:16]}")
+                    yield make_response_completed_event(response_model or model, f"resp_{uuid.uuid4().hex[:16]}")
                     yield b"data: [DONE]\n\n"
                     return
                 except Exception as e:
@@ -721,7 +764,7 @@ class ProxyStep(HandlerStep):
                         {"error": {"code": "proxy_error", "message": str(e) or type(e).__name__}},
                         event_type="error",
                     )
-                    yield make_response_completed_event(model, f"resp_{uuid.uuid4().hex[:16]}")
+                    yield make_response_completed_event(response_model or model, f"resp_{uuid.uuid4().hex[:16]}")
                     yield b"data: [DONE]\n\n"
                     return
         finally:
@@ -749,7 +792,7 @@ class ProxyStep(HandlerStep):
                 chat_body["reasoning_split"] = True
             reverse_tool_map = ctx.reverse_tool_map
             tool_spec_map = ctx.tool_spec_map
-            model = raw_model  # SSE 事件中使用原始模型名
+            model = ctx.response_model or raw_model  # SSE 事件中使用响应模型名
 
             model_paths = get_state().paths_map.get(model_id.lower(), {})
             chat_path = resolve_path(model_paths, "openai/chat-completions")
@@ -801,7 +844,7 @@ class ProxyStep(HandlerStep):
                                resp_body.get("usage", {}).get("prompt_tokens", 0),
                                resp_body.get("usage", {}).get("completion_tokens", 0))
 
-            responses_body = to_responses_response(resp_body, actual_model, reverse_tool_map, tool_spec_map=tool_spec_map)
+            responses_body = to_responses_response(resp_body, ctx.response_model or actual_model, reverse_tool_map, tool_spec_map=tool_spec_map)
             ctx.response = JSONResponse(responses_body)
         else:
             # Chat completions 同协议透传
@@ -896,7 +939,8 @@ class ProxyStep(HandlerStep):
         if stream:
             self._record_usage(ctx, endpoint_id, model_id, 0, 0)
             ctx.response = StreamingResponse(
-                self._chat_stream_gen(target_url, req_headers, out_body, model_id),
+                self._chat_stream_gen(target_url, req_headers, out_body, model_id,
+                                      response_model=ctx.response_model),
                 media_type="text/event-stream",
             )
             return
@@ -935,16 +979,23 @@ class ProxyStep(HandlerStep):
         self._record_usage(ctx, endpoint_id, model_id,
                            usage.get("prompt_tokens", 0),
                            usage.get("completion_tokens", 0))
+        if ctx.response_model:
+            resp_body["model"] = ctx.response_model
         ctx.response = JSONResponse(resp_body)
 
-    async def _chat_stream_gen(self, target_url: str, headers: dict, body: dict, model_id: str):
+    async def _chat_stream_gen(self, target_url: str, headers: dict, body: dict, model_id: str,
+                                response_model: str = ""):
         """Chat Completions 流式透传"""
+        first_model_event = True
         for attempt in range(_RETRY_MAX + 1):
             try:
                 client = _client_for(model_id)
                 async with client.stream("POST", target_url, json=body, headers=headers, timeout=120.0) as resp:
                     logger.debug(f"Chat stream response status: {resp.status_code}")
                     async for chunk in resp.aiter_bytes():
+                        if first_model_event and response_model:
+                            chunk = _replace_sse_model(chunk, response_model)
+                            first_model_event = False
                         yield chunk
                     return
 
@@ -996,7 +1047,7 @@ class ProxyStep(HandlerStep):
         if stream:
             self._record_usage(ctx, endpoint_id, model_id, 0, 0)
             ctx.response = StreamingResponse(
-                self._chat_to_responses_stream(target_url, req_headers, responses_body, actual_model,
+                self._chat_to_responses_stream(target_url, req_headers, responses_body, ctx.response_model or actual_model,
                                                endpoint_id, model_id,
                                                record_ctx=ctx.extra.get("_record_ctx", {})),
                 media_type="text/event-stream",
@@ -1030,7 +1081,7 @@ class ProxyStep(HandlerStep):
             ))
 
         usage = resp_body.get("usage", {})
-        chat_response = convert_responses_to_chat_response(resp_body, actual_model)
+        chat_response = convert_responses_to_chat_response(resp_body, ctx.response_model or actual_model)
         self._record_usage(ctx, endpoint_id, model_id,
                            usage.get("input_tokens", 0),
                            usage.get("output_tokens", 0))

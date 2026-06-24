@@ -888,12 +888,13 @@ async def format_ir_as_sse(
 
         elif etype == "error":
             err = data or {}
-            yield sse_format_data_only({
-                "error": {
-                    "message": err.get("message", "Stream error"),
-                    "type": err.get("code", "api_error"),
-                }
-            })
+            error_obj: dict = {
+                "message": err.get("message", "Stream error"),
+                "type": err.get("type", err.get("code", "api_error")),
+            }
+            if "code" in err:
+                error_obj["code"] = err["code"]
+            yield sse_format_data_only({"error": error_obj})
 
         elif etype == "keepalive":
             yield b": keepalive\n\n"

@@ -36,6 +36,7 @@ class PipelineContext:
     resolved: tuple | None = None  # resolve_model_for_endpoint 的六元组结果
     upstream_protocol: str = ""
     converter: str | None = None  # "responses_to_chat" | "chat_to_responses" | None
+    response_model: str = ""  # 端点 model_map 计算出的响应侧 model 名
     reverse_tool_map: dict | None = None
     tool_spec_map: dict | None = None  # 上游工具名 → CodexToolSpec（namespace 展开等工具元信息）
     response: JSONResponse | StreamingResponse | None = None

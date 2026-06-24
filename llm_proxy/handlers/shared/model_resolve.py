@@ -55,4 +55,7 @@ class ModelResolveStep(HandlerStep):
                 403,
             ))
 
+        # 计算响应侧 model 名：端点 model_map 优先，回退到客户端原始请求名
+        endpoint_model_map = endpoint.get("model_map", {}) or {}
+        ctx.response_model = endpoint_model_map.get(model_id, raw_model)
         ctx.resolved = resolved

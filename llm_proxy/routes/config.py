@@ -22,6 +22,7 @@ async def api_get_config():
 async def api_update_config(request: Request):
     new_config = await request.json()
     new_config.pop("family_routing", None)
+    new_config.pop("model_map", None)
     save_config(new_config)
     await get_state().reload()
     logger.info("Config reloaded")

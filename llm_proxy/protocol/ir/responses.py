@@ -125,6 +125,50 @@ def to_ir(body: dict[str, Any]) -> IRRequest:
     return ir_request
 
 
+def _fix_orphaned_ir_tool_calls(messages: list[IRMessage]) -> list[IRMessage]:
+    """修复 IR messages 中孤立的 tool_use（缺少对应的 tool result）。
+
+    当 Responses input 中有 function_call 但没有匹配的 function_call_output 时，
+    转换出的 IR messages 会包含含 IRToolUseBlock 的 assistant 消息，
+    但没有对应的 IRToolResultBlock。
+
+    DeepSeek 等上游严格校验：assistant(tool_calls) 后必须有匹配的 tool 消息。
+    此函数扫描 messages 并在缺失处插入占位符 IRToolResultBlock。
+    """
+    result: list[IRMessage] = []
+    i = 0
+    placeholders = 0
+    while i < len(messages):
+        msg = messages[i]
+        result.append(msg)
+        if msg.role == "assistant" and isinstance(msg.content, list):
+            tool_use_ids = {b.id for b in msg.content if isinstance(b, IRToolUseBlock) and b.id}
+            if tool_use_ids:
+                # 扫描该 assistant 之后的 tool 消息，收集已响应的 tool_call_id
+                responded_ids: set[str] = set()
+                j = i + 1
+                while j < len(messages) and messages[j].role == "tool":
+                    if isinstance(messages[j].content, list):
+                        for b in messages[j].content:
+                            if isinstance(b, IRToolResultBlock) and b.tool_use_id in tool_use_ids:
+                                responded_ids.add(b.tool_use_id)
+                    j += 1
+                # 为缺失的 tool_call_id 插入占位符
+                missing = tool_use_ids - responded_ids
+                for mid in sorted(missing):
+                    result.append(IRMessage(role="tool", content=[
+                        IRToolResultBlock(tool_use_id=mid, content="[Tool call was interrupted]"),
+                    ]))
+                    placeholders += 1
+        i += 1
+    if placeholders:
+        logger.warning(
+            "IR responses: inserted %d placeholder tool result(s) for orphaned tool_calls",
+            placeholders,
+        )
+    return result
+
+
 def _convert_input_to_ir_messages(input_data: list) -> list[IRMessage]:
     """Responses input 数组 → IRMessage 列表。"""
     messages: list[IRMessage] = []
@@ -143,8 +187,7 @@ def _convert_input_to_ir_messages(input_data: list) -> list[IRMessage]:
         if pending_assistant_text is not None:
             blocks.append(IRTextBlock(text=pending_assistant_text))
             pending_assistant_text = None
-        elif pending_tool_calls:
-            pass  # content 留空（tool calls）
+        # tool_calls 与 text/reasoning 共存于同一条 assistant 消息
         for tc in pending_tool_calls:
             blocks.append(tc)
         if blocks:
@@ -170,13 +213,13 @@ def _convert_input_to_ir_messages(input_data: list) -> list[IRMessage]:
                     messages.append(IRMessage(role=role, content=text))
 
         elif item_type == "reasoning":
-            # 提取 reasoning 文本（Responses 通常在 summary[] 或 encrypted_content）
             text = _extract_reasoning_text(item)
             if text:
                 pending_reasoning.append(text)
 
         elif item_type == "function_call":
-            flush_assistant()
+            # 不 flush——与前面的 reasoning/text 合并到同一条 assistant 消息
+            # flush 在 function_call_output / 非 assistant message 时发生
             call_id = item.get("call_id") or item.get("id", "")
             name = item.get("name", "")
             arguments = safe_json_loads(item.get("arguments", "{}"), default={})
@@ -199,10 +242,46 @@ def _convert_input_to_ir_messages(input_data: list) -> list[IRMessage]:
                 )
             ]))
 
+        elif item_type in ("custom", "custom_tool_call"):
+            # apply_patch 等透传工具：input 是 DSL 字符串，需包成
+            # {"input": "<DSL>"} 以匹配 Chat Completions 协议（tool call
+            # 的 arguments 是 JSON 对象）。
+            # 不 flush——与前面的 reasoning/text 合并到同一条 assistant 消息
+            name = item.get("name", "")
+            input_text = item.get("input", "")
+            if not isinstance(input_text, str):
+                input_text = safe_json_dumps(input_text, default="")
+            call_id = item.get("call_id", "") or item.get("id", "")
+            pending_tool_calls.append(IRToolUseBlock(
+                id=call_id,
+                name=name,
+                input={"input": input_text},
+            ))
+
+        elif item_type in ("custom_tool_call_output", "custom_output"):
+            # apply_patch 工具结果：必须 flush assistant 并生成 IRToolResultBlock，
+            # 否则上游收不到工具结果，模型会误以为工具没执行（症状 A）。
+            flush_assistant()
+            call_id = item.get("call_id", "")
+            output = item.get("output", "")
+            if isinstance(output, dict) and "text" in output:
+                content = output["text"]
+            elif isinstance(output, str):
+                content = output
+            else:
+                content = safe_json_dumps(output, default="")
+            messages.append(IRMessage(role="tool", content=[
+                IRToolResultBlock(
+                    tool_use_id=call_id,
+                    content=content,
+                )
+            ]))
+
         else:
             logger.debug(f"Skipping unknown input item type: {item_type}")
 
     flush_assistant()
+    messages = _fix_orphaned_ir_tool_calls(messages)
     return messages
 
 

@@ -198,6 +198,8 @@ class IRProxyStep(HandlerStep):
             int(usage.get("output_tokens", 0)),
         )
 
+        if ctx.response_model:
+            client_body["model"] = ctx.response_model
         ctx.response = JSONResponse(client_body, status_code=resp.status_code)
 
     # ── 流式 ─────────────────────────────────────────────────────────
@@ -257,7 +259,7 @@ class IRProxyStep(HandlerStep):
                     err_events = _err_event_gen(err_data, self.client_protocol)
                     async for chunk in REGISTRY[client_proto].format_ir_as_sse(
                         err_events,
-                        actual_model,
+                        ctx.response_model or actual_model,
                     ):
                         yield chunk
                     return
@@ -269,7 +271,7 @@ class IRProxyStep(HandlerStep):
                 # 客户端 SSE formatter（带 reverse_tool_map / tool_spec_map）
                 sse_bytes = REGISTRY[client_proto].format_ir_as_sse(
                     intercepted_events,
-                    actual_model,
+                    ctx.response_model or actual_model,
                     reverse_tool_map=ir_request.extensions.get("reverse_tool_map"),
                     tool_spec_map=ir_request.extensions.get("tool_spec_map"),
                 )

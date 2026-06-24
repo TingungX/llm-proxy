@@ -320,6 +320,46 @@ class TestResponsesIRRoundtripRequest:
         assert tool_msg["tool_call_id"] == "call_1"
         assert tool_msg["content"] == "4"
 
+    def test_orphaned_function_call_inserts_placeholder(self):
+        """孤立 function_call（无匹配 function_call_output）应插入占位 tool result。
+
+        连续 function_call 合并到同一条 assistant 消息，缺失 call_A 的 result 插入占位符。
+        """
+        body = {
+            "model": "gpt-5",
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "Use tool A"},
+                ]},
+                {"type": "function_call", "call_id": "call_a",
+                 "name": "tool_a", "arguments": '{"x": 1}'},
+                # call_a 没有对应的 function_call_output
+                {"type": "function_call", "call_id": "call_b",
+                 "name": "tool_b", "arguments": '{"y": 2}'},
+                {"type": "function_call_output", "call_id": "call_b",
+                 "output": "done"},
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "Now what?"},
+                ]},
+            ],
+        }
+        ir = responses_to_ir(body)
+        chat_body = chat_to_upstream(ir)
+        roles = [m["role"] for m in chat_body["messages"]]
+        # 连续 function_call 合并为同一条 assistant，call_a 缺 result → 占位
+        assert roles == ["user", "assistant", "tool", "tool", "user"]
+        assistant = chat_body["messages"][1]
+        assert assistant["role"] == "assistant"
+        assert [tc["id"] for tc in assistant["tool_calls"]] == ["call_a", "call_b"]
+        # call_a 的占位符（先出现，因为有缺失）
+        assert chat_body["messages"][2]["role"] == "tool"
+        assert chat_body["messages"][2]["tool_call_id"] == "call_a"
+        assert chat_body["messages"][2]["content"] == "[Tool call was interrupted]"
+        # call_b 的正常 result
+        assert chat_body["messages"][3]["role"] == "tool"
+        assert chat_body["messages"][3]["tool_call_id"] == "call_b"
+        assert chat_body["messages"][3]["content"] == "done"
+
     def test_apply_patch_passthrough_in_ir(self):
         """apply_patch 透传：单 function tool + reverse_tool_map 自映射。"""
         body = {

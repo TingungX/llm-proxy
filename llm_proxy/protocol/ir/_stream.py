@@ -106,6 +106,13 @@ def extract_usage_tokens(usage: dict) -> dict:
 # ── Keepalive 包装器 ────────────────────────────────────────────────
 
 
+# 持有正在运行的泵任务，防止 finally 中 cancel 后因未 await 被 GC 时
+# 触发 "Task was destroyed but it is pending" 警告。
+# pump 在下一个事件循环 tick 收到 CancelledError 后会自然退出并触发
+# done_callback 清理自身。
+_running_pumps: set[asyncio.Task] = set()
+
+
 async def keepalive_wrapper(
     source: AsyncIterator[bytes],
     interval: float = 15.0,
@@ -132,6 +139,8 @@ async def keepalive_wrapper(
             await queue.put(("done", None))
 
     pump_task = asyncio.create_task(_pump())
+    _running_pumps.add(pump_task)
+    pump_task.add_done_callback(_running_pumps.discard)
     try:
         while True:
             if source_done and queue.empty():
@@ -149,12 +158,25 @@ async def keepalive_wrapper(
             elif kind == "done":
                 return
     finally:
+        # 只 cancel，不 await。
+        #
+        # 当客户端断开，GeneratorExit 在此 yield 处抛出，进入 finally。
+        # 如果在这里 await pump_task，CancelledError 会同步传播到 pump
+        # 的 async for chunk in source → source.close() → ... →
+        # resp.aiter_lines() → httpx 试图关闭 resp。但此时 async with
+        # client.stream() 上下文管理器尚未退出（它在 _proxy_stream 中
+        # 包裹 keepalive_wrapper 的 async for），resp 仍在活跃状态 →
+        # "aclose(): asynchronous generator is already running"，
+        # 且上游连接悬挂 → 30s 后 minimax timeout 返回 500。
+        #
+        # 只 cancel 不 await，CancelledError 在下一个事件循环 tick 才
+        # 传播到 pump，此时 GeneratorExit 已经沿 _proxy_stream 的
+        # async with 传播 → resp.close() 已经先执行了。httpx 对已关闭
+        # 连接的 aiter_lines 清理是安全的（不操作底层 socket）。
+        # pump_task 被 _running_pumps 持有生命期，完成后通过 done_
+        # callback 自动清理。
         if not pump_task.done():
             pump_task.cancel()
-            try:
-                await pump_task
-            except (asyncio.CancelledError, Exception):
-                pass
 
 
 # ── Stop reason 映射（与 _common.py 保持一致，但 IR 中心化）──

@@ -180,6 +180,7 @@ def init_db():
         ("is_default", "INTEGER DEFAULT 0"),
         ("accept_protocols", "TEXT DEFAULT '[\"anthropic\", \"openai\"]'"),
         ("family_routing", "TEXT DEFAULT NULL"),
+        ("model_map", "TEXT DEFAULT NULL"),
     ]:
         try:
             c.execute(f"ALTER TABLE endpoints ADD COLUMN {col} {col_type}")
@@ -826,7 +827,8 @@ def create_endpoint(
     enabled: bool = True,
     accept_protocols: list[str] = None,
     is_default: bool = False,
-    family_routing: dict = None
+    family_routing: dict = None,
+    model_map: dict = None
 ):
     """创建端点"""
     conn = sqlite3.connect(DB_PATH)
@@ -837,14 +839,15 @@ def create_endpoint(
         accept_protocols = ["anthropic", "openai"]
 
     c.execute("""
-        INSERT INTO endpoints (endpoint_id, name, api_key, api_key_hash, models, settings, enabled, is_default, accept_protocols, family_routing)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO endpoints (endpoint_id, name, api_key, api_key_hash, models, settings, enabled, is_default, accept_protocols, family_routing, model_map)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         endpoint_id, name, api_key, api_key_hash,
         json.dumps(models), json.dumps(settings),
         1 if enabled else 0, 1 if is_default else 0,
         json.dumps(accept_protocols),
-        json.dumps(family_routing) if family_routing else None
+        json.dumps(family_routing) if family_routing else None,
+        json.dumps(model_map) if model_map else None
     ))
     conn.commit()
     conn.close()
@@ -858,7 +861,8 @@ def update_endpoint(
     settings: dict = None,
     enabled: bool = None,
     accept_protocols: list[str] = None,
-    family_routing: dict = None
+    family_routing: dict = None,
+    model_map: dict = None
 ):
     """更新端点"""
     conn = sqlite3.connect(DB_PATH)
@@ -889,6 +893,9 @@ def update_endpoint(
     if family_routing is not None:
         updates.append("family_routing = ?")
         params.append(json.dumps(family_routing))
+    if model_map is not None:
+        updates.append("model_map = ?")
+        params.append(json.dumps(model_map))
 
     if updates:
         updates.append("updated_at = CURRENT_TIMESTAMP")
@@ -919,7 +926,7 @@ def get_endpoint(endpoint_id: str) -> dict | None:
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
-        SELECT endpoint_id, name, api_key, api_key_hash, models, settings, enabled, alias, created_at, updated_at, is_default, accept_protocols, family_routing
+        SELECT endpoint_id, name, api_key, api_key_hash, models, settings, enabled, alias, created_at, updated_at, is_default, accept_protocols, family_routing, model_map
         FROM endpoints WHERE endpoint_id = ?
     """, (endpoint_id,))
     row = c.fetchone()
@@ -939,7 +946,8 @@ def get_endpoint(endpoint_id: str) -> dict | None:
         "updated_at": row[9],
         "is_default": bool(row[10]),
         "accept_protocols": json.loads(row[11]) if row[11] else ["anthropic", "openai"],
-        "family_routing": json.loads(row[12]) if row[12] else None
+        "family_routing": json.loads(row[12]) if row[12] else None,
+        "model_map": json.loads(row[13]) if row[13] else None
     }
 
 
@@ -949,7 +957,7 @@ def get_endpoint_by_api_key(api_key: str) -> dict | None:
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
-        SELECT endpoint_id, name, api_key_hash, models, settings, enabled, alias, is_default, accept_protocols, family_routing
+        SELECT endpoint_id, name, api_key_hash, models, settings, enabled, alias, is_default, accept_protocols, family_routing, model_map
         FROM endpoints WHERE api_key_hash = ?
     """, (api_key_hash,))
     row = c.fetchone()
@@ -966,7 +974,8 @@ def get_endpoint_by_api_key(api_key: str) -> dict | None:
         "alias": row[6],
         "is_default": bool(row[7]),
         "accept_protocols": json.loads(row[8]) if row[8] else ["anthropic", "openai"],
-        "family_routing": json.loads(row[9]) if row[9] else None
+        "family_routing": json.loads(row[9]) if row[9] else None,
+        "model_map": json.loads(row[10]) if row[10] else None
     }
 
 
@@ -976,7 +985,7 @@ def get_all_endpoints() -> list[dict]:
     c = conn.cursor()
     c.execute("""
         SELECT
-            e.endpoint_id, e.name, e.api_key_hash, e.models, e.settings, e.enabled, e.alias, e.is_default, e.accept_protocols, e.family_routing,
+            e.endpoint_id, e.name, e.api_key_hash, e.models, e.settings, e.enabled, e.alias, e.is_default, e.accept_protocols, e.family_routing, e.model_map,
             MAX(r.timestamp) as last_used
         FROM endpoints e
         LEFT JOIN usage_records r ON e.endpoint_id = r.endpoint_id
@@ -998,7 +1007,8 @@ def get_all_endpoints() -> list[dict]:
             "is_default": bool(row[7]),
             "accept_protocols": json.loads(row[8]) if row[8] else ["anthropic", "openai"],
             "family_routing": json.loads(row[9]) if row[9] else None,
-            "last_used": row[10]
+            "model_map": json.loads(row[10]) if row[10] else None,
+            "last_used": row[11]
         }
         for row in rows
     ]

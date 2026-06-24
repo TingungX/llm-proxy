@@ -30,6 +30,7 @@ async def api_create_endpoint(request: Request):
     enabled = body.get("enabled", True)
     accept_protocols = body.get("accept_protocols", ["anthropic", "openai"])
     family_routing = body.get("family_routing")
+    model_map = body.get("model_map")
 
     if not name or not api_key:
         return JSONResponse({"error": "name and api_key are required"}, status_code=400)
@@ -38,7 +39,7 @@ async def api_create_endpoint(request: Request):
     if db.get_endpoint(endpoint_id):
         return JSONResponse({"error": "Endpoint with this API Key already exists"}, status_code=400)
 
-    db.create_endpoint(endpoint_id, name, api_key, models, settings, enabled, accept_protocols, is_default=False, family_routing=family_routing)
+    db.create_endpoint(endpoint_id, name, api_key, models, settings, enabled, accept_protocols, is_default=False, family_routing=family_routing, model_map=model_map)
     return {"status": "ok", "endpoint_id": endpoint_id}
 
 
@@ -61,6 +62,7 @@ async def api_update_endpoint(endpoint_id: str, request: Request):
         enabled=body.get("enabled"),
         accept_protocols=body.get("accept_protocols"),
         family_routing=body.get("family_routing"),
+        model_map=body.get("model_map"),
     )
     return {"status": "ok"}
 
