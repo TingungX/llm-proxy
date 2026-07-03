@@ -1,13 +1,13 @@
 """OpenAI Responses API ↔ IR 转换器。
 
-透传模式：apply_patch 不再展开为 4 个标准文件工具，直接降级为 function tool。
+apply_patch 使用单工具定义（含 action 枚举），正向解析 DSL → 结构化参数，
+反向将结构化参数还原为 DSL。
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import re
 import uuid
 import time
 from typing import Any, AsyncIterator
@@ -29,7 +29,13 @@ from llm_proxy.protocol.ir._stream import (
     parse_sse_line,
     sse_format,
 )
-from llm_proxy.protocol.responses_chat.tool_replacement import repair_apply_patch_dsl, APPLY_PATCH_TOOL_DESCRIPTION
+from llm_proxy.protocol.responses_chat.tool_replacement import (
+    APPLY_PATCH_SINGLE_TOOL_DEF,
+    ReverseConversionError,
+    parse_apply_patch_to_simple,
+    reverse_tool_args_to_apply_patch,
+    tool_result_to_action_call,
+)
 from llm_proxy.protocol.ir.types import (
     IRStreamEvent,
     IRContentBlock,
@@ -243,24 +249,53 @@ def _convert_input_to_ir_messages(input_data: list) -> list[IRMessage]:
             ]))
 
         elif item_type in ("custom", "custom_tool_call"):
-            # apply_patch 等透传工具：input 是 DSL 字符串，需包成
-            # {"input": "<DSL>"} 以匹配 Chat Completions 协议（tool call
-            # 的 arguments 是 JSON 对象）。
-            # 不 flush——与前面的 reasoning/text 合并到同一条 assistant 消息
             name = item.get("name", "")
-            input_text = item.get("input", "")
-            if not isinstance(input_text, str):
-                input_text = safe_json_dumps(input_text, default="")
-            call_id = item.get("call_id", "") or item.get("id", "")
-            pending_tool_calls.append(IRToolUseBlock(
-                id=call_id,
-                name=name,
-                input={"input": input_text},
-            ))
+            if name == "apply_patch":
+                input_text = item.get("input", "")
+                if not isinstance(input_text, str):
+                    input_text = safe_json_dumps(input_text, default="")
+                parsed = parse_apply_patch_to_simple(input_text)
+                if parsed is not None:
+                    call_id = item.get("call_id", "") or item.get("id", "")
+                    normal_ops = [op for op in parsed if op.get("tool") != "_degraded_user_message"]
+                    degraded_ops = [op for op in parsed if op.get("tool") == "_degraded_user_message"]
+                    if normal_ops:
+                        if len(normal_ops) == 1:
+                            action_call = tool_result_to_action_call(normal_ops[0])
+                        else:
+                            action_call = {
+                                "action": "batch",
+                                "operations": [tool_result_to_action_call(op) for op in normal_ops],
+                            }
+                        pending_tool_calls.append(IRToolUseBlock(
+                            id=call_id,
+                            name="apply_patch",
+                            input=action_call,
+                        ))
+                    for dop in degraded_ops:
+                        flush_assistant()
+                        messages.append(IRMessage(
+                            role="user",
+                            content=dop.get("args", {}).get("content", ""),
+                        ))
+                else:
+                    flush_assistant()
+                    messages.append(IRMessage(
+                        role="user",
+                        content=f"[File was modified]\n{input_text}",
+                    ))
+            else:
+                input_text = item.get("input", "")
+                if not isinstance(input_text, str):
+                    input_text = safe_json_dumps(input_text, default="")
+                call_id = item.get("call_id", "") or item.get("id", "")
+                pending_tool_calls.append(IRToolUseBlock(
+                    id=call_id,
+                    name=name,
+                    input={"input": input_text},
+                ))
 
         elif item_type in ("custom_tool_call_output", "custom_output"):
-            # apply_patch 工具结果：必须 flush assistant 并生成 IRToolResultBlock，
-            # 否则上游收不到工具结果，模型会误以为工具没执行（症状 A）。
             flush_assistant()
             call_id = item.get("call_id", "")
             output = item.get("output", "")
@@ -271,10 +306,7 @@ def _convert_input_to_ir_messages(input_data: list) -> list[IRMessage]:
             else:
                 content = safe_json_dumps(output, default="")
             messages.append(IRMessage(role="tool", content=[
-                IRToolResultBlock(
-                    tool_use_id=call_id,
-                    content=content,
-                )
+                IRToolResultBlock(tool_use_id=call_id, content=content)
             ]))
 
         else:
@@ -318,25 +350,6 @@ def _extract_reasoning_text(item: dict) -> str:
     return ""
 
 
-def _extract_dsl_from_raw(raw_str: str) -> str:
-    """从上游发来的非严格 JSON args 字符串中提取 apply_patch DSL。
-
-    MiniMax M3 等上游可能发送含字面 \\n 的非严格 JSON（IR Chat parser 解析失败，
-    返回 {"_raw": "..."}）。DSL 通常在 `{"input": "..."}` 字段里，本函数用正则
-    提取该字段的字符串值。
-
-    Returns: 提取出的 DSL 文本，未匹配则返回空串。
-    """
-    if not raw_str:
-        return ""
-    # 匹配 "input": "<DSL>"，允许 <DSL> 中含字面 \n
-    m = re.search(r'"input"\s*:\s*"((?:[^"\\]|\\.)*)"', raw_str, flags=re.DOTALL)
-    if m:
-        # 反转义 \\n → \n（DSL 用真实换行）
-        return m.group(1).replace("\\n", "\n").replace('\\"', '"').replace("\\\\", "\\")
-    return ""
-
-
 def _convert_tools_to_ir(tools: list) -> tuple[list[IRToolDef], dict[str, str], dict[str, dict]]:
     """Responses tools → (IRToolDef list, reverse_tool_map, tool_spec_map)。
 
@@ -361,19 +374,27 @@ def _convert_tools_to_ir(tools: list) -> tuple[list[IRToolDef], dict[str, str], 
 
         if tool_type == "custom":
             name = tool.get("name", "")
-            # 透传：apply_patch 与其他 custom 工具一致，直接降级为单个 function tool
+            if name == "apply_patch":
+                func = APPLY_PATCH_SINGLE_TOOL_DEF["function"]
+                ir_tools.append(IRToolDef(
+                    name=func["name"],
+                    description=func["description"],
+                    parameters=clean_schema(func["parameters"]),
+                ))
+                reverse_tool_map["apply_patch"] = "apply_patch"
+                tool_spec_map["apply_patch"] = {"kind": "custom", "name": "apply_patch"}
+                continue
+            # 其他 custom 工具 → 降级为 function
             params = _normalize_params(tool.get("parameters"))
             if not params.get("properties"):
-                # apply_patch 用完整 DSL 描述让上游模型理解格式，其他工具用简短描述
-                input_desc = APPLY_PATCH_TOOL_DESCRIPTION if name == "apply_patch" else "Tool input"
                 params = {
                     "type": "object",
-                    "properties": {"input": {"type": "string", "description": input_desc}},
+                    "properties": {"input": {"type": "string", "description": "Tool input"}},
                     "required": [],
                 }
             ir_tools.append(IRToolDef(
                 name=name,
-                description=tool.get("description") or (APPLY_PATCH_TOOL_DESCRIPTION if name == "apply_patch" else ""),
+                description=tool.get("description", ""),
                 parameters=clean_schema(params),
             ))
             reverse_tool_map[name] = name
@@ -455,7 +476,6 @@ def response_from_ir(ir: IRResponse, *, reverse_tool_map: dict | None = None, to
     output: list[dict] = []
     _reverse = reverse_tool_map or {}
     _spec = tool_spec_map or {}
-    # 收集所有 text blocks 合并到一个 message item（Responses API 规范：
     # 同一 response 的 output 中，assistant role 的 message 应只有一个）
     text_parts: list[dict] = []
     for block in ir.content_blocks:
@@ -492,18 +512,21 @@ def response_from_ir(ir: IRResponse, *, reverse_tool_map: dict | None = None, to
 
             if downstream_name is not None:
                 # 1) reverse_tool_map 命中 → custom_tool_call
-                args_raw = safe_json_dumps(block.input, default="{}")
-                if block.name == "apply_patch" and isinstance(block.input, dict):
-                    dsl = block.input.get("input", "")
-                    if isinstance(dsl, str):
-                        args_raw = repair_apply_patch_dsl(dsl).dsl
+                if downstream_name == "apply_patch" and isinstance(block.input, dict):
+                    try:
+                        input_text = reverse_tool_args_to_apply_patch(block.input)
+                    except ReverseConversionError as exc:
+                        logger.warning("Reverse conversion failed: %s", exc)
+                        input_text = f"Tool call apply_patch failed: {exc.reason}. {exc.detail}"
+                else:
+                    input_text = safe_json_dumps(block.input, default="{}")
                 output.append({
                     "type": "custom_tool_call",
                     "id": f"fc_{uuid.uuid4().hex[:24]}",
                     "name": downstream_name,
                     "status": "completed",
                     "call_id": block.id or f"call_{uuid.uuid4().hex[:24]}",
-                    "input": args_raw,
+                    "input": input_text,
                 })
             elif spec is not None and spec.get("kind") == "namespace" and spec.get("namespace"):
                 # 2) namespace 子工具 → function_call + 原始名称 + namespace
@@ -792,19 +815,26 @@ def _tools_ir_to_responses(
 ) -> list[dict]:
     """IRToolDef list → Responses tools 列表。
 
-    透传模式：每个 IRToolDef 直接还原为 Responses function tool。
+    reverse_tool_map 包含 apply_patch → 还原为 custom tool。
     """
     if not ir_tools:
         return []
 
     result: list[dict] = []
     for tool in ir_tools:
-        result.append({
-            "type": "function",
-            "name": tool.name,
-            "description": tool.description,
-            "parameters": tool.parameters,
-        })
+        if tool.name == "apply_patch" and reverse_tool_map and reverse_tool_map.get("apply_patch"):
+            result.append({
+                "type": "custom",
+                "name": "apply_patch",
+                "description": tool.description,
+            })
+        else:
+            result.append({
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters,
+            })
     return result
 
 
@@ -1448,19 +1478,14 @@ async def format_ir_as_sse(
                 for ev in close_current_item():
                     yield ev
             elif current_item_type == "custom_tool_call":
-                # 透传模式：final_input 原样作为 custom_tool_call.input
                 final_input = data.get("input", {})
                 if isinstance(final_input, dict):
                     if current_tool_downstream_name == "apply_patch":
-                        # 解包 {"input": "<DSL>"} → 裸 DSL 文本 + DSL 修复
-                        dsl = final_input.get("input", "")
-                        # 兜底：上游（如 MiniMax M3）可能发送含字面 \n 的非严格 JSON，
-                        # IR Chat parser 此时返回 {"_raw": "..."}；正则提取 DSL
-                        if not dsl and "_raw" in final_input:
-                            raw_str = final_input["_raw"]
-                            if isinstance(raw_str, str):
-                                dsl = _extract_dsl_from_raw(raw_str)
-                        input_text = repair_apply_patch_dsl(dsl).dsl if (isinstance(dsl, str) and dsl) else safe_json_dumps(final_input, default="{}")
+                        try:
+                            input_text = reverse_tool_args_to_apply_patch(final_input)
+                        except ReverseConversionError as exc:
+                            logger.warning("Reverse conversion failed: %s", exc)
+                            input_text = f"Tool call apply_patch failed: {exc.reason}. {exc.detail}"
                     else:
                         input_text = safe_json_dumps(final_input, default="{}")
                 else:

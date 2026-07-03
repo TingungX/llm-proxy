@@ -372,7 +372,7 @@ class TestConvertInputCustomToolPassthrough:
         assert args["path"] == "/tmp/test.png"
 
     def test_apply_patch_custom_tool_call_passthrough(self):
-        """透传：apply_patch 的 custom_tool_call input 原样作为 function arguments"""
+        """apply_patch 的 custom_tool_call input 被解析为结构化参数"""
         from llm_proxy.protocol.responses_chat.request import convert_input_to_messages
         input_data = [
             {"type": "custom_tool_call", "name": "apply_patch", "call_id": "call_3",
@@ -384,10 +384,11 @@ class TestConvertInputCustomToolPassthrough:
         assistant_msgs = [m for m in messages if m.get("role") == "assistant" and m.get("tool_calls")]
         assert len(assistant_msgs) == 1
         tc = assistant_msgs[0]["tool_calls"][0]
-        # 透传：function name 保持 apply_patch，arguments 是原始 DSL 字符串
         assert tc["function"]["name"] == "apply_patch"
-        assert "*** Begin Patch" in tc["function"]["arguments"]
-        assert "/tmp/test.txt" in tc["function"]["arguments"]
+        args = json.loads(tc["function"]["arguments"])
+        assert args["action"] == "add_file"
+        assert args["filePath"] == "/tmp/test.txt"
+        assert args["content"] == "hello"
 
     def test_custom_tool_call_with_non_string_input(self):
         """custom_tool_call 的 input 是非字符串时，应 JSON 序列化"""
@@ -438,7 +439,7 @@ class TestToResponsesResponseCustomPassthrough:
         assert parsed["task_name"] == "task1"
 
     def test_apply_patch_passthrough_in_response(self):
-        """透传：上游返回 apply_patch 调用，arguments 原样作为 custom_tool_call.input"""
+        """上游返回 apply_patch 调用，结构化参数反向转换为 DSL"""
         from llm_proxy.protocol.responses_chat.request import to_responses_response
         chat_body = {
             "choices": [{
@@ -448,7 +449,7 @@ class TestToResponsesResponseCustomPassthrough:
                         "type": "function",
                         "function": {
                             "name": "apply_patch",
-                            "arguments": '{"input": "*** Begin Patch\\n*** Add File: /tmp/x.txt\\n+hello\\n*** End Patch"}',
+                            "arguments": '{"action": "add_file", "filePath": "/tmp/x.txt", "content": "hello"}',
                         },
                     }],
                 },
@@ -465,7 +466,7 @@ class TestToResponsesResponseCustomPassthrough:
         assert "*** Add File: /tmp/x.txt" in item["input"]
 
     def test_mixed_apply_patch_and_custom_in_response(self):
-        """透传：apply_patch 和 spawn_agent 都走 JSON 透传"""
+        """apply_patch 和 spawn_agent 混合：apply_patch 走 DSL 反向转换，spawn_agent 走 JSON"""
         from llm_proxy.protocol.responses_chat.request import to_responses_response
         chat_body = {
             "choices": [{
@@ -476,7 +477,7 @@ class TestToResponsesResponseCustomPassthrough:
                             "type": "function",
                             "function": {
                                 "name": "apply_patch",
-                                "arguments": '{"input": "*** Begin Patch\\n*** Add File: a.txt\\n+hi\\n*** End Patch"}',
+                                "arguments": '{"action": "add_file", "filePath": "a.txt", "content": "hi"}',
                             },
                         },
                         {

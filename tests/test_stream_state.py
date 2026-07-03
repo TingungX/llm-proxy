@@ -345,10 +345,10 @@ class TestCustomToolPassthrough:
         assert parsed["path"] == "/tmp/test.png"
 
     def test_apply_patch_passthrough(self):
-        """透传：上游 apply_patch 调用的 arguments 原样作为 custom_tool_call.input"""
+        """apply_patch 结构化参数反向转换为 DSL"""
         st = StreamState(reverse_tool_map={"apply_patch": "apply_patch"})
         st.handle_tool_call_id(0, "call_patch1", "apply_patch")
-        st.handle_tool_call_args_delta(0, '{"input": "*** Begin Patch\\n*** Add File: /tmp/x.txt\\n+hello\\n*** End Patch"}')
+        st.handle_tool_call_args_delta(0, '{"action": "add_file", "filePath": "/tmp/x.txt", "content": "hello"}')
         events = st.close_func_blocks()
         done_events = [e for e in _parse_events(events) if e.get("type") == "response.output_item.done"]
         assert len(done_events) == 1
@@ -360,13 +360,13 @@ class TestCustomToolPassthrough:
         assert "*** Add File: /tmp/x.txt" in input_text
 
     def test_mixed_apply_patch_and_custom_tools(self):
-        """透传：apply_patch 和 spawn_agent 都走 JSON 透传"""
+        """apply_patch 走 DSL 反向转换，spawn_agent 走 JSON"""
         st = StreamState(reverse_tool_map={
             "apply_patch": "apply_patch",
             "spawn_agent": "spawn_agent",
         })
         st.handle_tool_call_id(0, "call_patch1", "apply_patch")
-        st.handle_tool_call_args_delta(0, '{"input": "*** Begin Patch\\n*** Add File: a.txt\\n+hi\\n*** End Patch"}')
+        st.handle_tool_call_args_delta(0, '{"action": "add_file", "filePath": "a.txt", "content": "hi"}')
         st.handle_tool_call_id(1, "call_spawn1", "spawn_agent")
         st.handle_tool_call_args_delta(1, '{"task_name": "task1"}')
         events = st.close_func_blocks()

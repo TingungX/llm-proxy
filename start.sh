@@ -72,6 +72,10 @@ build_frontend_if_needed
 mkdir -p "$(dirname "$LOG_FILE")"
 touch "$LOG_FILE"
 
+# 代理：Steam++ (Watt Toolkit) MITM proxy，用于访问被墙上游（opencode.ai 等）
+# allow_proxy=true 的模型走此代理，其余直连
+export HTTPS_PROXY="${HTTPS_PROXY:-http://127.0.0.1:1082}"
+
 echo "Starting $APP_MODULE on http://$HOST:$PORT"
 echo "Logging to $LOG_FILE"
 

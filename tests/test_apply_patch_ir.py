@@ -64,8 +64,8 @@ class TestCustomToolCallForwarding:
         assert apply_blocks[0].id == "call_apply_1"
 
     def test_custom_tool_call_input_wrapped_in_dict(self):
-        """input 字段是 DSL 字符串，必须包成 {'input': '...'} 以匹配
-        Chat Completions 协议（tool call 的 arguments 是 JSON 对象）。"""
+        """apply_patch 的 DSL input 被解析为结构化参数（含 action 字段），
+        匹配 Chat Completions 协议（tool call 的 arguments 是 JSON 对象）。"""
         body = {"model": "gpt-5", "input": _build_codex_apply_patch_history()}
         ir = to_ir(body)
 
@@ -74,9 +74,9 @@ class TestCustomToolCallForwarding:
             if isinstance(b, IRToolUseBlock) and b.name == "apply_patch"
         )
         assert isinstance(apply_block.input, dict)
-        assert "input" in apply_block.input
-        assert "*** Begin Patch" in apply_block.input["input"]
-        assert "*** End Patch" in apply_block.input["input"]
+        assert apply_block.input.get("action") == "add_file"
+        assert apply_block.input.get("filePath") == "foo.py"
+        assert "def hello():" in apply_block.input.get("content", "")
 
     def test_custom_tool_call_output_creates_ir_tool_result_block(self):
         """这是症状 A 的核心：custom_tool_call_output 必须被转换为

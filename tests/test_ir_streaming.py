@@ -623,35 +623,30 @@ class TestResponsesFormat:
         assert '"input_tokens": 10' in text
 
     async def test_apply_patch_reverse_to_custom_tool_call(self):
-        """standard file tool → apply_patch custom_tool_call via reverse_tool_map。"""
+        """apply_patch 结构化参数 → custom_tool_call via reverse_tool_map，反向转换为 DSL。"""
         async def events_aiter():
             for e in [
             IRStreamEvent("message_start", {"id": "resp_1", "model": "gpt-5"}),
-            IRStreamEvent("tool_use_start", {"id": "call_1", "name": "write_to_file"}),
+            IRStreamEvent("tool_use_start", {"id": "call_1", "name": "apply_patch"}),
             IRStreamEvent("tool_use_end", {
                 "id": "call_1",
-                "input": {"filePath": "/tmp/x.py", "content": "print('hi')"},
+                "input": {"action": "add_file", "filePath": "/tmp/x.py", "content": "print('hi')"},
             }),
             IRStreamEvent("message_stop", {"stop_reason": "tool_use"}),
         ]:
                 yield e
         events_aiter = events_aiter()
-        reverse_tool_map = {"write_to_file": "apply_patch"}
+        reverse_tool_map = {"apply_patch": "apply_patch"}
         chunks = []
         async for b in responses_format(
             events_aiter, model='gpt-5', reverse_tool_map=reverse_tool_map,
         ):
             chunks.append(b)
         text = b''.join(chunks).decode()
-        # 必须含 custom_tool_call
         assert "custom_tool_call" in text
-        # 必须含 apply_patch 名字
         assert '"name": "apply_patch"' in text
-        # 透传模式：上游 write_to_file 的参数 JSON 序列化后作为 input
-        assert "filePath" in text
-        assert "/tmp/x.py" in text
-        assert "content" in text
-        assert "print('hi')" in text
+        assert "*** Begin Patch" in text
+        assert "*** Add File: /tmp/x.py" in text
 
     async def test_tool_spec_map_adds_namespace_field(self):
         """tool_spec_map 命中的 tool → function_call + namespace 字段。"""

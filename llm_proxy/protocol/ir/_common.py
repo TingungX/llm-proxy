@@ -20,10 +20,21 @@ logger = logging.getLogger(__name__)
 # ── Schema 清理 ────────────────────────────────────────────────────────
 
 
-def clean_schema(schema: dict) -> dict:
-    """递归清理 JSON schema，移除 OpenAI 不支持的字段。
+_UNSUPPORTED_SCHEMA_KEYS = frozenset({
+    "minLength", "maxLength",
+    "minItems", "maxItems",
+    "pattern", "format",
+    "default", "examples",
+})
 
-    当前规则：移除 `format: "uri"`，递归处理 properties 和 items。
+
+def clean_schema(schema: dict) -> dict:
+    """递归清理 JSON schema，移除上游不支持的约束字段。
+
+    移除规则：
+    - format: "uri" 及其他 format 值（部分上游不支持）
+    - minLength / maxLength / minItems / maxItems / pattern / default / examples
+    - 递归处理 properties 和 items
     返回新 dict（shallow copy），不修改原 schema。
     """
     if not isinstance(schema, dict):
@@ -31,7 +42,7 @@ def clean_schema(schema: dict) -> dict:
 
     result = {}
     for key, value in schema.items():
-        if key == "format" and value == "uri":
+        if key in _UNSUPPORTED_SCHEMA_KEYS:
             continue
         if key == "properties" and isinstance(value, dict):
             result[key] = {k: clean_schema(v) for k, v in value.items()}

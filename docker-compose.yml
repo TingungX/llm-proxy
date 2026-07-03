@@ -10,8 +10,8 @@ services:
     environment:
       # 显式声明 DB 路径
       - LLM_PROXY_DB_PATH=/app/usage.db
-      # 如需走代理，在此传递（与 http_client.py 配合）
-      # - HTTPS_PROXY=http://host.docker.internal:7890
+      # 走 Steam++ (Watt Toolkit) 代理访问被墙上游（opencode.ai 等）
+      - HTTPS_PROXY=http://host.docker.internal:1082
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:4000/api/config', timeout=5).raise_for_status()"]

@@ -6,7 +6,10 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from llm_proxy.protocol.responses_chat.request import CodexToolSpec
-from llm_proxy.protocol.responses_chat.tool_replacement import repair_apply_patch_dsl
+from llm_proxy.protocol.responses_chat.tool_replacement import (
+    ReverseConversionError,
+    reverse_tool_args_to_apply_patch,
+)
 from llm_proxy.protocol.think_tag import ThinkTagStateMachine
 
 logger = logging.getLogger(__name__)
@@ -22,29 +25,6 @@ def _make_sse_event(data: dict) -> bytes:
 
 def _gen_id(prefix: str = "") -> str:
     return prefix + uuid.uuid4().hex[:24]
-
-
-def _unwrap_input_arg(args: str) -> str:
-    """如果 args 是 {"input": "..."} 的 JSON（单 key），解包返回内层字符串。
-
-    透传模式下，非 JSON 的 custom 工具 input（如 DSL 文本）被包装为
-    {"input": "<DSL>"}，模型调用时参数形如 {"input": "<DSL>"}。
-    Codex 的 custom_tool_call 期望 input 是原始 DSL 文本，需去掉外层包装。
-
-    也兼容模型直接传裸字符串（JSON string literal）的情况。
-    如果 args 是多 key 的 JSON 对象，说明 input 本身就是合法 JSON，不解包。
-    """
-    if not args or not isinstance(args, str):
-        return args
-    try:
-        obj = json.loads(args)
-        if isinstance(obj, dict) and len(obj) == 1 and "input" in obj and isinstance(obj["input"], str):
-            return obj["input"]
-        if isinstance(obj, str):
-            return obj
-    except (json.JSONDecodeError, TypeError):
-        pass
-    return args
 
 
 class StreamState:
@@ -314,18 +294,82 @@ class StreamState:
             downstream_name = self.reverse_tool_map.get(name)
 
             if downstream_name is not None:
-                # 透传模式：arguments 原样作为 custom_tool_call.input
-                if not isinstance(args, str):
-                    args = json.dumps(args, ensure_ascii=False)
-                # 模型调用时参数被包在 {"input": "..."} 中，Codex 期望的是
-                # 原始 DSL 文本而非 JSON 对象，这里解包 input 字段。
-                args = repair_apply_patch_dsl(_unwrap_input_arg(args)).dsl
+                try:
+                    parsed_args = json.loads(args) if isinstance(args, str) else args
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "Truncated tool call arguments for %s (call_id=%s), "
+                        "falling back to text message",
+                        name, call_id,
+                    )
+                    truncated_msg = (
+                        f"[Output truncated] The tool call {name} was interrupted "
+                        f"because the arguments were too long and got truncated. "
+                        f"Consider using append_to_file to write content in smaller chunks."
+                    )
+                    events.append(_make_sse_event({
+                        "type": "response.output_text.delta",
+                        "item_id": f"msg_{call_id}",
+                        "output_index": output_index,
+                        "delta": truncated_msg,
+                    }))
+                    events.append(_make_sse_event({
+                        "type": "response.output_text.done",
+                        "item_id": f"msg_{call_id}",
+                        "output_index": output_index,
+                        "sequence_number": self._next_seq(),
+                    }))
+                    events.append(_make_sse_event({
+                        "type": "response.output_item.done",
+                        "output_index": output_index,
+                        "sequence_number": self._next_seq(),
+                        "item": {
+                            "id": f"msg_{call_id}",
+                            "type": "message",
+                            "status": "completed",
+                            "content": [{"type": "output_text", "text": truncated_msg}],
+                        },
+                    }))
+                    continue
+
+                if downstream_name == "apply_patch":
+                    try:
+                        input_text = reverse_tool_args_to_apply_patch(parsed_args)
+                    except ReverseConversionError as exc:
+                        logger.warning("Reverse conversion failed: %s", exc)
+                        error_msg = f"Tool call {name} failed: {exc.reason}. {exc.detail}"
+                        events.append(_make_sse_event({
+                            "type": "response.output_text.delta",
+                            "item_id": f"msg_{call_id}",
+                            "output_index": output_index,
+                            "delta": error_msg,
+                        }))
+                        events.append(_make_sse_event({
+                            "type": "response.output_text.done",
+                            "item_id": f"msg_{call_id}",
+                            "output_index": output_index,
+                            "sequence_number": self._next_seq(),
+                        }))
+                        events.append(_make_sse_event({
+                            "type": "response.output_item.done",
+                            "output_index": output_index,
+                            "sequence_number": self._next_seq(),
+                            "item": {
+                                "id": f"msg_{call_id}",
+                                "type": "message",
+                                "status": "completed",
+                                "content": [{"type": "output_text", "text": error_msg}],
+                            },
+                        }))
+                        continue
+                else:
+                    input_text = json.dumps(parsed_args, ensure_ascii=False)
 
                 events.append(_make_sse_event({
                     "type": "response.custom_tool_call_input.delta",
                     "item_id": item_id,
                     "call_id": call_id,
-                    "delta": args,
+                    "delta": input_text,
                 }))
                 events.append(_make_sse_event({
                     "type": "response.output_item.done",
@@ -337,7 +381,7 @@ class StreamState:
                         "name": downstream_name,
                         "status": "completed",
                         "call_id": call_id,
-                        "input": args,
+                        "input": input_text,
                     },
                 }))
             else:
@@ -470,18 +514,48 @@ class StreamState:
             args = self.func_args_buf[idx] or "{}"
             downstream_name = self.reverse_tool_map.get(name)
             if downstream_name is not None:
-                # 透传模式：arguments 原样作为 custom_tool_call.input
-                if not isinstance(args, str):
-                    args = json.dumps(args, ensure_ascii=False)
-                # 解包 {"input": "..."} 为原始 DSL 文本
-                args = repair_apply_patch_dsl(_unwrap_input_arg(args)).dsl
+                try:
+                    parsed_args = json.loads(args) if isinstance(args, str) else args
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "Truncated tool call arguments for %s (call_id=%s), "
+                        "falling back in output items",
+                        name, call_id,
+                    )
+                    truncated_msg = (
+                        f"[Output truncated] The tool call {name} was interrupted "
+                        f"because the arguments were too long and got truncated. "
+                        f"Consider using append_to_file to write content in smaller chunks."
+                    )
+                    items.append({
+                        "id": f"msg_{call_id}",
+                        "type": "message",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": truncated_msg}],
+                    })
+                    continue
+                if downstream_name == "apply_patch":
+                    try:
+                        input_text = reverse_tool_args_to_apply_patch(parsed_args)
+                    except ReverseConversionError as exc:
+                        logger.warning("Reverse conversion failed: %s", exc)
+                        error_msg = f"Tool call {name} failed: {exc.reason}. {exc.detail}"
+                        items.append({
+                            "id": f"msg_{call_id}",
+                            "type": "message",
+                            "status": "completed",
+                            "content": [{"type": "output_text", "text": error_msg}],
+                        })
+                        continue
+                else:
+                    input_text = json.dumps(parsed_args, ensure_ascii=False)
                 items.append({
                     "id": item_id,
                     "type": "custom_tool_call",
                     "name": downstream_name,
                     "status": "completed",
                     "call_id": call_id,
-                    "input": args,
+                    "input": input_text,
                 })
             else:
                 spec = self.tool_spec_map.get(name)

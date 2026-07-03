@@ -283,9 +283,15 @@ class IRProxyStep(HandlerStep):
         except Exception as e:
             logger.error(f"IR stream error: {e}", exc_info=True)
             had_error = True
-            err_chunk = _make_error_chunk(e, self.client_protocol)
-            if err_chunk:
-                yield err_chunk
+            err_events = _err_event_gen(
+                {"message": f"Proxy error: {type(e).__name__}: {e}"},
+                self.client_protocol,
+            )
+            async for chunk in REGISTRY[client_proto].format_ir_as_sse(
+                err_events,
+                ctx.response_model or actual_model,
+            ):
+                yield chunk
         finally:
             # 记录 usage
             status = "error" if had_error else "success"
@@ -351,15 +357,4 @@ async def _err_event_gen(err_data: dict, client_protocol: str):
     )
 
 
-def _make_error_chunk(err: Exception, client_protocol: str) -> bytes | None:
-    """为非流式错误流生成错误 SSE chunk。"""
-    msg = f"Proxy error: {type(err).__name__}: {err}"
-    if client_protocol == "anthropic":
-        return (
-            f"event: error\n"
-            f'data: {{"type":"error","error":{{"type":"proxy_error","message":{json.dumps(msg)}}}}}\n\n'
-        ).encode()
-    # OpenAI 风格
-    return (
-        f'data: {{"error":{{"message":{json.dumps(msg)},"type":"proxy_error"}}}}\n\n'
-    ).encode()
+

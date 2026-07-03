@@ -14,10 +14,15 @@ from typing import Optional
 
 from llm_proxy.infra import db
 
-from llm_proxy.protocol.responses_chat.stream import StreamState, _unwrap_input_arg
+from llm_proxy.protocol.responses_chat.stream import StreamState
 from llm_proxy.protocol.responses_chat.tool_replacement import (
+    APPLY_PATCH_SINGLE_TOOL_DEF,
     APPLY_PATCH_TOOL_DESCRIPTION,
-    repair_apply_patch_dsl,
+    ReverseConversionError,
+    parse_apply_patch_to_simple,
+    reverse_tool_args_to_apply_patch,
+    tool_result_to_action_call,
+    TOOL_TO_ACTION,
 )
 from llm_proxy.protocol.think_tag import strip_think_tags
 
@@ -100,24 +105,33 @@ def convert_tools_to_chat(tools: list) -> tuple[list, dict[str, str], dict[str, 
             logger.debug(f"Skipping client-side tool: {tool_type}")
             continue
 
-        # --- custom 工具（透传模式） ---
-        # apply_patch 与其他 custom 工具一致，直接降级为单个 function tool
-        # 不再展开为 4 个标准文件工具，反向也不再做 DSL 转换
+        # --- custom 工具 ---
+        # apply_patch 使用單工具定義（含 action 枚舉），其他 custom 工具透傳
         if tool_type == "custom":
             name = tool.get("name", "")
-            params = _normalize_params(tool.get("parameters"))
-            if not params.get("properties"):
-                params = {
-                    "type": "object",
-                    "properties": {"input": {"type": "string", "description": APPLY_PATCH_TOOL_DESCRIPTION}},
-                    "required": [],
-                }
-            result.append(_make_chat_function_tool(
-                name, tool.get("description") or APPLY_PATCH_TOOL_DESCRIPTION, params
-            ))
-            reverse_tool_map[name] = name
-            tool_spec_map[name] = CodexToolSpec(kind="custom", name=name)
-            logger.debug(f"Passthrough custom tool as function: {name}")
+            if name == "apply_patch":
+                from llm_proxy.protocol.ir._common import clean_schema as _clean_schema
+                defn = dict(APPLY_PATCH_SINGLE_TOOL_DEF)
+                func = dict(defn["function"])
+                func["parameters"] = _clean_schema(func["parameters"])
+                defn["function"] = func
+                result.append(defn)
+                reverse_tool_map["apply_patch"] = "apply_patch"
+                tool_spec_map["apply_patch"] = CodexToolSpec(kind="custom", name="apply_patch")
+            else:
+                params = _normalize_params(tool.get("parameters"))
+                if not params.get("properties"):
+                    params = {
+                        "type": "object",
+                        "properties": {"input": {"type": "string", "description": "Tool input"}},
+                        "required": [],
+                    }
+                result.append(_make_chat_function_tool(
+                    name, tool.get("description", ""), params
+                ))
+                reverse_tool_map[name] = name
+                tool_spec_map[name] = CodexToolSpec(kind="custom", name=name)
+                logger.debug(f"Pass-through custom tool as function: {name}")
             continue
 
         # --- namespace 工具：展开子工具，使用限定的全名以避免同名冲突 ---
@@ -293,27 +307,74 @@ def convert_input_to_messages(input_data, instructions: str | None = None) -> li
 
             if item_type in ("custom", "custom_tool_call"):
                 name = item.get("name", "")
-                input_text = item.get("input", "")
-                if not isinstance(input_text, str):
-                    input_text = json.dumps(input_text, ensure_ascii=False)
-                call_id = item.get("call_id", "") or item.get("id", "")
-                try:
-                    parsed = json.loads(input_text)
-                    if isinstance(parsed, dict):
-                        arguments = input_text
+                if name == "apply_patch":
+                    input_text = item.get("input", "")
+                    parsed = parse_apply_patch_to_simple(input_text)
+                    if parsed is not None:
+                        normal_ops = [op for op in parsed if op.get("tool") != "_degraded_user_message"]
+                        degraded_ops = [op for op in parsed if op.get("tool") == "_degraded_user_message"]
+
+                        if normal_ops:
+                            base_call_id = item.get("call_id", "") or item.get("id", "")
+                            if len(normal_ops) == 1:
+                                action_call = tool_result_to_action_call(normal_ops[0])
+                                pending_tool_calls.append({
+                                    "id": base_call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": "apply_patch",
+                                        "arguments": json.dumps(action_call, ensure_ascii=False),
+                                    },
+                                })
+                            else:
+                                derived_ids = [f"{base_call_id}_{i}" for i in range(len(normal_ops))]
+                                split_call_ids[base_call_id] = derived_ids
+                                for i, op in enumerate(normal_ops):
+                                    action_call = tool_result_to_action_call(op)
+                                    pending_tool_calls.append({
+                                        "id": derived_ids[i],
+                                        "type": "function",
+                                        "function": {
+                                            "name": "apply_patch",
+                                            "arguments": json.dumps(action_call, ensure_ascii=False),
+                                        },
+                                    })
+
+                        if degraded_ops:
+                            _flush_assistant_turn()
+                            for dop in degraded_ops:
+                                messages.append({
+                                    "role": "user",
+                                    "content": dop.get("args", {}).get("content", ""),
+                                })
                     else:
+                        _flush_assistant_turn()
+                        messages.append({
+                            "role": "user",
+                            "content": f"[File was modified]\n{input_text}",
+                        })
+                else:
+                    input_text = item.get("input", "")
+                    if not isinstance(input_text, str):
+                        input_text = json.dumps(input_text, ensure_ascii=False)
+                    call_id = item.get("call_id", "") or item.get("id", "")
+                    try:
+                        parsed = json.loads(input_text)
+                        if isinstance(parsed, dict):
+                            arguments = input_text
+                        else:
+                            arguments = json.dumps({"input": input_text}, ensure_ascii=False)
+                    except (json.JSONDecodeError, TypeError):
                         arguments = json.dumps({"input": input_text}, ensure_ascii=False)
-                except (json.JSONDecodeError, TypeError):
-                    arguments = json.dumps({"input": input_text}, ensure_ascii=False)
-                pending_tool_calls.append({
-                    "id": call_id,
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": arguments,
-                    },
-                })
-                logger.debug(f"Passthrough custom_tool_call to function: {name}")
+                    pending_tool_calls.append({
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments,
+                        },
+                    })
+                    logger.debug(f"Converted custom_tool_call to function: {name}")
                 continue
 
             if item_type in ("custom_tool_call_output", "custom_output"):
@@ -454,19 +515,27 @@ def to_responses_response(chat_body: dict, original_model: str, reverse_tool_map
             downstream_name = _reverse.get(name)
             spec = _spec.get(name)
             if downstream_name is not None:
-                # 1) reverse_tool_map 命中 → custom_tool_call（透传：arguments 原样作为 input）
+                # 1) reverse_tool_map 命中 → custom_tool_call
                 args_str = func.get("arguments", "{}")
-                if not isinstance(args_str, str):
-                    args_str = json.dumps(args_str, ensure_ascii=False)
-                # 解包 {"input": "..."} 为原始 DSL 文本
-                args_str = repair_apply_patch_dsl(_unwrap_input_arg(args_str)).dsl
+                try:
+                    args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                except json.JSONDecodeError:
+                    args = {}
+                if downstream_name == "apply_patch":
+                    try:
+                        input_text = reverse_tool_args_to_apply_patch(args)
+                    except ReverseConversionError as exc:
+                        logger.warning("Reverse conversion failed: %s", exc)
+                        input_text = f"Tool call apply_patch failed: {exc.reason}. {exc.detail}"
+                else:
+                    input_text = json.dumps(args, ensure_ascii=False)
                 output.append({
                     "id": f"fc_{uuid.uuid4().hex[:24]}",
                     "type": "custom_tool_call",
                     "name": downstream_name,
                     "status": "completed",
                     "call_id": tc.get("id", ""),
-                    "input": args_str,
+                    "input": input_text,
                 })
             elif spec is not None and spec.kind == "namespace" and spec.namespace:
                 # 2) namespace 子工具 → function_call + 原始名称 + namespace

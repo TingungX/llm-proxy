@@ -1,15 +1,16 @@
-"""Test for MiniMax M3 apply_patch with literal newlines in args.
+"""Test for MiniMax M3 apply_patch with structured parameters in stream.
 
 Reproduces: Codex→minimax-m3 stream_error after first tool call.
 
-Root cause: MiniMax upstream may send tool_call arguments as a JSON string with
-literal newlines (e.g. `{"input": "*** Begin Patch\n*** Add File: ..."}`), which
-is technically invalid JSON. The IR Chat parser's IncrementalJSONParser fails to
-parse this, returning `{"_raw": "..."}`. The Responses IR custom_tool_call handler
+Root cause (original): MiniMax upstream may send tool_call arguments as a JSON
+string with literal newlines (e.g. `{"input": "*** Begin Patch\n*** Add File: ..."`}),
+which is technically invalid JSON. The IR Chat parser's IncrementalJSONParser fails
+to parse this, returning `{"_raw": "..."}`. The Responses IR custom_tool_call handler
 then can't extract the DSL from `_raw`, leaving Codex with an empty input.
 
-Fix: when `_raw` is present in parsed input, fall back to regex-extracting the
-embedded DSL string via `_extract_dsl_from_raw`.
+With the new structured parameters approach, the upstream should send
+`{"action": "add_file", "filePath": "...", "content": "..."}` format.
+The reverse conversion (reverse_tool_args_to_apply_patch) converts this back to DSL.
 """
 import asyncio
 import json
@@ -20,7 +21,6 @@ sys.path.insert(0, '/Users/tingung/Projects/github/llm-proxy')
 import pytest
 
 from llm_proxy.protocol.ir import REGISTRY, _resolve
-from llm_proxy.protocol.ir.responses import _extract_dsl_from_raw
 
 
 class MockResp:
@@ -43,46 +43,20 @@ def _make_args_chunk(args_str: str) -> str:
     return f"data: {json.dumps(data)}"
 
 
-# ── 单元测试：_extract_dsl_from_raw helper ──
-
-
-def test_extract_dsl_literal_newlines():
-    """MiniMax M3 实际发送的字面 \\n JSON。"""
-    raw = '{"input": "*** Begin Patch\n*** Add File: /tmp/x\n+hi\n*** End Patch"}'
-    got = _extract_dsl_from_raw(raw)
-    assert "*** Begin Patch" in got
-    assert "*** End Patch" in got
-
-
-def test_extract_dsl_escaped_newlines():
-    """正常 JSON（\\\\n）。"""
-    raw = '{"input": "*** Begin Patch\\n*** Add File: /tmp/x\\n+hi\\n*** End Patch"}'
-    got = _extract_dsl_from_raw(raw)
-    assert "*** Begin Patch" in got
-    assert "*** End Patch" in got
-
-
-def test_extract_dsl_empty():
-    assert _extract_dsl_from_raw("") == ""
-
-
-def test_extract_dsl_no_input_field():
-    assert _extract_dsl_from_raw('{"foo": "bar"}') == ""
-
-
-# ── 集成测试：完整 stream 流程 ──
-
-
-async def test_minimax_apply_patch_with_literal_newlines_in_stream():
-    """完整重现 Codex→minimax-m3 stream_error 的根因场景。"""
-    raw_args = '{"input": "*** Begin Patch\n*** Add File: /tmp/test.txt\n+hello\n*** End Patch"}'
+async def test_minimax_apply_patch_structured_params_in_stream():
+    """apply_patch 调用使用结构化参数，反向转换为 DSL。"""
+    args = json.dumps({
+        "action": "add_file",
+        "filePath": "/tmp/test.txt",
+        "content": "hello",
+    })
 
     upstream_lines = [
         'data: {"id":"chatcmpl-x","model":"MiniMax-M3","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}',
         '',
         'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc123","type":"function","function":{"name":"apply_patch","arguments":""}}]}}]}',
         '',
-        _make_args_chunk(raw_args),
+        _make_args_chunk(args),
         '',
         'data: {"choices":[{"index":0,"finish_reason":"tool_calls"}]}',
         '',
@@ -104,7 +78,6 @@ async def test_minimax_apply_patch_with_literal_newlines_in_stream():
     ):
         chunks.append(chunk.decode())
 
-    # Find the output_item.done chunk for apply_patch
     apply_patch_done = None
     for c in chunks:
         if 'custom_tool_call' in c and 'output_item.done' in c:
@@ -113,12 +86,10 @@ async def test_minimax_apply_patch_with_literal_newlines_in_stream():
 
     assert apply_patch_done is not None, "No custom_tool_call output_item.done found"
 
-    # Extract the input value
     data_line = [l for l in apply_patch_done.split('\n') if l.startswith('data: ')][0]
     payload = json.loads(data_line[6:])
     input_value = payload['item']['input']
 
-    # DSL 应该完整出现在 input 中（修复前是空字符串）
     assert '*** Begin Patch' in input_value, f"DSL marker missing: {input_value!r}"
     assert '*** Add File: /tmp/test.txt' in input_value
     assert '+hello' in input_value
@@ -126,9 +97,5 @@ async def test_minimax_apply_patch_with_literal_newlines_in_stream():
 
 
 if __name__ == "__main__":
-    asyncio.run(test_minimax_apply_patch_with_literal_newlines_in_stream())
-    test_extract_dsl_literal_newlines()
-    test_extract_dsl_escaped_newlines()
-    test_extract_dsl_empty()
-    test_extract_dsl_no_input_field()
+    asyncio.run(test_minimax_apply_patch_structured_params_in_stream())
     print("All tests passed")

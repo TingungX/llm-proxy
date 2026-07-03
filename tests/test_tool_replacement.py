@@ -15,15 +15,15 @@ class TestApplyPatchToolDescription:
         assert len(APPLY_PATCH_TOOL_DESCRIPTION) > 50
 
     def test_mentions_add_update_delete_actions(self):
-        for kw in ("Add File", "Update File", "Delete File"):
+        for kw in ("add_file", "update_file", "delete_file"):
             assert kw in APPLY_PATCH_TOOL_DESCRIPTION
 
-    def test_mentions_plus_prefix_rule(self):
-        assert "plus" in APPLY_PATCH_TOOL_DESCRIPTION.lower()
-        assert "minus" in APPLY_PATCH_TOOL_DESCRIPTION.lower()
+    def test_mentions_structured_params_and_actions(self):
+        assert "structured parameters" in APPLY_PATCH_TOOL_DESCRIPTION.lower()
+        assert "action" in APPLY_PATCH_TOOL_DESCRIPTION.lower()
 
-    def test_mentions_move_to_rename(self):
-        assert "Move to" in APPLY_PATCH_TOOL_DESCRIPTION
+    def test_mentions_batch_mode(self):
+        assert "batch" in APPLY_PATCH_TOOL_DESCRIPTION.lower()
 
     def test_under_1500_characters(self):
         assert len(APPLY_PATCH_TOOL_DESCRIPTION) < 1500
