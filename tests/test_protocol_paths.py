@@ -30,20 +30,21 @@ def test_resolve_path_returns_empty_for_unknown_key():
 
 def test_existing_anthropic_model_gets_legacy_path_injected():
     from llm_proxy.state import State
-    cfg = {"models": {"claude-opus-4-7": {"api_base": "https://api.anthropic.com", "api_key": "sk-test", "upstream_protocol": "anthropic"}}}
+    cfg = {"models": {"claude-opus-4-7": {"api_base": "https://api.anthropic.com", "api_key": "sk-test", "upstream_protocols": [{"protocol": "anthropic", "enabled": True, "path": "/v1/messages"}]}}}
     paths_map = State._build_paths_map(cfg)
     assert paths_map["claude-opus-4-7"]["anthropic/messages"] == "/v1/messages"
 
 
 def test_model_with_explicit_paths_not_overridden():
     from llm_proxy.state import State
-    cfg = {"models": {"my-model": {"api_base": "https://example.com", "api_key": "sk-test", "upstream_protocol": "anthropic", "upstream_paths": {"anthropic/messages": "custom/v1/messages"}}}}
+    cfg = {"models": {"my-model": {"api_base": "https://example.com", "api_key": "sk-test", "upstream_protocols": [{"protocol": "anthropic", "enabled": True, "path": "custom/v1/messages"}]}}}
     paths_map = State._build_paths_map(cfg)
     assert paths_map["my-model"]["anthropic/messages"] == "custom/v1/messages"
 
 
 def test_non_anthropic_model_not_injected():
     from llm_proxy.state import State
-    cfg = {"models": {"gpt-4": {"api_base": "https://api.openai.com", "api_key": "sk-test", "upstream_protocol": "openai"}}}
+    cfg = {"models": {"gpt-4": {"api_base": "https://api.openai.com", "api_key": "sk-test", "upstream_protocols": [{"protocol": "openai/chat-completions", "enabled": True, "path": "/v1/chat/completions"}]}}}
     paths_map = State._build_paths_map(cfg)
-    assert "gpt-4" not in paths_map
+    assert "gpt-4" in paths_map
+    assert "anthropic/messages" not in paths_map["gpt-4"]

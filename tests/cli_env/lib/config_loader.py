@@ -87,10 +87,9 @@ def make_openai_model_config(
         "context_window": context_window,
         "display_name": display_name,
         "vision_support": vision_support,
-        "upstream_paths": {
-            "openai/chat-completions": "/v1/chat/completions",
-        },
-        "upstream_protocols": ["openai"],
+        "upstream_protocols": [
+            {"protocol": "openai/chat-completions", "enabled": True, "path": "/v1/chat/completions"},
+        ],
     }
 
 
@@ -110,11 +109,10 @@ def make_anthropic_model_config(
         "context_window": context_window,
         "display_name": display_name,
         "vision_support": vision_support,
-        "upstream_paths": {
-            "anthropic/messages": "anthropic/v1/messages",
-            "openai/chat-completions": "/v1/chat/completions",
-        },
-        "upstream_protocols": ["openai/chat-completions", "anthropic"],
+        "upstream_protocols": [
+            {"protocol": "openai/chat-completions", "enabled": True, "path": "/v1/chat/completions"},
+            {"protocol": "anthropic", "enabled": True, "path": "anthropic/v1/messages"},
+        ],
     }
 
 
@@ -133,9 +131,8 @@ def make_dual_model_config(
         "context_window": context_window,
         "display_name": display_name,
         "vision_support": True,
-        "upstream_paths": {
-            "anthropic/messages": "anthropic/v1/messages",
-            "openai/chat-completions": "/v1/chat/completions",
-        },
-        "upstream_protocols": ["anthropic", "openai"],
+        "upstream_protocols": [
+            {"protocol": "anthropic", "enabled": True, "path": "anthropic/v1/messages"},
+            {"protocol": "openai/chat-completions", "enabled": True, "path": "/v1/chat/completions"},
+        ],
     }

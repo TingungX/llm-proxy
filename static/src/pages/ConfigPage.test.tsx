@@ -25,7 +25,9 @@ const sampleConfig: Config = {
       api_key: 'sk-test-1',
       upstream_model: 'opus-4-7',
       display_name: 'Claude Opus 4.7',
-      upstream_protocol: 'anthropic',
+      upstream_protocols: [
+        { protocol: 'anthropic', enabled: true, path: '/v1/messages' },
+      ],
       context_window: 200000,
     },
     'gpt-5': {
@@ -33,12 +35,15 @@ const sampleConfig: Config = {
       api_key: 'sk-test-2',
       upstream_model: 'gpt-5',
       display_name: 'GPT-5',
-      upstream_paths: { 'openai/chat-completions': '/v1/chat/completions' },
+      upstream_protocols: [
+        { protocol: 'openai/chat-completions', enabled: true, path: '/v1/chat/completions' },
+      ],
     },
     'deepseek-v4': {
       api_base: 'https://api.deepseek.com',
       api_key: 'sk-test-3',
       upstream_model: 'deepseek-v4',
+      upstream_protocols: [],
       context_window: 128000,
     },
   },

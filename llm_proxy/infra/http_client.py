@@ -34,7 +34,7 @@ def _build_client(proxy: httpx.Proxy | None) -> httpx.AsyncClient:
         keepalive_expiry=_KEEPALIVE_EXPIRY,
     )
     if proxy is None:
-        return httpx.AsyncClient(timeout=_TIMEOUT, limits=limits, trust_env=False)
+        return httpx.AsyncClient(timeout=_TIMEOUT, limits=limits, trust_env=False, follow_redirects=True)
     return httpx.AsyncClient(timeout=_TIMEOUT, limits=limits, proxy=proxy, trust_env=False)
 
 

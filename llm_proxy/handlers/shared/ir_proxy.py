@@ -19,6 +19,9 @@ import time
 import uuid
 from typing import AsyncIterator
 
+import socket
+
+import httpx
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from llm_proxy.handlers.base import HandlerStep, PipelineContext
@@ -40,6 +43,79 @@ def _make_error(ctx: PipelineContext, message: str, error_type: str = "api_error
     if ctx.error_protocol == "anthropic":
         return make_anthropic_error(message, error_type, status_code)
     return make_openai_error(message, error_type, status_code)
+
+
+def _classify_stream_error(e: Exception) -> str:
+    """根据异常类型分类流式错误，返回细粒度的 error_type。
+
+    分类优先级（从上到下匹配）：
+    1. DNS 解析失败 → upstream_dns_error
+    2. 连接超时 → upstream_timeout
+    3. TCP/TLS 连接失败 → upstream_connect_error
+    4. HTTP 超时 → upstream_timeout
+    5. HTTP 错误（4xx/5xx 响应体解析失败等）→ upstream_http_error
+    6. 其他 → stream_error
+    """
+
+    def _has_dns_error_in_chain(exc: BaseException | None) -> bool:
+        """递归检查异常链中是否有 DNS 解析失败（gaierror 或 errno 为 -2/8）。"""
+        if exc is None:
+            return False
+        if isinstance(exc, socket.gaierror):
+            return True
+        if isinstance(exc, OSError):
+            errno = getattr(exc, "errno", None)
+            # -2: Linux EAI_NONAME (Name or service not known)
+            # 8:  macOS EAI_NONAME (nodename nor servname provided, or not known)
+            if errno in (-2, 8):
+                return True
+        return _has_dns_error_in_chain(getattr(exc, "__cause__", None))
+
+    # DNS 解析失败
+    if isinstance(e, socket.gaierror):
+        return "upstream_dns_error"
+
+    # httpx 异常
+    if isinstance(e, httpx.ConnectError):
+        if _has_dns_error_in_chain(getattr(e, "__cause__", None)):
+            return "upstream_dns_error"
+        return "upstream_connect_error"
+
+    if isinstance(e, httpx.TimeoutException):
+        return "upstream_timeout"
+
+    if isinstance(e, httpx.HTTPStatusError):
+        return "upstream_http_error"
+
+    # 底层 socket/OS 错误
+    if isinstance(e, (socket.timeout, TimeoutError)):
+        return "upstream_timeout"
+
+    if isinstance(e, OSError):
+        errno = getattr(e, "errno", None)
+        # -2: Linux EAI_NONAME (Name or service not known)
+        # 8:  macOS EAI_NONAME (nodename nor servname provided, or not known)
+        if errno in (-2, 8):
+            return "upstream_dns_error"
+        # 连接被拒绝 / 网络不可达等
+        if errno in (61, 64, 65, 111):  # ECONNREFUSED, EHOSTDOWN, EHOSTUNREACH, ECONNREFUSED
+            return "upstream_connect_error"
+
+    # 兜底
+    return "stream_error"
+
+
+def _estimate_input_tokens(body: dict) -> int:
+    """从请求体估算 input tokens（上游未返回 usage 时的回退）。
+
+    使用字符数 / 4 的粗略估算（英文约 4 chars/token，中文约 1.5 chars/token，
+    取保守值 4 作为统一估算）。至少返回 1。
+    """
+    try:
+        text = json.dumps(body, ensure_ascii=False)
+        return max(1, len(text) // 4)
+    except (TypeError, ValueError):
+        return 1
 
 
 def _client_for(model_id: str | None):
@@ -95,8 +171,14 @@ class IRProxyStep(HandlerStep):
         # ── 路径解析 ──
         api_base, upstream_api_key, actual_model, _, _, _ = ctx.resolved
         model_paths = s.paths_map.get(model_id.lower(), {})
-        target_path = resolve_path(model_paths, _resolve(upstream_protocol))
-        target_url = f"{api_base.rstrip('/')}{target_path}"
+        # "anthropic" 是协议名，但 path key 需要 "anthropic/messages" 才能匹配
+        # upstream_paths 和 DEFAULT_PATHS 中的完整路径键名。
+        # openai/chat-completions 和 openai/responses 的协议名本身就是 path key。
+        path_key = _resolve(upstream_protocol)
+        if path_key == "anthropic":
+            path_key = "anthropic/messages"
+        target_path = resolve_path(model_paths, path_key)
+        target_url = f"{api_base.rstrip('/')}/{target_path.lstrip('/')}"
 
         # ── IR 转换 ──
         client_proto = _resolve(self.client_protocol)
@@ -173,9 +255,9 @@ class IRProxyStep(HandlerStep):
             self._record_usage(ctx, 0, 0, status="error", error_type="non_json")
             raise
 
-        if resp.status_code >= 400:
+        if resp.status_code >= 300:
             self._record_usage(ctx, 0, 0, status="error", error_type=f"upstream_{resp.status_code}")
-            # 透传上游错误响应（保留原始 status_code 和 body）
+            # 透传上游错误/重定向响应
             ctx.response = JSONResponse(
                 upstream_resp_body if isinstance(upstream_resp_body, dict) else {"error": {"message": str(upstream_resp_body)}},
                 status_code=resp.status_code,
@@ -218,6 +300,10 @@ class IRProxyStep(HandlerStep):
         accumulated_input = 0
         accumulated_output = 0
         had_error = False
+        error_type = "stream_error"  # 默认错误类型，会被 except 块覆盖
+
+        # 预计算 input tokens 估算值（上游未返回 usage 时回退用）
+        estimated_input_fallback = _estimate_input_tokens(upstream_body)
 
         async def _intercept_events(
             events: AsyncIterator[IRStreamEvent],
@@ -281,7 +367,8 @@ class IRProxyStep(HandlerStep):
                     yield sse_chunk
 
         except Exception as e:
-            logger.error(f"IR stream error: {e}", exc_info=True)
+            error_type = _classify_stream_error(e)
+            logger.error(f"IR stream error ({error_type}): {e}", exc_info=True)
             had_error = True
             err_events = _err_event_gen(
                 {"message": f"Proxy error: {type(e).__name__}: {e}"},
@@ -293,18 +380,19 @@ class IRProxyStep(HandlerStep):
             ):
                 yield chunk
         finally:
-            # 记录 usage
+            # 记录 usage：上游未返回 usage 时，用请求体内容估算 input tokens
             status = "error" if had_error else "success"
-            estimated_input = accumulated_input or 1
+            # 如果上游没有返回 usage，用预计算的估算值；否则用实际值
+            final_input = accumulated_input if accumulated_input > 0 else estimated_input_fallback
             rctx = ctx.extra.get("_record_ctx", {}) if ctx.extra else {}
             try:
                 db.record_usage(
                     endpoint_id=endpoint_id,
                     model_id=model_id,
-                    input_tokens=estimated_input,
+                    input_tokens=final_input,
                     output_tokens=accumulated_output,
                     status=status,
-                    error_type="stream_error" if had_error else None,
+                    error_type=error_type if had_error else None,
                     request_id=rctx.get("request_id", ""),
                     client_ip=rctx.get("client_ip", ""),
                     user_agent=rctx.get("user_agent", ""),
@@ -355,6 +443,5 @@ async def _err_event_gen(err_data: dict, client_protocol: str):
             "code": err_data.get("error", {}).get("code", "api_error") if isinstance(err_data.get("error"), dict) else "api_error",
         },
     )
-
 
 

@@ -31,8 +31,8 @@ IMPLEMENTED_CONVERSIONS: tuple[tuple[str, str], ...] = (
     ("anthropic", "openai/chat-completions"),
     ("openai/responses", "openai/chat-completions"),
     ("openai/chat-completions", "openai/responses"),
-    ("anthropic", "openai/responses"),
     ("openai/responses", "anthropic"),
+    ("anthropic", "openai/responses"),
 )
 
 

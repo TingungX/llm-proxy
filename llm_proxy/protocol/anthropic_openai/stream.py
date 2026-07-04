@@ -104,13 +104,11 @@ async def create_anthropic_sse_stream(resp, model: str, on_event=None) -> bytes:
                 logger.warning(f"Failed to parse SSE chunk: {data_str[:100]}")
                 continue
 
-            # 提取 chunk 元数据
+            # 提取 chunk 元数据 — 注意：不能从上游 SSE 读取 model 字段覆盖 current_model，
+            # current_model 必须保持为调用方传入的 response_model（客户端期望的模型名）
             chunk_id = chunk.get("id", "")
-            chunk_model = chunk.get("model", "")
             if chunk_id:
                 message_id = chunk_id
-            if chunk_model:
-                current_model = chunk_model
 
             # Usage 处理
             raw_usage = chunk.get("usage")

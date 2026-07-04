@@ -12,6 +12,34 @@ from llm_proxy.infra.http_client import get_client
 logger = logging.getLogger(__name__)
 
 
+def _get_enabled_protocols(model_cfg: dict) -> list[str]:
+    """从模型配置提取启用的协议列表（字符串形式）。
+
+    upstream_protocols = [{protocol: "anthropic", enabled: true, ...}, ...]
+    """
+    protocols = model_cfg.get("upstream_protocols", [])
+    return [e["protocol"] for e in protocols if e.get("enabled", False)]
+
+
+def _build_paths_from_entries(model_cfg: dict) -> dict[str, str]:
+    """从 upstream_protocols 的 entry path 字段构建路径字典。
+
+    {model_id(lower): {"anthropic/messages": "/v1/messages", ...}}
+    只含 enabled 协议，无 enabled 的也包含在内（前端需要保留路径信息）。
+    """
+    result: dict[str, str] = {}
+    for e in model_cfg.get("upstream_protocols", []):
+        proto = e.get("protocol", "")
+        path = (e.get("path") or "").strip()
+        if proto == "anthropic":
+            result["anthropic/messages"] = path or "/v1/messages"
+        elif proto == "openai/chat-completions":
+            result["openai/chat-completions"] = path or "/v1/chat/completions"
+        elif proto == "openai/responses":
+            result["openai/responses"] = path or "/v1/responses"
+    return result
+
+
 # ─── Resolver pure functions (from resolver.py) ────────────────────
 
 def normalize_claude_model(model: str) -> Optional[str]:
@@ -53,19 +81,14 @@ def _get_endpoint_id(api_key: str) -> str:
 def build_model_map(config: dict) -> dict:
     """从 config 构建 {模型名(小写): (api_base, api_key, upstream_model, upstream_protocol)}。
 
-    `upstream_protocol` 字段（标量）迁移后已删除。这里从 `upstream_protocols`
-    集合里取第一个作为"代表协议"用于日志展示，运行时选择逻辑走 protocols_map。
+    从 `upstream_protocols` 取第一个启用的协议作为"代表协议"用于日志展示。
     """
     return {
         k.lower(): (
             v["api_base"],
             v["api_key"],
             v.get("upstream_model"),
-            (
-                (v.get("upstream_protocols") or [None])[0]
-                if v.get("upstream_protocols")
-                else v.get("upstream_protocol")
-            ),
+            (_get_enabled_protocols(v) or [None])[0],
         )
         for k, v in config["models"].items()
     }
@@ -207,40 +230,25 @@ class State:
 
     @staticmethod
     def _build_protocols_map(cfg: dict) -> dict[str, set[str]]:
-        """构建 {model_id(lower): {支持的协议集合}}。
-
-        优先读 `upstream_protocols`（集合），缺失时回退到 `upstream_protocol`
-        标量（迁移期兼容，新代码不应再写标量）。
-        """
+        """构建 {model_id(lower): {启用的协议集合}}。"""
         result: dict[str, set[str]] = {}
         for key, val in cfg.get("models", {}).items():
-            protocols = val.get("upstream_protocols")
-            if protocols is not None:
-                result[key.lower()] = set(protocols)
-                continue
-            p = val.get("upstream_protocol")
-            if p:
-                result[key.lower()] = {p}
+            enabled = _get_enabled_protocols(val)
+            if enabled:
+                result[key.lower()] = set(enabled)
         return result
 
     @staticmethod
     def _build_paths_map(cfg: dict) -> dict[str, dict[str, str]]:
         """从 config 构建 {model_id(lower): {协议路径字典}}。
 
-        优先读 `upstream_paths` 显式路径映射；若缺失但模型支持 anthropic 协议
-        （从 upstream_protocols 集合判断），补默认 `/v1/messages`。
+        从 upstream_protocols 的 entry.path 读取。
         """
         result: dict[str, dict[str, str]] = {}
         for key, val in cfg.get("models", {}).items():
-            paths = val.get("upstream_paths")
+            paths = _build_paths_from_entries(val)
             if paths:
                 result[key.lower()] = paths
-                continue
-            protocols = val.get("upstream_protocols") or (
-                [val["upstream_protocol"]] if val.get("upstream_protocol") else []
-            )
-            if "anthropic" in protocols:
-                result[key.lower()] = {"anthropic/messages": "/v1/messages"}
         return result
 
     @staticmethod

@@ -1,12 +1,16 @@
 // ===== Config =====
+export interface ProtocolEntry {
+  protocol: string;
+  enabled: boolean;
+  path?: string;
+}
+
 export interface ModelConfig {
   api_base: string;
   api_key: string;
   upstream_model: string;
   display_name?: string;
-  upstream_protocol?: string;
-  upstream_protocols?: string[];
-  upstream_paths?: Record<string, string>;
+  upstream_protocols?: ProtocolEntry[];
   context_window?: number;
   vision_support?: boolean;
   allow_proxy?: boolean;
@@ -143,7 +147,6 @@ export interface LatencyResult {
 
 // ===== Protocol Detection =====
 export interface ProtocolDetectionResult {
-  upstream_protocol: string;
-  upstream_protocols?: string[];
+  upstream_protocols?: ProtocolEntry[];
   error?: string;
 }

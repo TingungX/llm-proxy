@@ -7,10 +7,23 @@ from fastapi.responses import JSONResponse
 
 from llm_proxy.main import app
 from llm_proxy.config_loader import save_config
-from llm_proxy.protocol.detector import detect_upstream_protocols, get_protocol_path
+from llm_proxy.protocol.detector import detect_upstream_protocols
 from llm_proxy.state import get_state
 
 logger = logging.getLogger(__name__)
+
+
+def _entries_from_protocols(protocols: list[str]) -> list[dict]:
+    """将探测到的协议列表转换为新版 entry 格式。"""
+    path_defaults = {
+        "anthropic": "/v1/messages",
+        "openai/chat-completions": "/v1/chat/completions",
+        "openai/responses": "/v1/responses",
+    }
+    return [
+        {"protocol": p, "enabled": True, "path": path_defaults.get(p, "/v1/" + p.split("/")[-1])}
+        for p in protocols
+    ]
 
 
 @app.get("/api/config")
@@ -42,11 +55,9 @@ async def api_update_model(model_id: str, request: Request):
             model_cfg.pop(key, None)
         else:
             model_cfg[key] = value
-    # 对齐 api_detect_provider_protocol：当请求里给出 upstream_protocols 列表时，
-    # 主动 pop 掉标量旧字段 upstream_protocol，避免两套值并存（运行时按列表走、
-    # 前端按标量显示，分裂越演越烈）。
     if body.get("upstream_protocols") is not None:
         model_cfg.pop("upstream_protocol", None)
+        model_cfg.pop("upstream_paths", None)
     save_config(s.config)
     await s.reload()
     logger.info(f"Model {model_id} updated")
@@ -90,7 +101,7 @@ async def api_detect_protocol(request: Request):
     return {
         "status": "ok",
         "upstream_protocol": protocols[0],
-        "upstream_protocols": protocols,
+        "upstream_protocols": _entries_from_protocols(protocols),
     }
 
 
@@ -115,22 +126,18 @@ async def api_detect_provider_protocol(model_id: str):
             status_code=400
         )
     
-    # 更新 config.json：探测结果**整个集合**覆盖到 upstream_protocols
-    # 不再写 upstream_protocol 标量字段（迁移后已删除）
+    # 更新 config.json：探测结果写入新版 entry 格式
     s = get_state()
     if model_id in s.config["models"]:
-        s.config["models"][model_id]["upstream_protocols"] = sorted(set(protocols))
-        # 兼容期：探测时如果原来有标量也清掉
+        entries = _entries_from_protocols(protocols)
+        s.config["models"][model_id]["upstream_protocols"] = entries
         s.config["models"][model_id].pop("upstream_protocol", None)
-        s.config["models"][model_id]["upstream_paths"] = {
-            p: (get_protocol_path(api_base, p) or "/v1/" + p.split("/")[-1])
-            for p in protocols
-        }
+        s.config["models"][model_id].pop("upstream_paths", None)
         save_config(s.config)
     await s.reload()
 
     return {
         "status": "ok",
         "model_id": model_id,
-        "upstream_protocols": sorted(set(protocols)),
+        "upstream_protocols": _entries_from_protocols(protocols),
     }

@@ -7,7 +7,7 @@ import { showToast } from '../components/Toast';
 import { ApiCallError } from '../api/client';
 import { useFormState } from '../hooks/useFormState';
 import { togglePasswordVisibility } from '../utils/clipboard';
-import { toUpstreamProtocols, toUpstreamPaths } from '../utils/protocol';
+import { toUpstreamProtocols, extractProtocolConfig } from '../utils/protocol';
 import { Modal } from '../components/Modal';
 import { Field } from '../components/Field';
 import { ProtocolChip } from '../components/ProtocolChip';
@@ -48,13 +48,7 @@ function getInitialValues(name: string | null): ModelFormValues {
         if (m.context_window >= 1_000_000) { cw = String(m.context_window / 1_000_000); cwUnit = '1000000'; }
         else { cw = String(m.context_window / 1000); cwUnit = '1000'; }
       }
-      const paths = m.upstream_paths ?? {};
-      // 优先读上游协议列表（新格式）；缺失时回退到标量（迁移期兼容）
-      const protocols = new Set<string>(
-        m.upstream_protocols ?? (m.upstream_protocol ? [m.upstream_protocol] : [])
-      );
-      // 旧标量 'openai' 等价于 'openai/chat-completions'（向后兼容映射）
-      const openaiChat = protocols.has('openai') || protocols.has('openai/chat-completions') || !!paths['openai/chat-completions'];
+      const pc = extractProtocolConfig(m);
       return {
         ...base,
         name,
@@ -63,12 +57,12 @@ function getInitialValues(name: string | null): ModelFormValues {
         apiKey: m.api_key ?? '',
         contextWindow: cw,
         contextWindowUnit: cwUnit,
-        chipAnthropic: protocols.has('anthropic') || !!paths['anthropic/messages'],
-        chipOpenaiChat: openaiChat,
-        chipOpenaiResponses: protocols.has('openai/responses') || !!paths['openai/responses'],
-        pathAnthropic: paths['anthropic/messages'] ?? '',
-        pathOpenaiChat: paths['openai/chat-completions'] ?? '',
-        pathOpenaiResponses: paths['openai/responses'] ?? '',
+        chipAnthropic: pc.enabled.anthropic,
+        chipOpenaiChat: pc.enabled.openai_chat,
+        chipOpenaiResponses: pc.enabled.openai_responses,
+        pathAnthropic: pc.paths.anthropic,
+        pathOpenaiChat: pc.paths.openai_chat,
+        pathOpenaiResponses: pc.paths.openai_responses,
         visionSupport: m.vision_support ?? false,
         allowProxy: m.allow_proxy ?? false,
       };
@@ -104,8 +98,6 @@ export function ModelModal() {
       vision_support: v.visionSupport || undefined,
       allow_proxy: v.allowProxy || undefined,
     };
-    const paths = toUpstreamPaths(pc);
-    if (Object.keys(paths).length > 0) data.upstream_paths = paths;
     try {
       await form.handleSubmit(async () => {
         await saveModel(v.name, data);
@@ -124,14 +116,24 @@ export function ModelModal() {
     if (!v.apiKey) { showToast('请先填写 API Key', 'err'); return; }
     try {
       const result = await apiDetectProtocol(v.apiBase, v.apiKey);
-      // 后端返回 upstream_protocols: ["anthropic" | "openai/chat-completions" | "openai/responses", ...]
-      // 分别映射到三个 chip
-      const protocols = result.upstream_protocols ?? (result.upstream_protocol ? [result.upstream_protocol] : []);
-      form.setField('chipAnthropic', protocols.includes('anthropic'));
-      form.setField('chipOpenaiChat', protocols.includes('openai/chat-completions'));
-      form.setField('chipOpenaiResponses', protocols.includes('openai/responses'));
-      const labels = protocols.map(p => p === 'anthropic' ? 'Anthropic' : p === 'openai/chat-completions' ? 'OpenAI Chat' : 'OpenAI Responses');
-      showToast(protocols.length ? `已检测: ${labels.join('、')}` : '未检测到协议', protocols.length ? 'ok' : 'err');
+      const entries = result.upstream_protocols ?? [];
+      for (const e of entries) {
+        if (e.protocol === 'anthropic') {
+          form.setField('chipAnthropic', e.enabled);
+          if (e.path) form.setField('pathAnthropic', e.path);
+        } else if (e.protocol === 'openai/chat-completions') {
+          form.setField('chipOpenaiChat', e.enabled);
+          if (e.path) form.setField('pathOpenaiChat', e.path);
+        } else if (e.protocol === 'openai/responses') {
+          form.setField('chipOpenaiResponses', e.enabled);
+          if (e.path) form.setField('pathOpenaiResponses', e.path);
+        }
+      }
+      const labels: string[] = [];
+      if (form.values.value.chipAnthropic) labels.push('Anthropic');
+      if (form.values.value.chipOpenaiChat) labels.push('OpenAI Chat');
+      if (form.values.value.chipOpenaiResponses) labels.push('OpenAI Responses');
+      showToast(labels.length ? `已检测: ${labels.join('、')}` : '未检测到协议', labels.length ? 'ok' : 'err');
     } catch (e) {
       showToast(e instanceof ApiCallError ? e.detail : '检测失败', 'err');
     }
