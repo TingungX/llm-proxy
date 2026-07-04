@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -37,6 +38,11 @@ from llm_proxy.state import get_state
 from llm_proxy.logging_config import REQUEST_ID_CTX
 
 logger = logging.getLogger(__name__)
+
+# 单条请求重试：仅对 429/503，且仅在「未向下游 flush 任何 chunk」阶段重试。
+# 指数退避：1s / 2s / 4s，最多 3 次（共 4 次请求）。
+_RETRY_STATUSES = (429, 503)
+_RETRY_MAX = 3
 
 
 def _make_error(ctx: PipelineContext, message: str, error_type: str = "api_error", status_code: int = 400):
@@ -240,12 +246,29 @@ class IRProxyStep(HandlerStep):
         endpoint_id = endpoint["endpoint_id"]
         client_proto = _resolve(self.client_protocol)
 
-        try:
-            resp = await client.post(target_url, json=upstream_body, headers=req_headers, timeout=120.0)
-        except Exception as e:
-            logger.error(f"IR proxy request error: {e}", exc_info=True)
-            self._record_usage(ctx, 0, 0, status="error", error_type="proxy_error")
-            raise
+        # ── 单条请求 retry：仅 429/503，仅在拿到响应头后（未向下游写任何字节）重试 ──
+        resp = None
+        for attempt in range(_RETRY_MAX + 1):
+            try:
+                client = _client_for(model_id)
+                resp = await client.post(target_url, json=upstream_body, headers=req_headers, timeout=120.0)
+            except Exception as e:
+                # 连接级异常（DNS/超时/连接失败）在未 flush 阶段也可安全重试
+                if attempt < _RETRY_MAX and not isinstance(e, (httpx.HTTPStatusError,)):
+                    wait = 2 ** attempt
+                    logger.warning(f"IR non-stream connect error: {e}, retrying in {wait}s (attempt {attempt + 1}/{_RETRY_MAX + 1})")
+                    await asyncio.sleep(wait)
+                    continue
+                logger.error(f"IR proxy request error: {e}", exc_info=True)
+                self._record_usage(ctx, 0, 0, status="error", error_type=_classify_stream_error(e))
+                raise
+            # 429/503 重试
+            if resp.status_code in _RETRY_STATUSES and attempt < _RETRY_MAX:
+                wait = 2 ** attempt
+                logger.warning(f"IR non-stream upstream {resp.status_code}, retrying in {wait}s (attempt {attempt + 1}/{_RETRY_MAX + 1})")
+                await asyncio.sleep(wait)
+                continue
+            break
 
         try:
             upstream_resp_body = resp.json()
@@ -325,60 +348,95 @@ class IRProxyStep(HandlerStep):
         # 错误状态变量（用闭包）
         stop_reason = "end_turn"
 
+        # ── 单条请求 retry ──
+        # 安全边界：429/503 或连接级异常一定出现在「首 chunk 之前」——
+        # 此时还未向下游 yield 任何 chunk（下游 yield 在 status_code 检查通过之后），
+        # 因此 retry 不会导致下游收到重复/截断的流。
+        # 一旦进入 SSE body 遍历（下面的 async for）就不再 retry，任何异常走 except。
+        #
+        # 控制流：外层 try/finally 保证 usage 记录；for 内 try/except 处理单次请求；
+        # 所有错误路径 yield error event 后 return（终止生成器，触发 finally）。
         try:
-            async with client.stream(
-                "POST", target_url, json=upstream_body, headers=req_headers, timeout=120.0
-            ) as resp:
-                logger.debug(f"IR proxy stream response status: {resp.status_code}")
-                if resp.status_code >= 400:
-                    # 错误处理：发 error event 给客户端
-                    error_body = await resp.aread()
-                    error_text = error_body.decode("utf-8", errors="replace")
-                    logger.error(f"Upstream stream error {resp.status_code}: {error_text[:500]}")
+            for attempt in range(_RETRY_MAX + 1):
+                try:
+                    client = _client_for(model_id)
+                    async with client.stream(
+                        "POST", target_url, json=upstream_body, headers=req_headers, timeout=120.0
+                    ) as resp:
+                        logger.debug(f"IR proxy stream response status: {resp.status_code}")
+                        # 429/503：在向下游 flush 任何东西之前，可安全重试
+                        if resp.status_code in _RETRY_STATUSES and attempt < _RETRY_MAX:
+                            # 先读完响应体以释放连接，再退避
+                            await resp.aread()
+                            wait = 2 ** attempt
+                            logger.warning(f"IR stream upstream {resp.status_code}, retrying in {wait}s (attempt {attempt + 1}/{_RETRY_MAX + 1})")
+                            await asyncio.sleep(wait)
+                            continue
+
+                        if resp.status_code >= 400:
+                            # 错误处理：发 error event 给客户端
+                            error_body = await resp.aread()
+                            error_text = error_body.decode("utf-8", errors="replace")
+                            logger.error(f"Upstream stream error {resp.status_code}: {error_text[:500]}")
+                            had_error = True
+                            err_data: dict = {}
+                            try:
+                                err_data = json.loads(error_text)
+                            except json.JSONDecodeError:
+                                err_data = {"message": error_text}
+                            # 发一个 error IR event
+                            err_events = _err_event_gen(err_data, self.client_protocol)
+                            async for chunk in REGISTRY[client_proto].format_ir_as_sse(
+                                err_events,
+                                ctx.response_model or actual_model,
+                            ):
+                                yield chunk
+                            return
+
+                        # 上游 SSE → IR events（带拦截）
+                        raw_events = REGISTRY[upstream_proto].parse_stream_to_ir(resp, actual_model)
+                        intercepted_events = _intercept_events(raw_events)
+
+                        # 客户端 SSE formatter（带 reverse_tool_map / tool_spec_map）
+                        sse_bytes = REGISTRY[client_proto].format_ir_as_sse(
+                            intercepted_events,
+                            ctx.response_model or actual_model,
+                            reverse_tool_map=ir_request.extensions.get("reverse_tool_map"),
+                            tool_spec_map=ir_request.extensions.get("tool_spec_map"),
+                        )
+
+                        # keepalive 包装：每 15s 无数据发心跳
+                        async for sse_chunk in keepalive_wrapper(sse_bytes, interval=15.0):
+                            yield sse_chunk
+                        return
+
+                except Exception as e:
+                    # 连接级异常（DNS/超时/连接失败）在未 flush 阶段可安全重试；
+                    # 但若已经进入 SSE body 遍历后抛出的异常，则不应重试（下游可能已收到部分 chunk）。
+                    # 这里无法精确区分，保守做法：仅当 attempt < _RETRY_MAX 且未向下游 yield 过时重试。
+                    # 由于 yield 都发生在 status_code 检查通过之后，连接级异常（在拿到 resp 之前）
+                    # 一定属于「未 flush」，可安全重试。
+                    if attempt < _RETRY_MAX and isinstance(
+                        e, (httpx.ConnectError, httpx.TimeoutException, socket.gaierror, socket.timeout, OSError)
+                    ):
+                        wait = 2 ** attempt
+                        logger.warning(f"IR stream connect error: {e}, retrying in {wait}s (attempt {attempt + 1}/{_RETRY_MAX + 1})")
+                        await asyncio.sleep(wait)
+                        continue
+                    # 不可重试：发 error event 给客户端后终止
+                    error_type = _classify_stream_error(e)
+                    logger.error(f"IR stream error ({error_type}): {e}", exc_info=True)
                     had_error = True
-                    err_data: dict = {}
-                    try:
-                        err_data = json.loads(error_text)
-                    except json.JSONDecodeError:
-                        err_data = {"message": error_text}
-                    # 发一个 error IR event
-                    err_events = _err_event_gen(err_data, self.client_protocol)
+                    err_events = _err_event_gen(
+                        {"message": f"Proxy error: {type(e).__name__}: {e}"},
+                        self.client_protocol,
+                    )
                     async for chunk in REGISTRY[client_proto].format_ir_as_sse(
                         err_events,
                         ctx.response_model or actual_model,
                     ):
                         yield chunk
                     return
-
-                # 上游 SSE → IR events（带拦截）
-                raw_events = REGISTRY[upstream_proto].parse_stream_to_ir(resp, actual_model)
-                intercepted_events = _intercept_events(raw_events)
-
-                # 客户端 SSE formatter（带 reverse_tool_map / tool_spec_map）
-                sse_bytes = REGISTRY[client_proto].format_ir_as_sse(
-                    intercepted_events,
-                    ctx.response_model or actual_model,
-                    reverse_tool_map=ir_request.extensions.get("reverse_tool_map"),
-                    tool_spec_map=ir_request.extensions.get("tool_spec_map"),
-                )
-
-                # keepalive 包装：每 15s 无数据发心跳
-                async for sse_chunk in keepalive_wrapper(sse_bytes, interval=15.0):
-                    yield sse_chunk
-
-        except Exception as e:
-            error_type = _classify_stream_error(e)
-            logger.error(f"IR stream error ({error_type}): {e}", exc_info=True)
-            had_error = True
-            err_events = _err_event_gen(
-                {"message": f"Proxy error: {type(e).__name__}: {e}"},
-                self.client_protocol,
-            )
-            async for chunk in REGISTRY[client_proto].format_ir_as_sse(
-                err_events,
-                ctx.response_model or actual_model,
-            ):
-                yield chunk
         finally:
             # 记录 usage：上游未返回 usage 时，用请求体内容估算 input tokens
             status = "error" if had_error else "success"
