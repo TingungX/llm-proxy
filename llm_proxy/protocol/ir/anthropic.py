@@ -201,11 +201,18 @@ def _convert_message_to_ir(role: str, content: Any) -> list[IRMessage]:
             tool_use_id = block.get("tool_use_id", "")
             result_content = block.get("content", "")
             if isinstance(result_content, list):
-                # 嵌套 blocks → 提取文本
-                result_content = "\n".join(
-                    b.get("text", "") for b in result_content
-                    if isinstance(b, dict) and b.get("type") == "text"
-                )
+                # 嵌套 blocks：若仅含 text block 则拼接为字符串；
+                # 若含 image 等非 text block，则保留为 list（round-trip 不丢数据）
+                non_text = [b for b in result_content
+                            if isinstance(b, dict) and b.get("type") != "text"]
+                if non_text:
+                    # 保留原始 list 结构（Anthropic ↔ Anthropic round-trip）
+                    pass
+                else:
+                    result_content = "\n".join(
+                        b.get("text", "") for b in result_content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
             elif not isinstance(result_content, str):
                 result_content = json.dumps(result_content, ensure_ascii=False)
 
@@ -394,13 +401,14 @@ def to_upstream(ir: IRRequest, upstream_model: str | None = None) -> dict[str, A
     # tool_choice
     if ir.tool_choice is not None:
         tc = ir.tool_choice
-        if tc in ("auto", "any", "none"):
-            anthropic_tc = "any" if tc == "required" else tc
-            result["tool_choice"] = anthropic_tc
+        if isinstance(tc, str):
+            # Chat/Responses "required" → Anthropic "any"
+            result["tool_choice"] = "any" if tc == "required" else tc
         elif isinstance(tc, dict) and tc.get("type") == "function":
+            # IR 规范形式（Chat 嵌套）→ Anthropic {"type": "tool", "name": ...}
             result["tool_choice"] = {
                 "type": "tool",
-                "name": tc.get("function", {}).get("name", ""),
+                "name": tc.get("function", {}).get("name", "") or tc.get("name", ""),
             }
         else:
             result["tool_choice"] = tc
@@ -467,6 +475,7 @@ def _message_ir_to_anthropic(msg: IRMessage) -> dict[str, Any]:
             if block.is_error:
                 tr["is_error"] = True
             blocks.append(tr)
+            # 注：content 可以是 str 或 list（含 image 等非 text block 时保留为 list）
 
     if not blocks:
         return {"role": role, "content": ""}

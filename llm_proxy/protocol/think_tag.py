@@ -35,7 +35,6 @@ class ThinkTagStateMachine:
         self.buf: str = ""
         self._reasoning_parts: list[str] = []
         self._content_parts: list[str] = []
-        self._reasoning_drain_buf: str = ""
 
     def reset(self):
         self.state = "none"
@@ -44,7 +43,6 @@ class ThinkTagStateMachine:
         self.buf = ""
         self._reasoning_parts = []
         self._content_parts = []
-        self._reasoning_drain_buf = ""
 
     def feed(self, chunk: str) -> tuple[list[str], list[str]]:
         self._reasoning_parts = []
@@ -68,15 +66,20 @@ class ThinkTagStateMachine:
         return self._reasoning_parts, self._content_parts
 
     def drain(self) -> tuple[str, bool]:
+        """流结束时返回残留 buffer。
+
+        返回 (remaining, to_reasoning)：
+        - to_reasoning=True：state=="inside"，残留 buf 是未闭合 think 内的 partial tag，
+          调用方应作为 reasoning 处理（已在 feed 中通过 _emit_reasoning 发出主体，
+          这里仅返回未匹配的 partial tag 字面量）。
+        - to_reasoning=False：state!="inside"，残留是 leading_ws + buf（partial open tag），
+          调用方应作为 content 处理。
+
+        注意：drain 不返回已通过 _emit_reasoning / _emit_content 发出的内容，避免双倍计数。
+        """
         if self.state == "inside":
-            remaining = self._reasoning_drain_buf
-            self._reasoning_drain_buf = ""
-            if self.buf:
-                if remaining:
-                    remaining = remaining + self.buf
-                else:
-                    remaining = self.buf
-                self.buf = ""
+            remaining = self.buf
+            self.buf = ""
             return remaining, remaining != ""
 
         remaining = self.leading_ws + self.buf
@@ -163,7 +166,6 @@ class ThinkTagStateMachine:
 
         if text:
             self._emit_reasoning(text)
-            self._reasoning_drain_buf = text
 
     def _try_match_tag(self, text: str, pos: int, tag: str) -> tuple[bool, int]:
         end = pos + len(tag)
@@ -199,9 +201,15 @@ def strip_think_tags(text: str) -> tuple[str, str]:
     drain_result, to_reasoning = m.drain()
 
     reasoning = "".join(reasoning_parts)
-    if to_reasoning and drain_result:
-        reasoning = (reasoning + drain_result) if reasoning else drain_result
-
     content = "".join(content_parts)
+
+    # 残留 buffer：feed 中已 emit 主体，这里只处理未匹配的 partial tag
+    # - to_reasoning=True（inside 状态）：partial close tag，作为 reasoning 末尾追加
+    # - to_reasoning=False（outside 状态）：partial open tag / leading_ws，作为 content 末尾追加
+    if drain_result:
+        if to_reasoning:
+            reasoning = reasoning + drain_result
+        else:
+            content = content + drain_result
 
     return reasoning, content

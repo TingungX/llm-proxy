@@ -87,6 +87,9 @@ def extract_usage_tokens(usage: dict) -> dict:
 
     支持 Chat (prompt_tokens/completion_tokens) 和 Responses (input_tokens/output_tokens)
     和 Anthropic (input_tokens/output_tokens)。
+
+    保留 Anthropic 的 cache token 字段（cache_read_input_tokens / cache_creation_input_tokens），
+    避免流式 usage 事件丢失 cache 统计。
     """
     if not usage:
         return {"input_tokens": 0, "output_tokens": 0}
@@ -100,7 +103,17 @@ def extract_usage_tokens(usage: dict) -> dict:
     if output_tokens is None:
         output_tokens = usage.get("completion_tokens", 0)
 
-    return {"input_tokens": int(input_tokens), "output_tokens": int(output_tokens)}
+    result: dict = {"input_tokens": int(input_tokens), "output_tokens": int(output_tokens)}
+
+    # 保留 cache token（Anthropic 特有），非零时才加入避免噪声
+    cache_read = usage.get("cache_read_input_tokens")
+    if cache_read is not None and int(cache_read) > 0:
+        result["cache_read_input_tokens"] = int(cache_read)
+    cache_creation = usage.get("cache_creation_input_tokens")
+    if cache_creation is not None and int(cache_creation) > 0:
+        result["cache_creation_input_tokens"] = int(cache_creation)
+
+    return result
 
 
 # ── Keepalive 包装器 ────────────────────────────────────────────────

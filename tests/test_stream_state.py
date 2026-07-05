@@ -153,12 +153,35 @@ class TestStreamStateOutputIndex:
 
 class TestStreamStateFlushAndCompleted:
     def test_flush_think_tag_buf(self):
+        """flush 应输出未匹配的 partial close tag（state=inside 末尾）。
+
+        注意：think.feed() 已通过 _emit_reasoning 把主体 reasoning 加入 reasoning_parts；
+        调用方（生产代码 request.py:609-612）会消费这些 parts。
+        flush 仅负责回收未匹配的 partial tag，不再重复输出已 emit 的 reasoning。
+        """
         st = StreamState()
         from llm_proxy.protocol.think_tag import ThinkTagStateMachine, OPEN_TAG
         st.think = ThinkTagStateMachine()
-        st.think.feed(OPEN_TAG + "still thinking")
+        # 模拟流末尾有 partial close tag（如上游 chunk 边界切到 "</thi"）
+        reasoning_parts, _ = st.think.feed(OPEN_TAG + "thinking</thi")
+        # 消费 feed 返回的 parts（与生产代码一致）
+        for rp in reasoning_parts:
+            st.handle_reasoning_delta(rp)
         events = st.flush_think_tag_buf()
-        assert len(events) > 0
+        assert len(events) > 0  # partial "</thi" 应作为 reasoning 输出
+        assert st.reasoning_active is True
+
+    def test_flush_think_tag_buf_empty_when_no_partial(self):
+        """state=inside 但无 partial tag 时，flush 应返回空（reasoning 已通过 feed emit）。"""
+        st = StreamState()
+        from llm_proxy.protocol.think_tag import ThinkTagStateMachine, OPEN_TAG
+        st.think = ThinkTagStateMachine()
+        reasoning_parts, _ = st.think.feed(OPEN_TAG + "still thinking")
+        for rp in reasoning_parts:
+            st.handle_reasoning_delta(rp)
+        events = st.flush_think_tag_buf()
+        assert events == []
+        # reasoning_active 已通过 handle_reasoning_delta 设置
         assert st.reasoning_active is True
 
     def test_generate_completed_events_closes_all_blocks(self):
@@ -224,13 +247,20 @@ class TestStreamStateEdgeCases:
 
 class TestStreamStateDrainIntegration:
     def test_unclosed_think_tag_drained_on_completed(self):
+        """未闭合 <think>（无 partial tag）：reasoning 已通过 feed emit，
+        generate_completed_events 不再补发 reasoning delta（避免双倍计数）。"""
         from llm_proxy.protocol.think_tag import ThinkTagStateMachine
         st = StreamState()
         st.think = ThinkTagStateMachine()
-        st.think.feed("<think>still thinking without close")
+        reasoning_parts, _ = st.think.feed("<think>still thinking without close")
+        # 消费 feed 返回的 parts（与生产代码一致）
+        for rp in reasoning_parts:
+            st.handle_reasoning_delta(rp)
+        # reasoning_active 在 close 前应为 True
+        assert st.reasoning_active is True
         completed = st.generate_completed_events("gpt-4", "resp_test")
         types = _event_types(completed)
-        assert "response.reasoning_summary_text.delta" in types
+        # reasoning 已通过 handle_reasoning_delta 发出，completed 只需包含 response.completed
         assert "response.completed" in types
 
     def test_partial_tag_buffer_drained(self):
