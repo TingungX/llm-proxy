@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 import re
 
 def _replace_sse_model(chunk: bytes, new_model: str) -> bytes:
-    """Replace the first 'model' field value in an SSE data chunk."""
+    """Replace every 'model' field value in an SSE data chunk."""
     if b'"model"' not in chunk:
         return chunk
     try:
@@ -44,7 +44,6 @@ def _replace_sse_model(chunk: bytes, new_model: str) -> bytes:
             b'"model"\\s*:\\s*"[^"]*"',
             f'"model": "{new_model}"'.encode("utf-8"),
             chunk,
-            count=1,
         )
     except Exception:
         return chunk
@@ -336,7 +335,6 @@ class ProxyStep(HandlerStep):
         """Anthropic 流式生成器"""
         usage = {"input_tokens": 0, "output_tokens": 0}
         seen_stop = False
-        first_event = True
 
         def track_usage(event_type, data):
             nonlocal seen_stop
@@ -354,10 +352,8 @@ class ProxyStep(HandlerStep):
                 seen_stop = True
 
         def wrap_chunk(chunk: bytes) -> bytes:
-            nonlocal first_event
-            if first_event and response_model:
+            if response_model and b'"model"' in chunk:
                 chunk = _replace_sse_model(chunk, response_model)
-                first_event = False
             return chunk
 
         try:
@@ -696,7 +692,7 @@ class ProxyStep(HandlerStep):
         rctx = record_ctx or {}
         usage = {"input_tokens": 0, "output_tokens": 0}
         had_error = False
-        first_model_event = True
+        display_model = response_model or model
 
         try:
             for attempt in range(_RETRY_MAX + 1):
@@ -717,19 +713,16 @@ class ProxyStep(HandlerStep):
                                 {"error": {"code": err_code, "message": err_message}},
                                 event_type="error",
                             )
-                            yield make_response_completed_event(response_model or model, f"resp_{uuid.uuid4().hex[:16]}")
+                            yield make_response_completed_event(display_model, f"resp_{uuid.uuid4().hex[:16]}")
                             yield b"data: [DONE]\n\n"
                             return
 
                         async for line in resp.aiter_lines():
                             if line:
-                                # 替换首个 model 事件中的模型名
-                                if first_model_event and response_model and line.startswith("data: ") and '"model"' in line:
-                                    chunk = line.encode() if isinstance(line, str) else line
+                                chunk = line.encode() if isinstance(line, str) else line
+                                if response_model and b'"model"' in chunk:
                                     chunk = _replace_sse_model(chunk, response_model)
-                                    line = chunk.decode() if isinstance(line, str) else chunk
-                                    first_model_event = False
-                                yield line.encode() if isinstance(line, str) else line
+                                yield chunk
                                 if isinstance(line, str) and line.startswith("data: ") and not line.endswith("[DONE]"):
 
                                     try:
@@ -986,16 +979,14 @@ class ProxyStep(HandlerStep):
     async def _chat_stream_gen(self, target_url: str, headers: dict, body: dict, model_id: str,
                                 response_model: str = ""):
         """Chat Completions 流式透传"""
-        first_model_event = True
         for attempt in range(_RETRY_MAX + 1):
             try:
                 client = _client_for(model_id)
                 async with client.stream("POST", target_url, json=body, headers=headers, timeout=120.0) as resp:
                     logger.debug(f"Chat stream response status: {resp.status_code}")
                     async for chunk in resp.aiter_bytes():
-                        if first_model_event and response_model:
+                        if response_model and b'"model"' in chunk:
                             chunk = _replace_sse_model(chunk, response_model)
-                            first_model_event = False
                         yield chunk
                     return
 
