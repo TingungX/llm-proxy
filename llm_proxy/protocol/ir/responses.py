@@ -16,6 +16,7 @@ from llm_proxy.protocol.ir._common import (
     build_usage,
     clean_schema,
     is_openai_o_series,
+    map_tool_choice_to_chat,
     safe_json_dumps,
     safe_json_loads,
     supports_reasoning_effort,
@@ -41,6 +42,7 @@ from llm_proxy.protocol.ir.types import (
     IRContentBlock,
     IRImageBlock,
     IRMessage,
+    IRRedactedThinkingBlock,
     IRRequest,
     IRResponse,
     IRTextBlock,
@@ -121,7 +123,8 @@ def to_ir(body: dict[str, Any]) -> IRRequest:
             ir_request.extensions["tool_spec_map"] = tool_spec_map
 
     if "tool_choice" in body:
-        ir_request.tool_choice = body["tool_choice"]
+        # 规范化到 IR Chat 嵌套形式（Responses 输入可能是扁平形式 {"type":"function","name":"X"}）
+        ir_request.tool_choice = map_tool_choice_to_chat(body["tool_choice"])
 
     # 透传 Responses 特有字段
     for key in ("parallel_tool_calls", "truncation", "store", "user"):
@@ -497,6 +500,22 @@ def response_from_ir(ir: IRResponse, *, reverse_tool_map: dict | None = None, to
                     "id": f"rs_{uuid.uuid4().hex[:24]}",
                     "summary": [{"type": "summary_text", "text": block.thinking}],
                 })
+        elif isinstance(block, IRRedactedThinkingBlock):
+            # Responses 无原生 redacted_thinking 概念，转换为 reasoning 占位
+            # 保留 data 让客户端至少知道存在已加密 reasoning（不可见）
+            if text_parts:
+                output.append({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": text_parts,
+                })
+                text_parts = []
+            output.append({
+                "type": "reasoning",
+                "id": f"rs_{uuid.uuid4().hex[:24]}",
+                "summary": [{"type": "summary_text", "text": f"[redacted_thinking: {block.data}]"}],
+                "encrypted_content": block.data,
+            })
         elif isinstance(block, IRToolUseBlock):
             # tool_use 也需要先 flush text parts
             if text_parts:
@@ -564,6 +583,10 @@ def response_from_ir(ir: IRResponse, *, reverse_tool_map: dict | None = None, to
     if ir.stop_reason == "max_tokens":
         status = "incomplete"
         incomplete_reason = "max_output_tokens"
+    elif ir.stop_reason == "refusal":
+        # 内容过滤：与流式路径（map_stop_to_responses_status）保持一致
+        status = "incomplete"
+        incomplete_reason = "content_filter"
     elif ir.stop_reason == "tool_use":
         status = "completed"  # 工具调用后正常完成
 
@@ -640,8 +663,19 @@ def response_to_ir(body: dict[str, Any]) -> IRResponse:
         reason = incomplete_details.get("reason", "max_output_tokens")
         if reason == "max_output_tokens":
             stop_reason = "max_tokens"
+        elif reason == "content_filter":
+            stop_reason = "refusal"
         else:
             stop_reason = "end_turn"
+    elif status in ("failed", "cancelled"):
+        # 上游失败/取消：映射到 refusal（IR 无 failed/cancelled 概念，
+        # refusal 语义最接近"未正常完成"，且下游能识别为非 end_turn）
+        stop_reason = "refusal"
+        # 若上游给了 error.message，作为 text block 保留（避免错误信息丢失）
+        err = body.get("error") or {}
+        err_msg = err.get("message") if isinstance(err, dict) else None
+        if err_msg and not any(isinstance(b, IRTextBlock) and b.text for b in blocks):
+            blocks.insert(0, IRTextBlock(text=f"[upstream {status}: {err_msg}]"))
     else:
         # 检查是否包含 tool_use
         has_tool = any(isinstance(b, IRToolUseBlock) for b in blocks)
@@ -702,7 +736,13 @@ def to_upstream(ir: IRRequest, upstream_model: str | None = None) -> dict[str, A
         result["tools"] = _tools_ir_to_responses(ir.tools, ir.extensions.get("reverse_tool_map"))
 
     if ir.tool_choice is not None:
-        result["tool_choice"] = ir.tool_choice
+        # IR 规范形式（Chat 嵌套）→ Responses 扁平形式
+        tc = ir.tool_choice
+        if isinstance(tc, dict) and tc.get("type") == "function":
+            name = tc.get("function", {}).get("name", "")
+            result["tool_choice"] = {"type": "function", "name": name}
+        else:
+            result["tool_choice"] = tc
 
     # 透传 Responses 特有字段
     for key in ("parallel_tool_calls", "truncation", "store", "user"):
@@ -733,10 +773,18 @@ def _messages_ir_to_responses_input(messages: list[IRMessage]) -> list[dict]:
             if isinstance(content, list):
                 for block in content:
                     if isinstance(block, IRToolResultBlock):
+                        # content 可能是 str 或 list（含 image 等非 text block）。
+                        # Responses function_call_output 仅支持字符串，提取 text 部分（lossy）。
+                        block_content = block.content
+                        if isinstance(block_content, list):
+                            block_content = "\n".join(
+                                b.get("text", "") for b in block_content
+                                if isinstance(b, dict) and b.get("type") == "text"
+                            )
                         items.append({
                             "type": "function_call_output",
                             "call_id": block.tool_use_id,
-                            "output": block.content,
+                            "output": block_content,
                         })
             continue
 

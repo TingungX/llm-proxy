@@ -221,10 +221,17 @@ _TOOL_CHOICE_MAP = {
 
 
 def map_tool_choice_to_chat(tool_choice) -> dict | str:
-    """Anthropic tool_choice → Chat tool_choice。
+    """任意协议 tool_choice → IR 规范形式（与 Chat 形式一致）。
 
-    - "any" (str) → "required"（OpenAI 无 "any" 概念）
-    - {"type": "tool", "name": "X"} → {"type": "function", "function": {"name": "X"}}
+    IR 规范形式：
+    - str: "auto" | "required" | "none"
+    - dict: {"type": "function", "function": {"name": "X"}}
+
+    转换规则：
+    - "any" (str/dict.type) → "required"（OpenAI 无 "any" 概念）
+    - {"type": "tool", "name": "X"} (Anthropic) → {"type": "function", "function": {"name": "X"}}
+    - {"type": "function", "name": "X"} (Responses 扁平形式) → {"type": "function", "function": {"name": "X"}}
+    - {"type": "function", "function": {...}} (Chat 嵌套形式) → 透传
     """
     if isinstance(tool_choice, str):
         return _TOOL_CHOICE_MAP.get(tool_choice, tool_choice)
@@ -233,6 +240,12 @@ def map_tool_choice_to_chat(tool_choice) -> dict | str:
         if tc_type in _TOOL_CHOICE_MAP:
             return _TOOL_CHOICE_MAP[tc_type]
         if tc_type == "tool":
+            name = tool_choice.get("name", "")
+            return {"type": "function", "function": {"name": name}}
+        if tc_type == "function":
+            # 同时接受 Chat 嵌套形式与 Responses 扁平形式，统一到 Chat 嵌套形式
+            if "function" in tool_choice and isinstance(tool_choice["function"], dict):
+                return tool_choice
             name = tool_choice.get("name", "")
             return {"type": "function", "function": {"name": name}}
         return tool_choice

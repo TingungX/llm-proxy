@@ -108,10 +108,19 @@ class TestThinkTagDrain:
         assert to_reasoning is False
 
     def test_drain_inside_state_as_reasoning(self):
+        """inside 状态结束且无 partial tag：drain 返回空（reasoning 已通过 feed emit）。"""
         m = ThinkTagStateMachine()
         m.feed("<think>still thinking")
         remaining, to_reasoning = m.drain()
-        assert "still thinking" in remaining
+        assert remaining == ""
+        assert to_reasoning is False
+
+    def test_drain_inside_state_with_partial_close_tag(self):
+        """inside 状态结束且有 partial close tag：drain 返回该 partial（应作为 reasoning 处理）。"""
+        m = ThinkTagStateMachine()
+        m.feed("<think>thinking</thi")
+        remaining, to_reasoning = m.drain()
+        assert remaining == "</thi"
         assert to_reasoning is True
 
     def test_drain_leading_ws_with_buf(self):

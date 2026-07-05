@@ -460,10 +460,10 @@ class TestAnthropicToResponsesRequest:
             "tool_choice": {"type": "tool", "name": "search"},
         }
         upstream = convert_request("anthropic", "openai/responses", body)
-        # Anthropic {"type":"tool","name":"X"} → Responses function
+        # Anthropic {"type":"tool","name":"X"} → Responses 扁平形式
         assert upstream["tool_choice"] == {
             "type": "function",
-            "function": {"name": "search"},
+            "name": "search",
         }
 
 
@@ -927,3 +927,326 @@ class TestRedactedThinkingRoundTrip:
         redacted = [b for b in blocks if b["type"] == "redacted_thinking"]
         assert len(redacted) == 1
         assert redacted[0]["data"] == "encrypted_blob_xyz"
+
+
+# ── 第二轮 review 修复点（边缘情况）───────────────────────────────────
+
+
+class TestToolChoiceRequiredToAnthropic:
+    """Chat 'required' → Anthropic 必须是 'any'（不能透传 'required'）。"""
+
+    def test_required_string_maps_to_any(self):
+        body = {
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tool_choice": "required",  # Chat 风格
+        }
+        ir = chat_to_ir(body)
+        anthropic_body = anthropic_to_upstream(ir)
+        assert anthropic_body["tool_choice"] == "any"
+
+
+class TestDictToolChoiceFormatCompat:
+    """dict tool_choice 在三协议间转换时格式必须正确。"""
+
+    def test_chat_dict_to_responses_uses_flat_name(self):
+        """Chat 格式 {'type':'function','function':{'name':'X'}} → Responses 格式 {'type':'function','name':'X'}."""
+        body = {
+            "model": "gpt-5",
+            "input": "Hi",
+            "tool_choice": {"type": "function", "function": {"name": "search"}},
+        }
+        # Chat → IR → Responses
+        ir = chat_to_ir(body)
+        upstream = responses_to_upstream(ir)
+        assert upstream["tool_choice"] == {"type": "function", "name": "search"}
+
+    def test_responses_dict_to_anthropic_uses_tool_type(self):
+        """Responses 格式 {'type':'function','name':'X'} → Anthropic 格式 {'type':'tool','name':'X'}."""
+        body = {
+            "model": "gpt-5",
+            "input": "Hi",
+            "tool_choice": {"type": "function", "name": "search"},
+        }
+        ir = responses_to_ir(body)
+        upstream = anthropic_to_upstream(ir)
+        assert upstream["tool_choice"] == {"type": "tool", "name": "search"}
+
+    def test_anthropic_dict_to_responses_uses_flat_name(self):
+        """Anthropic {'type':'tool','name':'X'} → Responses {'type':'function','name':'X'}."""
+        body = {
+            "model": "claude",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tool_choice": {"type": "tool", "name": "search"},
+        }
+        upstream = convert_request("anthropic", "openai/responses", body)
+        assert upstream["tool_choice"] == {"type": "function", "name": "search"}
+
+
+class TestChatStreamingToolUseEndFallback:
+    """Chat 流式：tool_use_end 携带完整 input 但未通过 delta 流式传输时，必须补发 arguments。"""
+
+    @pytest.mark.asyncio
+    async def test_tool_use_end_emits_arguments_when_no_delta(self):
+        from llm_proxy.protocol.ir.chat import format_ir_as_sse
+        from llm_proxy.protocol.ir.types import IRStreamEvent
+
+        events = [
+            IRStreamEvent(type="message_start", data={"id": "x", "model": "m"}),
+            IRStreamEvent(type="tool_use_start", data={"id": "call_1", "name": "search"}),
+            # 没有 tool_use_delta，直接 end 携带完整 input
+            IRStreamEvent(type="tool_use_end", data={"id": "call_1", "input": {"q": "test"}}),
+            IRStreamEvent(type="message_stop", data={"stop_reason": "tool_use"}),
+        ]
+
+        chunks: list[dict] = []
+        async for chunk in format_ir_as_sse(_async_iter(events), "m"):
+            text = chunk.decode("utf-8")
+            for line in text.split("\n"):
+                if line.startswith("data: ") and "[DONE]" not in line:
+                    chunks.append(json.loads(line[6:]))
+
+        # 找出所有 tool_calls delta
+        tool_args_deltas = []
+        for c in chunks:
+            for choice in c.get("choices", []):
+                delta = choice.get("delta", {})
+                for tc in delta.get("tool_calls", []):
+                    args = tc.get("function", {}).get("arguments")
+                    if args is not None and args != "":
+                        tool_args_deltas.append(args)
+        # 必须有至少一个非空 arguments delta
+        assert any(tool_args_deltas), f"Expected non-empty arguments delta, got {tool_args_deltas}"
+        # 拼接应能解析为完整 input
+        combined = "".join(tool_args_deltas)
+        assert json.loads(combined) == {"q": "test"}
+
+
+class TestResponsesRefusalMapsIncomplete:
+    """非流式 Responses 响应：refusal stop_reason 必须 → status=incomplete + reason=content_filter。"""
+
+    def test_refusal_status_is_incomplete(self):
+        ir = IRResponse(
+            id="r1",
+            model="m",
+            content_blocks=[IRTextBlock(text="I can't help with that.")],
+            stop_reason="refusal",
+            usage={"input_tokens": 5, "output_tokens": 3},
+        )
+        body = responses_response_from_ir(ir)
+        assert body["status"] == "incomplete"
+        assert body.get("incomplete_details", {}).get("reason") == "content_filter"
+
+
+class TestStripThinkTagsUnclosed:
+    """未闭合 <think> 标签：reasoning 不应被双倍计数。"""
+
+    def test_unclosed_think_no_double_count(self):
+        from llm_proxy.protocol.think_tag import strip_think_tags
+        reasoning, content = strip_think_tags("<think>reasoning here")
+        assert reasoning == "reasoning here"
+        assert content == ""
+
+    def test_unclosed_think_with_trailing_content(self):
+        from llm_proxy.protocol.think_tag import strip_think_tags
+        # 未闭合时所有后续内容都视为 reasoning
+        reasoning, content = strip_think_tags("<think>still thinking")
+        assert reasoning == "still thinking"
+        assert content == ""
+
+
+class TestChatStreamingToolCallWithoutName:
+    """Chat 流式：上游 chunk 携带 arguments 但无 name 时不应静默丢弃。"""
+
+    @pytest.mark.asyncio
+    async def test_arguments_without_name_still_emitted(self):
+        from llm_proxy.protocol.ir.chat import parse_stream_to_ir, format_ir_as_sse
+        from llm_proxy.protocol.ir.types import IRStreamEvent
+
+        # 模拟上游：name 缺失，只有 arguments delta
+        upstream_lines = [
+            'data: {"id":"1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"arguments":"{\\"q\\":\\"test\\"}"}}]}}]}',
+            'data: {"id":"1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+            'data: [DONE]',
+        ]
+
+        events = []
+        async for ev in parse_stream_to_ir(_FakeResp(upstream_lines), "m"):
+            events.append(ev)
+
+        # 必须有 tool_use_end 事件携带完整 input
+        end_events = [e for e in events if e.type == "tool_use_end"]
+        assert len(end_events) == 1
+        assert end_events[0].data.get("input") == {"q": "test"}
+
+
+# ── 辅助 ────────────────────────────────────────────────────────────
+
+
+async def _async_iter(items):
+    for x in items:
+        yield x
+
+
+class _FakeResp:
+    """模拟 httpx 流式响应，按行产出 SSE 数据。"""
+
+    def __init__(self, lines: list[str]):
+        self._lines = lines
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+
+
+# ── 第三轮 review 修复点（数据丢失类）───────────────────────────────
+
+
+class TestAnthropicToolResultImagePreserved:
+    """Anthropic tool_result 含 image block 时，Anthropic→IR→Anthropic 应保留图片。"""
+
+    def test_image_in_tool_result_roundtrip(self):
+        body = {
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tool_1",
+                    "content": [
+                        {"type": "text", "text": "screenshot below"},
+                        {"type": "image", "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "iVBORw0KGgo=",
+                        }},
+                    ],
+                }],
+            }],
+        }
+        # Anthropic → IR → Anthropic
+        ir = anthropic_to_ir(body)
+        upstream = anthropic_to_upstream(ir)
+        # 找到 tool_result block
+        msg = upstream["messages"][0]
+        tr_block = next(b for b in msg["content"] if b.get("type") == "tool_result")
+        # content 应保留为 list（含 image block），不应被压成纯文本
+        assert isinstance(tr_block["content"], list)
+        types_in_result = [b.get("type") for b in tr_block["content"]]
+        assert "image" in types_in_result, f"image block dropped: {types_in_result}"
+
+
+class TestStreamingUsageCacheTokens:
+    """流式 usage 事件应保留 cache_read_input_tokens / cache_creation_input_tokens。"""
+
+    @pytest.mark.asyncio
+    async def test_anthropic_streaming_usage_preserves_cache_tokens(self):
+        from llm_proxy.protocol.ir.anthropic import format_ir_as_sse
+        from llm_proxy.protocol.ir.types import IRStreamEvent
+
+        events = [
+            IRStreamEvent(type="message_start", data={"id": "x", "model": "m"}),
+            IRStreamEvent(type="usage", data={
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_read_input_tokens": 80,
+                "cache_creation_input_tokens": 20,
+            }),
+            IRStreamEvent(type="message_stop", data={"stop_reason": "end_turn"}),
+        ]
+
+        chunks: list[dict] = []
+        async for chunk in format_ir_as_sse(_async_iter(events), "m"):
+            text = chunk.decode("utf-8")
+            for line in text.split("\n"):
+                if line.startswith("data: ") and "[DONE]" not in line:
+                    chunks.append(json.loads(line[6:]))
+
+        # 找出 message_delta 中的 usage
+        usage_chunk = next(
+            (c for c in chunks if c.get("type") == "message_delta"),
+            None,
+        )
+        assert usage_chunk is not None, "no message_delta chunk emitted"
+        usage = usage_chunk.get("usage", {})
+        assert usage.get("cache_read_input_tokens") == 80, f"cache_read lost: {usage}"
+        assert usage.get("cache_creation_input_tokens") == 20, f"cache_creation lost: {usage}"
+
+
+class TestRedactedThinkingInChatResponses:
+    """IRRedactedThinkingBlock 在 Chat/Responses 响应方向不应被静默丢弃。"""
+
+    def test_redacted_thinking_in_chat_response(self):
+        """Chat 响应：redacted_thinking 应转换为 reasoning 占位（而非静默丢弃）。"""
+        ir = IRResponse(
+            id="r1",
+            model="m",
+            content_blocks=[
+                IRTextBlock(text="answer"),
+                IRRedactedThinkingBlock(data="encrypted_blob"),
+            ],
+            stop_reason="end_turn",
+            usage={"input_tokens": 5, "output_tokens": 3},
+        )
+        body = chat_response_from_ir(ir)
+        # 至少不应静默丢弃：reasoning_content 或 message content 应反映 redacted thinking 存在
+        # Chat 没有原生 redacted_thinking 概念，转换为 reasoning_content 占位
+        msg = body["choices"][0]["message"]
+        has_reasoning = bool(msg.get("reasoning_content"))
+        has_text = "answer" in (msg.get("content") or "")
+        assert has_text, f"text lost: {msg}"
+        assert has_reasoning, f"redacted_thinking silently dropped: {msg}"
+
+    def test_redacted_thinking_in_responses_response(self):
+        """Responses 命令响应：redacted_thinking 应转换为 reasoning 占位（而非静默丢弃）。"""
+        ir = IRResponse(
+            id="r1",
+            model="m",
+            content_blocks=[
+                IRRedactedThinkingBlock(data="encrypted_blob"),
+                IRTextBlock(text="answer"),
+            ],
+            stop_reason="end_turn",
+            usage={"input_tokens": 5, "output_tokens": 3},
+        )
+        body = responses_response_from_ir(ir)
+        # 至少应有 reasoning item（不被静默丢弃）
+        output = body.get("output", [])
+        types_in_output = [item.get("type") for item in output]
+        has_reasoning = any("reasoning" in t for t in types_in_output)
+        assert has_reasoning, f"redacted_thinking silently dropped: {types_in_output}"
+
+
+class TestResponsesFailedStatusMapping:
+    """Responses 上游 status=failed/cancelled 不应被映射为 end_turn。"""
+
+    def test_failed_status_mapped_to_refusal(self):
+        """status=failed → IR stop_reason 应反映错误，不应是 end_turn。"""
+        # 模拟上游 Responses 响应 status=failed
+        upstream = {
+            "id": "resp_1",
+            "object": "response",
+            "model": "gpt-5",
+            "status": "failed",
+            "output": [],
+            "usage": {"input_tokens": 5, "output_tokens": 0},
+            "error": {"code": "server_error", "message": "upstream failed"},
+        }
+        ir = responses_response_to_ir(upstream)
+        # stop_reason 不应是 end_turn（应反映失败）
+        assert ir.stop_reason != "end_turn", f"failed status mapped to end_turn: {ir.stop_reason}"
+
+    def test_cancelled_status_mapped_to_refusal(self):
+        upstream = {
+            "id": "resp_1",
+            "object": "response",
+            "model": "gpt-5",
+            "status": "cancelled",
+            "output": [],
+            "usage": {"input_tokens": 5, "output_tokens": 0},
+        }
+        ir = responses_response_to_ir(upstream)
+        assert ir.stop_reason != "end_turn", f"cancelled status mapped to end_turn: {ir.stop_reason}"

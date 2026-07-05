@@ -12,6 +12,7 @@ from llm_proxy.protocol.ir._common import (
     build_usage,
     clean_schema,
     is_openai_o_series,
+    map_tool_choice_to_chat,
     safe_json_dumps,
     safe_json_loads,
     supports_reasoning_effort,
@@ -30,6 +31,7 @@ from llm_proxy.protocol.ir.types import (
     IRContentBlock,
     IRImageBlock,
     IRMessage,
+    IRRedactedThinkingBlock,
     IRRequest,
     IRResponse,
     IRTextBlock,
@@ -120,7 +122,8 @@ def to_ir(body: dict[str, Any]) -> IRRequest:
 
     # tool_choice
     if "tool_choice" in body:
-        ir_request.tool_choice = body["tool_choice"]
+        # 规范化到 IR Chat 嵌套形式（防御性：可能收到 Responses 扁平形式）
+        ir_request.tool_choice = map_tool_choice_to_chat(body["tool_choice"])
 
     # extensions
     for key in ("stream_options", "response_format", "logprobs", "n",
@@ -238,6 +241,7 @@ def response_from_ir(ir: IRResponse) -> dict[str, Any]:
     text_parts: list[str] = []
     tool_calls: list[dict] = []
     reasoning_text: str | None = None
+    reasoning_parts: list[str] = []
 
     for block in ir.content_blocks:
         if isinstance(block, IRTextBlock):
@@ -245,7 +249,11 @@ def response_from_ir(ir: IRResponse) -> dict[str, Any]:
                 text_parts.append(block.text)
         elif isinstance(block, IRThinkingBlock):
             if block.thinking:
-                reasoning_text = block.thinking
+                reasoning_parts.append(block.thinking)
+        elif isinstance(block, IRRedactedThinkingBlock):
+            # Chat 无原生 redacted_thinking 概念，转换为 reasoning_content 占位
+            # 保留 data 让客户端至少知道存在已加密 reasoning（不可见）
+            reasoning_parts.append(f"[redacted_thinking: {block.data}]")
         elif isinstance(block, IRToolUseBlock):
             tool_calls.append({
                 "id": block.id or f"call_{uuid.uuid4().hex[:24]}",
@@ -255,6 +263,9 @@ def response_from_ir(ir: IRResponse) -> dict[str, Any]:
                     "arguments": safe_json_dumps(block.input, default="{}"),
                 },
             })
+
+    if reasoning_parts:
+        reasoning_text = "\n".join(reasoning_parts)
 
     # content
     if tool_calls and not text_parts:
@@ -492,10 +503,18 @@ def _message_ir_to_chat(msg: IRMessage) -> list[dict[str, Any]]:
         if isinstance(content, list):
             for block in content:
                 if isinstance(block, IRToolResultBlock):
+                    # content 可能是 str 或 list（含 image 等非 text block）。
+                    # Chat 不支持 tool result 中含 image，提取 text 部分（lossy）。
+                    block_content = block.content
+                    if isinstance(block_content, list):
+                        block_content = "\n".join(
+                            b.get("text", "") for b in block_content
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        )
                     result.append({
                         "role": "tool",
                         "tool_call_id": block.tool_use_id,
-                        "content": block.content,
+                        "content": block_content,
                     })
         if not result:
             # 降级：无 IRToolResultBlock 时保留纯字符串内容
@@ -597,6 +616,7 @@ async def parse_stream_to_ir(
                 "name": "",
                 "args": IncrementalJSONParser(),
                 "started": False,
+                "args_fed": False,  # 是否收到过 arguments delta
             }
         return tool_state[idx]
 
@@ -679,6 +699,7 @@ async def parse_stream_to_ir(
             if "arguments" in func and func["arguments"]:
                 args_delta = func["arguments"]
                 ts["args"].feed(args_delta)
+                ts["args_fed"] = True
                 if ts["started"]:
                     yield IRStreamEvent(
                         type="tool_use_delta",
@@ -707,12 +728,24 @@ async def parse_stream_to_ir(
     # 闭合所有 tool_use block
     for idx in sorted(tool_state.keys()):
         ts = tool_state[idx]
-        if not ts["started"]:
-            continue
         final_input = ts["args"].finalize()
+        if not ts["started"]:
+            # 上游未发 name 但发了 arguments（部分非标准 Chat 上游行为）：
+            # 仍需输出，否则整个 tool_call 静默丢失。
+            # 仅当确实收到过 arguments 时才补发，避免对空 tool_call 产生噪声。
+            if not ts["args_fed"]:
+                continue
+            # name 缺失时用 id 作 fallback（多数客户端按 id 路由，name 仅作展示）
+            fallback_id = ts["id"] or f"call_{uuid.uuid4().hex[:24]}"
+            fallback_name = ts["name"] or fallback_id
+            yield IRStreamEvent(
+                type="tool_use_start",
+                data={"id": fallback_id, "name": fallback_name},
+            )
+            ts["started"] = True
         yield IRStreamEvent(
             type="tool_use_end",
-            data={"id": ts["id"], "input": final_input},
+            data={"id": ts["id"] or fallback_id, "input": final_input},
         )
 
     # Usage
@@ -741,6 +774,9 @@ async def format_ir_as_sse(
     created_ts = int(time.time())
     tool_index = 0  # 每个 tool_call 需要独立的递增 index
     active_tool_index = 0  # 当前活跃 tool_call 的 index（用于 delta）
+    # 跟踪当前 tool 是否已通过 delta 流式传输 arguments；
+    # 若 tool_use_end 到达时未发过 delta，需补发完整 input（兼容非流式上游转流式）
+    tool_args_streamed: dict[int, bool] = {}
 
     async for event in events:
         etype = event.type
@@ -829,6 +865,7 @@ async def format_ir_as_sse(
 
         elif etype == "tool_use_delta":
             args_delta = data.get("arguments_delta", "")
+            tool_args_streamed[active_tool_index] = True
             yield sse_format_data_only({
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
@@ -845,8 +882,28 @@ async def format_ir_as_sse(
             })
 
         elif etype == "tool_use_end":
-            # Chat 风格不发显式 end；input 已在 delta 中累积
-            pass
+            # Chat 风格不发显式 end；arguments 已在 delta 中累积。
+            # 但若上游从未发 tool_use_delta（如非流式上游一次性给 input），
+            # 需补发完整 input 作为单个 arguments delta，否则客户端只收到空 arguments。
+            if not tool_args_streamed.get(active_tool_index):
+                final_input = data.get("input")
+                if final_input is not None:
+                    args_str = safe_json_dumps(final_input) if not isinstance(final_input, str) else final_input
+                    if args_str and args_str != "{}":
+                        yield sse_format_data_only({
+                            "id": chunk_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_ts,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"tool_calls": [{
+                                    "index": active_tool_index,
+                                    "function": {"arguments": args_str},
+                                }]},
+                                "finish_reason": None,
+                            }],
+                        })
 
         elif etype == "usage":
             usage = data or {}
@@ -855,6 +912,10 @@ async def format_ir_as_sse(
                 "completion_tokens": int(usage.get("output_tokens", 0)),
             }
             chat_usage["total_tokens"] = chat_usage["prompt_tokens"] + chat_usage["completion_tokens"]
+            # 保留 cache token（OpenAI Chat 字段：prompt_tokens_details.cached_tokens）
+            cache_read = usage.get("cache_read_input_tokens")
+            if cache_read is not None and int(cache_read) > 0:
+                chat_usage["prompt_tokens_details"] = {"cached_tokens": int(cache_read)}
             yield sse_format_data_only({
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
