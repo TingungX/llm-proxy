@@ -323,7 +323,10 @@ class ProxyStep(HandlerStep):
                 logger.error(f"Upstream returned non-JSON response (status={resp.status_code}): {raw}")
                 return {"error": {"type": "proxy_error", "message": f"Upstream returned non-JSON (status={resp.status_code}): {raw}"}}, 502
         except Exception as e:
-            logger.error(f"Anthropic request error: {e}", exc_info=True)
+            logger.error(
+                "Anthropic request error [target=%s, model=%s]: %s",
+                target_url, model_id, e, exc_info=True,
+            )
             return {"error": {"type": "proxy_error", "message": str(e) or type(e).__name__}}, 500
 
     async def _anthropic_stream_gen(
@@ -372,9 +375,15 @@ class ProxyStep(HandlerStep):
                         logger.warning(f"Anthropic stream connect error: {e}, retrying in {wait}s (attempt {attempt + 1}/{_RETRY_MAX + 1})")
                         await asyncio.sleep(wait)
                         continue
-                    logger.error(f"Anthropic stream connect error after {_RETRY_MAX + 1} attempts: {e}", exc_info=True)
+                    logger.error(
+                        "Anthropic stream connect error after %d attempts [target=%s, model=%s]: %s",
+                        _RETRY_MAX + 1, target_url, model_id, e, exc_info=True,
+                    )
                 except Exception as e:
-                    logger.error(f"Anthropic stream error: {e}", exc_info=True)
+                    logger.error(
+                        "Anthropic stream error [target=%s, model=%s]: %s",
+                        target_url, model_id, e, exc_info=True,
+                    )
                     break
         finally:
             _rctx = record_ctx or {}
@@ -451,7 +460,10 @@ class ProxyStep(HandlerStep):
                 return
             status_code = resp.status_code
         except Exception as e:
-            logger.error(f"Cross-protocol request error: {e}", exc_info=True)
+            logger.error(
+                "Cross-protocol request error [target=%s, model=%s]: %s",
+                target_url, model_id, e, exc_info=True,
+            )
             ctx.response = make_error_response({"type": "proxy_error", "message": str(e) or type(e).__name__}, 500)
             return
 
@@ -488,7 +500,7 @@ class ProxyStep(HandlerStep):
                             resp_body = retry_resp.json()
                         except json.JSONDecodeError:
                             raw = retry_resp.text[:500]
-                            logger.error(f"Cross-protocol retry upstream returned non-JSON (status={retry_resp.status_code}): {raw}")
+                            logger.error("Cross-protocol retry non-JSON [target=%s, model=%s] status=%s: %s", target_url, model_id, retry_resp.status_code, raw)
                             ctx.response = make_error_response(
                                 {"type": "proxy_error", "message": f"Upstream returned non-JSON (status={retry_resp.status_code}): {raw}"},
                                 502,
@@ -496,7 +508,7 @@ class ProxyStep(HandlerStep):
                             return
                         status_code = retry_resp.status_code
                     except Exception as e:
-                        logger.error(f"Cross-protocol retry error: {e}", exc_info=True)
+                        logger.error("Cross-protocol retry error [target=%s, model=%s]: %s", target_url, model_id, e, exc_info=True)
                         ctx.response = make_error_response({"type": "proxy_error", "message": str(e) or type(e).__name__}, 500)
                         return
 
@@ -572,13 +584,19 @@ class ProxyStep(HandlerStep):
                         await asyncio.sleep(wait)
                         continue
                     upstream_errored = True
-                    logger.error(f"Cross-protocol connect error after {_RETRY_MAX + 1} attempts: {e}", exc_info=True)
+                    logger.error(
+                        "Cross-protocol connect error after %d attempts [target=%s, model=%s]: %s",
+                        _RETRY_MAX + 1, target_url, model_id, e, exc_info=True,
+                    )
                     err_body = {"type": "error", "error": {"type": "proxy_error", "message": str(e) or type(e).__name__}}
                     yield f"event: error\ndata: {json.dumps(err_body)}\n\n".encode()
                     return
                 except Exception as e:
                     upstream_errored = True
-                    logger.error(f"Cross-protocol stream error: {e}", exc_info=True)
+                    logger.error(
+                        "Cross-protocol stream error [target=%s, model=%s]: %s",
+                        target_url, model_id, e, exc_info=True,
+                    )
                     err_body = {"type": "error", "error": {"type": "proxy_error", "message": str(e) or type(e).__name__}}
                     yield f"event: error\ndata: {json.dumps(err_body)}\n\n".encode()
                     return
@@ -658,7 +676,10 @@ class ProxyStep(HandlerStep):
         except json.JSONDecodeError:
             raise
         except Exception as e:
-            logger.error(f"Responses direct proxy failed: {e}", exc_info=True)
+            logger.error(
+                "Responses direct proxy failed [target=%s, model=%s]: %s",
+                target_url, model_id, e, exc_info=True,
+            )
             raise PipelineStop(_make_error(ctx, f"Upstream error: {str(e) or type(e).__name__}", "proxy_error", 502))
 
         if resp.status_code >= 400:
@@ -819,7 +840,10 @@ class ProxyStep(HandlerStep):
             except json.JSONDecodeError:
                 raise
             except Exception as e:
-                logger.error(f"Request to upstream failed: {e}", exc_info=True)
+                logger.error(
+                    "Responses->Chat upstream failed [target=%s, model=%s]: %s",
+                    target_url, model_id, e, exc_info=True,
+                )
                 raise PipelineStop(_make_error(ctx, f"Upstream error: {str(e) or type(e).__name__}", "proxy_error", 502))
 
             if resp.status_code >= 400:
@@ -951,7 +975,10 @@ class ProxyStep(HandlerStep):
         except json.JSONDecodeError:
             raise
         except Exception as e:
-            logger.error(f"Request error: {e}", exc_info=True)
+            logger.error(
+                "Chat completions proxy failed [target=%s, model=%s]: %s",
+                target_url, model_id, e, exc_info=True,
+            )
             self._record_usage(ctx, endpoint_id, model_id, 0, 0, status="error", error_type="proxy_error")
             raise PipelineStop(_make_error(ctx, str(e) or type(e).__name__, "proxy_error", 502))
 
@@ -1057,7 +1084,10 @@ class ProxyStep(HandlerStep):
         except json.JSONDecodeError:
             raise
         except Exception as e:
-            logger.error(f"Request error: {e}", exc_info=True)
+            logger.error(
+                "Chat->Responses proxy failed [target=%s, model=%s]: %s",
+                target_url, model_id, e, exc_info=True,
+            )
             raise PipelineStop(_make_error(ctx, str(e) or type(e).__name__, "proxy_error", 502))
 
         if resp.status_code >= 400:
@@ -1100,6 +1130,9 @@ class ProxyStep(HandlerStep):
                                                            user_agent=rctx.get("user_agent", "")):
                     yield event
         except Exception as e:
-            logger.error(f"Chat→Responses stream error: {e}", exc_info=True)
+            logger.error(
+                "Chat->Responses stream error [target=%s, model=%s]: %s",
+                target_url, model_id, e, exc_info=True,
+            )
             error_chunk = {"error": {"message": str(e) or type(e).__name__, "type": "proxy_error"}}
             yield f"data: {json.dumps(error_chunk)}\n\n".encode()

@@ -289,6 +289,31 @@ class TestResponsesIRRoundtripRequest:
         assert chat_body["messages"][0] == {"role": "user", "content": "Hi"}
         assert chat_body["messages"][1] == {"role": "assistant", "content": "Hello!"}
 
+    def test_input_image_data_url_becomes_chat_image_url(self):
+        body = {
+            "model": "gpt-5",
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "Describe this"},
+                    {"type": "input_image", "image_url": "data:image/jpeg;base64,imgdata"},
+                ]},
+            ],
+        }
+
+        ir = responses_to_ir(body)
+        assert isinstance(ir.messages[0].content, list)
+        assert isinstance(ir.messages[0].content[0], IRTextBlock)
+        assert isinstance(ir.messages[0].content[1], IRImageBlock)
+        assert ir.messages[0].content[1].media_type == "image/jpeg"
+        assert ir.messages[0].content[1].base64_data == "imgdata"
+
+        chat_body = chat_to_upstream(ir)
+        content = chat_body["messages"][0]["content"]
+        assert content == [
+            {"type": "text", "text": "Describe this"},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,imgdata"}},
+        ]
+
     def test_reasoning_effort_mapping(self):
         body = {
             "model": "gpt-5",
@@ -501,6 +526,28 @@ class TestResponsesToAnthropicRequest:
         upstream = convert_request("openai/responses", "anthropic", body)
         tool_names = {t["name"] for t in upstream["tools"]}
         assert tool_names == {"apply_patch"}
+
+    def test_tool_choice_required_string_maps_to_any(self):
+        """Chat/Responses tool_choice="required" → Anthropic "any"。"""
+        body = {
+            "model": "gpt-5",
+            "input": "Hi",
+            "max_output_tokens": 100,
+            "tool_choice": "required",
+        }
+        upstream = convert_request("openai/responses", "anthropic", body)
+        assert upstream["tool_choice"] == "any"
+
+    def test_tool_choice_required_dict_maps_to_any(self):
+        """dict 形式 {"type":"required"} → Anthropic "any"。"""
+        body = {
+            "model": "gpt-5",
+            "input": "Hi",
+            "max_output_tokens": 100,
+            "tool_choice": {"type": "required"},
+        }
+        upstream = convert_request("openai/responses", "anthropic", body)
+        assert upstream["tool_choice"] == "any"
 
 
 # ── 响应方向 ─────────────────────────────────────────────────────

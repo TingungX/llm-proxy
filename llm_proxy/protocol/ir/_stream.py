@@ -262,15 +262,132 @@ class IncrementalJSONParser:
             return None
 
     def finalize(self) -> dict:
-        """流结束时调用，返回累积的 JSON（解析失败则返回 _raw 字段保留原文）。"""
+        """流结束时调用，返回累积的 JSON。
+
+        上游流式响应可能因网络抖动/超时被截断，导致 arguments JSON 不完整。
+        解析失败时尝试修复截断（补全未闭合的字符串和括号），尽量恢复模型
+        实际生成的参数。修复仍失败则返回空 dict 并记录 warning。
+        """
+        if not self._buf.strip():
+            return {}
         try:
-            return json.loads(self._buf) if self._buf.strip() else {}
+            return json.loads(self._buf)
         except json.JSONDecodeError:
-            return {"_raw": self._buf}
+            repaired = _repair_truncated_json(self._buf)
+            if repaired is not None:
+                logger.warning(
+                    "IncrementalJSONParser.finalize: JSON was truncated, repaired "
+                    "(orig_len=%d, tail=%s)",
+                    len(self._buf), self._buf[-80:],
+                )
+                return repaired
+            logger.warning(
+                "IncrementalJSONParser.finalize: failed to parse accumulated JSON "
+                "(len=%d): %s",
+                len(self._buf), self._buf[:200],
+            )
+            return {}
 
     @property
     def buffer_length(self) -> int:
         return len(self._buf)
+
+
+def _repair_truncated_json(buf: str) -> dict | None:
+    """尝试修复被截断的 JSON 字符串，返回解析后的 dict。
+
+    处理上游流截断导致 JSON 不完整的常见情况：
+    - 字符串未闭合（缺少结尾引号）
+    - 对象/数组未闭合（缺少 } 或 ]）
+    - 值未完成（如 key: 后面没有值）
+
+    通过逐字符扫描追踪状态，补全缺失的闭合符号。
+    """
+    if not buf or not buf.strip():
+        return None
+
+    # 逐字符扫描，追踪字符串/对象/数组嵌套状态
+    stack: list[str] = []  # "object" | "array"
+    in_string = False
+    escape = False
+    i = 0
+    while i < len(buf):
+        c = buf[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                in_string = False
+        else:
+            if c == '"':
+                in_string = True
+            elif c == "{":
+                stack.append("object")
+            elif c == "[":
+                stack.append("array")
+            elif c == "}" and stack and stack[-1] == "object":
+                stack.pop()
+            elif c == "]" and stack and stack[-1] == "array":
+                stack.pop()
+        i += 1
+
+    # 如果仍在字符串内，补上闭合引号
+    suffix = ""
+    if in_string:
+        suffix += '"'
+
+    # 检查末尾是否是半完成的 key/value（如 ,"key": 或 ,"key"）
+    # 尝试截断到最后一个完整的值，再补全括号
+    repaired = buf + suffix
+    # 去掉末尾可能的不完整 token
+    stripped = repaired.rstrip()
+    if stripped.endswith(":"):
+        # key 后无值，补 null
+        stripped += "null"
+    elif stripped.endswith(","):
+        # 逗号后无值，去掉逗号
+        stripped = stripped[:-1]
+
+    # 补全未闭合的括号（从内到外）
+    # 重新扫描 stripped 的状态
+    stack2: list[str] = []
+    in_string2 = False
+    escape2 = False
+    for c in stripped:
+        if in_string2:
+            if escape2:
+                escape2 = False
+            elif c == "\\":
+                escape2 = True
+            elif c == '"':
+                in_string2 = False
+        else:
+            if c == '"':
+                in_string2 = True
+            elif c == "{":
+                stack2.append("object")
+            elif c == "[":
+                stack2.append("array")
+            elif c == "}" and stack2 and stack2[-1] == "object":
+                stack2.pop()
+            elif c == "]" and stack2 and stack2[-1] == "array":
+                stack2.pop()
+
+    for opener in reversed(stack2):
+        if opener == "object":
+            stripped += "}"
+        else:
+            stripped += "]"
+
+    try:
+        result = json.loads(stripped)
+        if isinstance(result, dict):
+            return result
+        return None
+    except json.JSONDecodeError:
+        return None
 
 
 # ── Multi-line 累积解析（data: 行可能跨多次 aiter）──

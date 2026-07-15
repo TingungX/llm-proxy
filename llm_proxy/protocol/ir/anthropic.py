@@ -158,6 +158,7 @@ def _convert_message_to_ir(role: str, content: Any) -> list[IRMessage]:
         return [IRMessage(role=role, content=content)]
 
     if not isinstance(content, list):
+        logger.debug("anthropic._convert_message_to_ir: non-list content, fallback to str (role=%s)", role)
         return [IRMessage(role=role, content=str(content))]
 
     # 数组 content — 按 block 类型分发
@@ -169,6 +170,7 @@ def _convert_message_to_ir(role: str, content: Any) -> list[IRMessage]:
 
     for block in content:
         if not isinstance(block, dict):
+            logger.debug("anthropic._convert_message_to_ir: skipped non-dict block: %r", block)
             continue
         block_type = block.get("type", "")
 
@@ -179,26 +181,38 @@ def _convert_message_to_ir(role: str, content: Any) -> list[IRMessage]:
             ))
         elif block_type == "image":
             source = block.get("source", {})
+            if not isinstance(source, dict):
+                logger.debug("anthropic._convert_message_to_ir: image block with non-dict source: %r", block)
             blocks.append(IRImageBlock(
                 base64_data=source.get("data", ""),
                 media_type=source.get("media_type", "image/png"),
             ))
         elif block_type == "thinking":
             thinking = block.get("thinking", "")
+            if not thinking:
+                logger.debug("anthropic._convert_message_to_ir: thinking block with empty content")
             if thinking:
                 blocks.append(IRThinkingBlock(
                     thinking=thinking,
                     signature=block.get("signature"),
                 ))
         elif block_type == "tool_use":
+            tool_id = block.get("id", "")
+            tool_name = block.get("name", "")
+            if not tool_id:
+                logger.warning("anthropic._convert_message_to_ir: tool_use missing id")
+            if not tool_name:
+                logger.warning("anthropic._convert_message_to_ir: tool_use missing name (id=%s)", tool_id)
             blocks.append(IRToolUseBlock(
-                id=block.get("id", ""),
-                name=block.get("name", ""),
+                id=tool_id,
+                name=tool_name,
                 input=block.get("input", {}) or {},
             ))
         elif block_type == "tool_result":
             # tool_result 产生独立的 tool role 消息，先收集
             tool_use_id = block.get("tool_use_id", "")
+            if not tool_use_id:
+                logger.warning("anthropic._convert_message_to_ir: tool_result missing tool_use_id")
             result_content = block.get("content", "")
             if isinstance(result_content, list):
                 # 嵌套 blocks：若仅含 text block 则拼接为字符串；
@@ -226,6 +240,8 @@ def _convert_message_to_ir(role: str, content: Any) -> list[IRMessage]:
             ])
             tool_msg.name = None
             tool_messages.append(tool_msg)
+        else:
+            logger.debug("anthropic._convert_message_to_ir: skipped unknown block type=%s", block_type)
 
     # 统一拆分：先放 blocks 消息（如有），再放 tool_messages
     if tool_messages:
@@ -294,27 +310,43 @@ def response_from_ir(ir: IRResponse) -> dict[str, Any]:
 def response_to_ir(body: dict[str, Any]) -> IRResponse:
     """Anthropic Messages 响应体 → IRResponse。"""
     content_blocks: list[IRContentBlock] = []
-    for block in body.get("content") or []:
+    raw_blocks = body.get("content") or []
+    if not raw_blocks:
+        logger.debug("anthropic.response_to_ir: empty content in response body")
+    
+    for block in raw_blocks:
         if not isinstance(block, dict):
+            logger.debug("anthropic.response_to_ir: skipped non-dict content block: %r", block)
             continue
         block_type = block.get("type", "")
         if block_type == "text":
             content_blocks.append(IRTextBlock(text=block.get("text", "")))
         elif block_type == "thinking":
+            thinking = block.get("thinking", "")
+            if not thinking:
+                logger.debug("anthropic.response_to_ir: thinking block with empty content (id=%s)", body.get("id", ""))
             content_blocks.append(IRThinkingBlock(
-                thinking=block.get("thinking", ""),
+                thinking=thinking,
                 signature=block.get("signature"),
             ))
         elif block_type == "tool_use":
+            call_id = block.get("id", "")
+            tool_name = block.get("name", "")
+            if not call_id:
+                logger.warning("anthropic.response_to_ir: tool_use missing id")
+            if not tool_name:
+                logger.warning("anthropic.response_to_ir: tool_use missing name (id=%s)", call_id)
             content_blocks.append(IRToolUseBlock(
-                id=block.get("id", ""),
-                name=block.get("name", ""),
+                id=call_id,
+                name=tool_name,
                 input=block.get("input", {}) or {},
             ))
         elif block_type == "redacted_thinking":
             content_blocks.append(IRRedactedThinkingBlock(
                 data=block.get("data", ""),
             ))
+        else:
+            logger.debug("anthropic.response_to_ir: skipped unknown content block type=%s", block_type)
 
     if not content_blocks:
         content_blocks.append(IRTextBlock(text=""))
@@ -401,8 +433,8 @@ def to_upstream(ir: IRRequest, upstream_model: str | None = None) -> dict[str, A
     # tool_choice
     if ir.tool_choice is not None:
         tc = ir.tool_choice
-        if isinstance(tc, str):
-            # Chat/Responses "required" → Anthropic "any"
+        if tc in ("auto", "any", "none", "required"):
+            # "required" (Chat/OpenAI) → "any" (Anthropic)
             result["tool_choice"] = "any" if tc == "required" else tc
         elif isinstance(tc, dict) and tc.get("type") == "function":
             # IR 规范形式（Chat 嵌套）→ Anthropic {"type": "tool", "name": ...}
@@ -410,6 +442,9 @@ def to_upstream(ir: IRRequest, upstream_model: str | None = None) -> dict[str, A
                 "type": "tool",
                 "name": tc.get("function", {}).get("name", "") or tc.get("name", ""),
             }
+        elif isinstance(tc, dict) and tc.get("type") == "required":
+            # dict 形式的 required：{"type": "required"} → "any"
+            result["tool_choice"] = "any"
         else:
             result["tool_choice"] = tc
 
@@ -512,20 +547,10 @@ async def parse_stream_to_ir(
     latest_usage: dict | None = None
 
     async for raw_line in resp.aiter_lines():
-        # Anthropic SSE 用 "event: X" + "data: Y" 配对
-        # parse_sse_line 不会处理 event 头（只返回 None），所以需要先缓存 event 名
-        # 这里简化：read full event pair
+        # Anthropic SSE 用 "event: X" + "data: Y" 配对，但 event 头是冗余的——
+        # data payload 中的 "type" 字段才是权威来源，直接忽略 event 头
         line = raw_line.rstrip("\r")
         if not line or line.startswith(":"):
-            continue
-
-        if line.startswith("event: "):
-            # 把 event name 累积下来，与下一个 data 配对
-            # 简化处理：用一个小 list 缓存单 event 流
-            # 但 aiter_lines 是 line-by-line，所以我们需要手动累积
-            # 改成：直接解析 data: 行（event 名通常也编码在 data 里）
-            # 为简化，这里使用一个延迟策略：等下一行
-            current_event = line[7:].strip()
             continue
 
         if line.startswith("data: "):
@@ -534,17 +559,33 @@ async def parse_stream_to_ir(
                 break
             try:
                 event = json.loads(data_str)
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as exc:
+                logger.debug(
+                    "anthropic.parse_stream_to_ir: failed to parse SSE data (%s): %s",
+                    exc, data_str[:200],
+                )
                 continue
         else:
             continue
 
+        if not isinstance(event, dict):
+            logger.debug("anthropic.parse_stream_to_ir: non-dict event payload, skipped: %r", data_str[:200])
+            continue
+
         event_type = event.get("type", "")
+        if not event_type:
+            logger.debug("anthropic.parse_stream_to_ir: event missing 'type' field: %r", data_str[:200])
+            continue
 
         if event_type == "message_start":
             msg = event.get("message", {})
             message_id = msg.get("id", message_id)
             message_model = msg.get("model", message_model)
+            # message_start 携带完整 input_tokens（output_tokens 通常为 0），
+            # 作为 usage 基线；message_delta 只含增量字段，需 merge 而非覆盖
+            start_usage = msg.get("usage")
+            if isinstance(start_usage, dict) and start_usage:
+                latest_usage = start_usage
             if not message_started:
                 yield IRStreamEvent(
                     type="message_start",
@@ -555,6 +596,9 @@ async def parse_stream_to_ir(
         elif event_type == "content_block_start":
             block_index = event.get("index", 0)
             block = event.get("content_block", {})
+            if not isinstance(block, dict):
+                logger.debug("anthropic.parse_stream_to_ir: content_block_start with non-dict block: %r", event)
+                continue
             block_type = block.get("type", "")
             if block_type == "thinking":
                 blocks[block_index] = {"type": "thinking", "open": True}
@@ -563,11 +607,15 @@ async def parse_stream_to_ir(
                 blocks[block_index] = {"type": "text", "open": True}
                 yield IRStreamEvent(type="text_start", data={"index": block_index})
             elif block_type == "tool_use":
+                tool_id = block.get("id", f"toolu_{uuid.uuid4().hex[:24]}")
+                tool_name = block.get("name", "")
+                if not tool_name:
+                    logger.warning("anthropic.parse_stream_to_ir: tool_use block missing name (id=%s)", tool_id)
                 blocks[block_index] = {
                     "type": "tool_use",
                     "open": True,
-                    "id": block.get("id", f"toolu_{uuid.uuid4().hex[:24]}"),
-                    "name": block.get("name", ""),
+                    "id": tool_id,
+                    "name": tool_name,
                     "args": IncrementalJSONParser(),
                 }
                 yield IRStreamEvent(
@@ -582,13 +630,19 @@ async def parse_stream_to_ir(
                 blocks[block_index] = {"type": "thinking", "open": False, "redacted": True}
                 yield IRStreamEvent(type="thinking_start", data={"index": block_index, "redacted": True})
                 yield IRStreamEvent(type="thinking_end", data={"index": block_index})
+            else:
+                logger.debug("anthropic.parse_stream_to_ir: unknown content_block type=%s at index %d", block_type, block_index)
 
         elif event_type == "content_block_delta":
             block_index = event.get("index", 0)
             delta = event.get("delta", {})
+            if not isinstance(delta, dict):
+                logger.debug("anthropic.parse_stream_to_ir: content_block_delta with non-dict delta: %r", event)
+                continue
             delta_type = delta.get("type", "")
             block = blocks.get(block_index)
             if not block:
+                logger.debug("anthropic.parse_stream_to_ir: content_block_delta for unknown block index %d", block_index)
                 continue
             if delta_type == "thinking_delta":
                 thinking_text = delta.get("thinking", "")
@@ -612,6 +666,8 @@ async def parse_stream_to_ir(
                         type="tool_use_delta",
                         data={"id": block["id"], "arguments_delta": fragment},
                     )
+            else:
+                logger.debug("anthropic.parse_stream_to_ir: unknown delta type=%s at index %d", delta_type, block_index)
 
         elif event_type == "content_block_stop":
             block_index = event.get("index", 0)
@@ -638,7 +694,12 @@ async def parse_stream_to_ir(
                 pending_stop_reason = delta["stop_reason"]
             usage_raw = event.get("usage")
             if isinstance(usage_raw, dict) and usage_raw:
-                latest_usage = usage_raw
+                # message_delta 通常只含 output_tokens 增量，需与 message_start
+                # 的 input_tokens 基线 merge，否则 input_tokens 会丢失为 0
+                if latest_usage:
+                    latest_usage = {**latest_usage, **usage_raw}
+                else:
+                    latest_usage = usage_raw
 
         elif event_type == "message_stop":
             # 闭合所有仍 open 的 block（Anthropic 异常情况下可能没发 content_block_stop）

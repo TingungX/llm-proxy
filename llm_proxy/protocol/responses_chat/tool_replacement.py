@@ -85,6 +85,8 @@ APPLY_PATCH_SINGLE_TOOL_DEF: dict = {
                     "description": (
                         "The exact text to be replaced. Must not be empty. "
                         "Include surrounding context lines to disambiguate. "
+                        "IMPORTANT: Preserve the original indentation of the first line "
+                        "from the file. Do not strip leading whitespace. "
                         "Required for update_file."
                     ),
                 },
@@ -92,7 +94,9 @@ APPLY_PATCH_SINGLE_TOOL_DEF: dict = {
                     "type": "string",
                     "description": (
                         "The replacement text. Include the same surrounding "
-                        "context lines that were in old_str. Required for update_file."
+                        "context lines that were in old_str. "
+                        "IMPORTANT: The first line must match the indentation "
+                        "of the corresponding old_str line. Required for update_file."
                     ),
                 },
                 "destinationPath": {
@@ -135,14 +139,16 @@ APPLY_PATCH_SINGLE_TOOL_DEF: dict = {
                                 "minLength": 1,
                                 "description": (
                                     "Text to replace. Required for update_file. "
-                                    "Include surrounding context lines to disambiguate."
+                                    "Include surrounding context lines to disambiguate. "
+                                    "IMPORTANT: Preserve original indentation of the first line."
                                 ),
                             },
                             "new_str": {
                                 "type": "string",
                                 "description": (
                                     "Replacement text. Required for update_file. "
-                                    "Include the same surrounding context lines as old_str."
+                                    "Include the same surrounding context lines as old_str. "
+                                    "IMPORTANT: First line must match old_str indentation."
                                 ),
                             },
                             "destinationPath": {

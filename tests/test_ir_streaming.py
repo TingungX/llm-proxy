@@ -150,15 +150,40 @@ class TestIncrementalJSONParser:
         assert p.feed('}') == {"a": 1}
 
     def test_finalize_partial(self):
+        """截断的 JSON 应被修复（补全缺失的值和括号），返回部分恢复的 dict。"""
         p = IncrementalJSONParser()
         p.feed('{"a": 1, "b":')
         result = p.finalize()
-        assert result == {"_raw": '{"a": 1, "b":'}
+        # "b": 后无值 → 补 null，再补 }
+        assert result == {"a": 1, "b": None}
 
     def test_finalize_empty(self):
         p = IncrementalJSONParser()
         result = p.finalize()
         assert result == {}
+
+    def test_finalize_truncated_string(self):
+        """字符串值中途截断应被修复（补全引号+括号）。"""
+        p = IncrementalJSONParser()
+        p.feed('{"action": "update_file", "old_str": "some text')
+        result = p.finalize()
+        assert result == {"action": "update_file", "old_str": "some text"}
+
+    def test_finalize_truncated_batch(self):
+        """batch 操作数组中途截断应被修复（模拟上游流截断）。"""
+        p = IncrementalJSONParser()
+        p.feed('{"action": "batch", "operations": [{"action":"update_file","filePath":"/foo.py","old_str":"old')
+        result = p.finalize()
+        assert result["action"] == "batch"
+        assert len(result["operations"]) == 1
+        assert result["operations"][0]["filePath"] == "/foo.py"
+
+    def test_finalize_trailing_comma(self):
+        """末尾逗号后截断应去掉逗号。"""
+        p = IncrementalJSONParser()
+        p.feed('{"a": 1, "b": 2,')
+        result = p.finalize()
+        assert result == {"a": 1, "b": 2}
 
 
 class TestSSELineAccumulator:
@@ -469,6 +494,65 @@ class TestAnthropicParseStream:
         assert ends[0].data["id"] == "toolu_1"
         assert ends[0].data["input"] == {"q": "x"}
 
+    async def test_usage_merge_message_start_and_delta(self):
+        """message_start 的 input_tokens 与 message_delta 的 output_tokens 应 merge。
+
+        Anthropic 流式规范：message_start.usage 含 input_tokens（output_tokens 为 0），
+        message_delta.usage 通常只含 output_tokens 增量。IR 层需字段级 merge，
+        否则 input_tokens 会被覆盖为 0。
+        """
+        sse = [
+            'event: message_start',
+            'data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude","content":[],"stop_reason":null,"usage":{"input_tokens":42,"output_tokens":0}}}',
+            '',
+            'event: content_block_start',
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+            '',
+            'event: content_block_delta',
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}',
+            '',
+            'event: content_block_stop',
+            'data: {"type":"content_block_stop","index":0}',
+            '',
+            'event: message_delta',
+            'data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":7}}',
+            '',
+            'event: message_stop',
+            'data: {"type":"message_stop"}',
+            '',
+        ]
+        resp = MockResp(sse)
+        events = await _collect(anthropic_parse(resp, model='claude'))
+        usage_ev = [e for e in events if e.type == "usage"]
+        assert len(usage_ev) == 1
+        assert usage_ev[0].data == {"input_tokens": 42, "output_tokens": 7}
+
+    async def test_usage_delta_with_cache_tokens(self):
+        """message_delta 携带 cache 字段时应与 message_start 基线 merge。"""
+        sse = [
+            'event: message_start',
+            'data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude","content":[],"stop_reason":null,"usage":{"input_tokens":100,"output_tokens":0,"cache_read_input_tokens":50}}}',
+            '',
+            'event: content_block_start',
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+            '',
+            'event: content_block_stop',
+            'data: {"type":"content_block_stop","index":0}',
+            '',
+            'event: message_delta',
+            'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":20}}',
+            '',
+            'event: message_stop',
+            'data: {"type":"message_stop"}',
+            '',
+        ]
+        resp = MockResp(sse)
+        events = await _collect(anthropic_parse(resp, model='claude'))
+        usage_ev = [e for e in events if e.type == "usage"]
+        assert len(usage_ev) == 1
+        assert usage_ev[0].data["input_tokens"] == 100
+        assert usage_ev[0].data["output_tokens"] == 20
+
 
 class TestAnthropicFormat:
     async def test_ir_to_anthropic_sse(self):
@@ -673,6 +757,62 @@ class TestResponsesFormat:
         # 含 namespace 字段，且 name 被还原为原始子工具名
         assert '"name": "search"' in text or '"name":\\n"search"' in text
         assert '"namespace": "mcp__web_search"' in text
+
+    async def test_duplicate_call_id_not_overwritten(self):
+        """两个相同 call_id 的 function_call 不应互相覆盖 arguments。
+
+        回归测试：tool_args_buf 用 current_item_id（唯一）作 key，
+        而非 call_id（可能重复）。若用 call_id 作 key，第二个 call 的
+        arguments 会覆盖第一个，导致 output_item.done 中 arguments 为空。
+        """
+        async def events_aiter():
+            for e in [
+            IRStreamEvent("message_start", {"id": "resp_1", "model": "gpt-5"}),
+            # 第一个 tool_call（call_id="dup"）
+            IRStreamEvent("tool_use_start", {"id": "dup", "name": "search"}),
+            IRStreamEvent("tool_use_delta", {"id": "dup", "arguments_delta": '{"q":"first"}'}),
+            IRStreamEvent("tool_use_end", {"id": "dup", "input": {"q": "first"}}),
+            # 第二个 tool_call（call_id 相同="dup"）
+            IRStreamEvent("tool_use_start", {"id": "dup", "name": "search"}),
+            IRStreamEvent("tool_use_delta", {"id": "dup", "arguments_delta": '{"q":"second"}'}),
+            IRStreamEvent("tool_use_end", {"id": "dup", "input": {"q": "second"}}),
+            IRStreamEvent("message_stop", {"stop_reason": "tool_use"}),
+        ]:
+                yield e
+        events_aiter = events_aiter()
+        chunks = []
+        async for b in responses_format(events_aiter, model='gpt-5'):
+            chunks.append(b)
+        text = b''.join(chunks).decode()
+        # 两个 function_call 的 arguments 都应存在（不被互相覆盖）
+        assert '\\"q\\":\\"first\\"' in text
+        assert '\\"q\\":\\"second\\"' in text
+
+    async def test_response_id_consistency(self):
+        """message_start 带来的 id 应与 response.completed 的 id 一致。
+
+        回归测试：response.created 不预生成 id（用空字符串），
+        message_start 带来的上游 id 从 response.in_progress 开始统一使用，
+        response.completed 也用同一 id。
+        """
+        async def events_aiter():
+            for e in [
+            IRStreamEvent("message_start", {"id": "resp_from_upstream", "model": "gpt-5"}),
+            IRStreamEvent("text_start", {}),
+            IRStreamEvent("text_delta", {"text": "Hi"}),
+            IRStreamEvent("text_end", {}),
+            IRStreamEvent("message_stop", {"stop_reason": "end_turn"}),
+        ]:
+                yield e
+        events_aiter = events_aiter()
+        chunks = []
+        async for b in responses_format(events_aiter, model='gpt-5'):
+            chunks.append(b)
+        text = b''.join(chunks).decode()
+        # response.created 的 id 为空
+        assert '"id": ""' in text
+        # response.in_progress 和 response.completed 都用 message_start 带来的 id
+        assert '"id": "resp_from_upstream"' in text
 
 
 # ── 跨协议流式 ────────────────────────────────────────────────────

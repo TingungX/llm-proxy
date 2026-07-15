@@ -52,8 +52,9 @@ def to_ir(body: dict[str, Any]) -> IRRequest:
     model = body.get("model", "")
 
     messages: list[IRMessage] = []
-    for msg in body.get("messages") or []:
+    for idx, msg in enumerate(body.get("messages") or []):
         if not isinstance(msg, dict):
+            logger.debug("chat.to_ir: skipped non-dict message at index %d: %r", idx, msg)
             continue
         role = msg.get("role", "user")
         content = msg.get("content")
@@ -61,6 +62,14 @@ def to_ir(body: dict[str, Any]) -> IRRequest:
         # 提取 reasoning_content
         reasoning_content = msg.get("reasoning_content")
         tool_call_id = msg.get("tool_call_id") if role == "tool" else None
+        if role == "tool" and not tool_call_id:
+            logger.warning(
+                "chat.to_ir: tool message missing tool_call_id at index %d — "
+                "upstream may reject as orphan tool_call",
+                idx,
+            )
+        if role not in ("system", "user", "assistant", "tool", "developer"):
+            logger.debug("chat.to_ir: unrecognized role=%r at index %d", role, idx)
         converted = _convert_message_to_ir(role, content, reasoning_content, tool_call_id=tool_call_id)
         messages.extend(converted)
 
@@ -170,6 +179,7 @@ def _convert_message_to_ir(
     elif isinstance(content, list):
         for part in content:
             if not isinstance(part, dict):
+                logger.debug("chat._convert_message_to_ir: skipped non-dict content part: %r", part)
                 continue
             part_type = part.get("type", "")
             if part_type == "text":
@@ -186,6 +196,8 @@ def _convert_message_to_ir(
             elif part_type == "refusal":
                 # refusal 降级为 text
                 blocks.append(IRTextBlock(text=part.get("refusal", "")))
+            else:
+                logger.debug("chat._convert_message_to_ir: skipped unknown part type=%s", part_type)
     elif isinstance(content, dict):
         # 嵌套 dict 当 text
         blocks.append(IRTextBlock(text=str(content)))
@@ -242,6 +254,7 @@ def response_from_ir(ir: IRResponse) -> dict[str, Any]:
     tool_calls: list[dict] = []
     reasoning_text: str | None = None
     reasoning_parts: list[str] = []
+    skipped_blocks = 0
 
     for block in ir.content_blocks:
         if isinstance(block, IRTextBlock):
@@ -328,6 +341,7 @@ def response_to_ir(body: dict[str, Any]) -> IRResponse:
     """Chat Completions 响应体 → IRResponse。"""
     choices = body.get("choices") or []
     if not choices:
+        logger.debug("chat.response_to_ir: empty choices in response body")
         return IRResponse(
             id=body.get("id", ""),
             model=body.get("model", ""),
@@ -363,6 +377,7 @@ def response_to_ir(body: dict[str, Any]) -> IRResponse:
         elif isinstance(content, list):
             for part in content:
                 if not isinstance(part, dict):
+                    logger.debug("chat.response_to_ir: skipped non-dict content part: %r", part)
                     continue
                 ptype = part.get("type", "")
                 if ptype == "text":
@@ -371,15 +386,28 @@ def response_to_ir(body: dict[str, Any]) -> IRResponse:
                 elif ptype == "refusal":
                     if part.get("refusal"):
                         blocks.append(IRTextBlock(text=part["refusal"]))
+                else:
+                    logger.debug("chat.response_to_ir: skipped unknown content part type=%s", ptype)
 
     for tc in message.get("tool_calls") or []:
-        if not isinstance(tc, dict) or tc.get("type") != "function":
+        if not isinstance(tc, dict):
+            logger.debug("chat.response_to_ir: skipped non-dict tool_call: %r", tc)
+            continue
+        if tc.get("type") != "function":
+            logger.debug("chat.response_to_ir: skipped tool_call with non-function type=%s", tc.get("type"))
             continue
         func = tc.get("function", {})
+        if not isinstance(func, dict):
+            logger.debug("chat.response_to_ir: skipped tool_call with non-dict function: %r", tc)
+            continue
         arguments = safe_json_loads(func.get("arguments", "{}"), default={})
+        call_id = tc.get("id", f"call_{uuid.uuid4().hex[:24]}")
+        tool_name = func.get("name", "")
+        if not tool_name:
+            logger.warning("chat.response_to_ir: tool_call missing name (id=%s)", call_id)
         blocks.append(IRToolUseBlock(
-            id=tc.get("id", f"call_{uuid.uuid4().hex[:24]}"),
-            name=func.get("name", ""),
+            id=call_id,
+            name=tool_name,
             input=arguments if isinstance(arguments, dict) else {},
         ))
 
@@ -494,6 +522,7 @@ def _message_ir_to_chat(msg: IRMessage) -> list[dict[str, Any]]:
     # developer role 是 OpenAI 引入的新 role，部分上游（如 DeepSeek）不兼容
     # 标准 Chat Completions 无 developer，应降级为 system
     if role == "developer":
+        logger.debug("chat._message_ir_to_chat: developer role downgraded to system")
         role = "system"
 
     if role == "tool":
@@ -503,6 +532,8 @@ def _message_ir_to_chat(msg: IRMessage) -> list[dict[str, Any]]:
         if isinstance(content, list):
             for block in content:
                 if isinstance(block, IRToolResultBlock):
+                    if not block.tool_use_id:
+                        logger.warning("chat._message_ir_to_chat: tool_result missing tool_use_id")
                     # content 可能是 str 或 list（含 image 等非 text block）。
                     # Chat 不支持 tool result 中含 image，提取 text 部分（lossy）。
                     block_content = block.content
@@ -516,8 +547,11 @@ def _message_ir_to_chat(msg: IRMessage) -> list[dict[str, Any]]:
                         "tool_call_id": block.tool_use_id,
                         "content": block_content,
                     })
+                else:
+                    logger.debug("chat._message_ir_to_chat: skipped non-tool_result block in tool message: %s", type(block).__name__)
         if not result:
             # 降级：无 IRToolResultBlock 时保留纯字符串内容
+            logger.warning("chat._message_ir_to_chat: tool message has no IRToolResultBlock, using fallback")
             fallback = str(content) if not isinstance(content, str) else content
             result.append({"role": "tool", "content": fallback})
         return result
@@ -629,6 +663,7 @@ async def parse_stream_to_ir(
 
         chunk = parsed
         if not isinstance(chunk, dict):
+            logger.debug("chat.parse_stream_to_ir: skipped non-dict chunk: %r", parsed[:200] if isinstance(parsed, str) else parsed)
             continue
 
         # 首个有效 chunk：emit message_start
@@ -648,6 +683,7 @@ async def parse_stream_to_ir(
 
         choices = chunk.get("choices") or []
         if not choices:
+            logger.debug("chat.parse_stream_to_ir: chunk has no choices (id=%s)", chunk.get("id", ""))
             continue
         choice = choices[0]
         delta = choice.get("delta") or {}

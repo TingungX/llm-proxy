@@ -34,6 +34,7 @@ from llm_proxy.protocol.errors import make_anthropic_error, make_openai_error
 from llm_proxy.protocol.ir import REGISTRY, _resolve
 from llm_proxy.protocol.ir._stream import keepalive_wrapper
 from llm_proxy.protocol.ir.types import IRStreamEvent
+from llm_proxy.services.tool_call_fix import fix_orphaned_tool_calls
 from llm_proxy.state import get_state
 from llm_proxy.logging_config import REQUEST_ID_CTX
 
@@ -197,6 +198,13 @@ class IRProxyStep(HandlerStep):
             self._record_usage(ctx, 0, 0, status="error", error_type="ir_conversion_error")
             raise
 
+        # Chat 上游严格校验 tool_call_id 配对：每个 tool 消息必须能在前序
+        # assistant(tool_calls) 找到对应 id。Codex 中断 apply_patch 后重建的
+        # history 可能携带孤立 tool result（id 无对应 tool_call），触发上游 400。
+        # 发给上游前统一清理（孤立 tool result 降级为 user，缺 result 补占位）。
+        if upstream_proto == "openai" and isinstance(upstream_body.get("messages"), list):
+            upstream_body["messages"] = fix_orphaned_tool_calls(upstream_body["messages"])
+
         # ── 请求头 ──
         if upstream_proto == "anthropic":
             req_headers = {
@@ -259,7 +267,10 @@ class IRProxyStep(HandlerStep):
                     logger.warning(f"IR non-stream connect error: {e}, retrying in {wait}s (attempt {attempt + 1}/{_RETRY_MAX + 1})")
                     await asyncio.sleep(wait)
                     continue
-                logger.error(f"IR proxy request error: {e}", exc_info=True)
+                logger.error(
+                    "IR proxy request error [target=%s, model=%s]: %s",
+                    target_url, model_id, e, exc_info=True,
+                )
                 self._record_usage(ctx, 0, 0, status="error", error_type=_classify_stream_error(e))
                 raise
             # 429/503 重试
@@ -425,7 +436,10 @@ class IRProxyStep(HandlerStep):
                         continue
                     # 不可重试：发 error event 给客户端后终止
                     error_type = _classify_stream_error(e)
-                    logger.error(f"IR stream error ({error_type}): {e}", exc_info=True)
+                    logger.error(
+                        "IR stream error (%s) [target=%s, model=%s]: %s",
+                        error_type, target_url, model_id, e, exc_info=True,
+                    )
                     had_error = True
                     err_events = _err_event_gen(
                         {"message": f"Proxy error: {type(e).__name__}: {e}"},
@@ -501,5 +515,3 @@ async def _err_event_gen(err_data: dict, client_protocol: str):
             "code": err_data.get("error", {}).get("code", "api_error") if isinstance(err_data.get("error"), dict) else "api_error",
         },
     )
-
-

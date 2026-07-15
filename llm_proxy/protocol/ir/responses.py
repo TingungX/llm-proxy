@@ -211,15 +211,17 @@ def _convert_input_to_ir_messages(input_data: list) -> list[IRMessage]:
         if item_type == "message":
             role = item.get("role", "user")
             content = item.get("content")
-            text = _extract_message_text(content)
-            if text is not None:
+            content_ir = _extract_message_content(content)
+            if content_ir is not None:
                 if role == "assistant":
-                    if pending_assistant_text is None:
-                        pending_assistant_text = ""
-                    pending_assistant_text += text
+                    text = _content_to_text(content_ir)
+                    if text:
+                        if pending_assistant_text is None:
+                            pending_assistant_text = ""
+                        pending_assistant_text += text
                 else:
                     flush_assistant()
-                    messages.append(IRMessage(role=role, content=text))
+                    messages.append(IRMessage(role=role, content=content_ir))
 
         elif item_type == "reasoning":
             text = _extract_reasoning_text(item)
@@ -282,11 +284,21 @@ def _convert_input_to_ir_messages(input_data: list) -> list[IRMessage]:
                             content=dop.get("args", {}).get("content", ""),
                         ))
                 else:
-                    flush_assistant()
-                    messages.append(IRMessage(
-                        role="user",
-                        content=f"[File was modified]\n{input_text}",
+                    # DSL 解析失败（input 为空或格式错误）。
+                    # 保留 tool_call（不降级为 user），让 tool result 配对完整。
+                    # input 用空 batch（符合 schema，上游不会拒绝），
+                    # Codex 的报错在 tool result 里，模型能看到"apply_patch 调用失败"。
+                    # 这避免了丢弃 tool_call 导致的孤立 tool result → 上游 400。
+                    call_id = item.get("call_id", "") or item.get("id", "")
+                    pending_tool_calls.append(IRToolUseBlock(
+                        id=call_id,
+                        name="apply_patch",
+                        input={"action": "batch", "operations": []},
                     ))
+                    logger.warning(
+                        "apply_patch DSL parse failed, keeping tool_call (call_id=%s, input_len=%d)",
+                        call_id, len(input_text),
+                    )
             else:
                 input_text = item.get("input", "")
                 if not isinstance(input_text, str):
@@ -322,11 +334,25 @@ def _convert_input_to_ir_messages(input_data: list) -> list[IRMessage]:
 
 def _extract_message_text(content) -> str | None:
     """从 Responses message.content 数组中提取文本。"""
+    extracted = _extract_message_content(content)
+    if extracted is None:
+        return None
+    return _content_to_text(extracted)
+
+
+def _extract_message_content(content) -> str | list[IRContentBlock] | None:
+    """从 Responses message.content 提取 IR 内容。
+
+    data URL 形式的 input_image 可无损进入 IRImageBlock；远程 URL 暂不引入
+    URL 型 IR，继续降级为文本占位。
+    """
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
         return None
-    parts: list[str] = []
+
+    blocks: list[IRContentBlock] = []
+    has_image_block = False
     for p in content:
         if not isinstance(p, dict):
             continue
@@ -334,13 +360,52 @@ def _extract_message_text(content) -> str | None:
         if ptype in ("input_text", "output_text"):
             text = p.get("text", "")
             if text:
-                parts.append(text)
+                blocks.append(IRTextBlock(text=text))
         elif ptype == "input_image":
-            url = p.get("image_url", "")
-            if url:
-                parts.append(f"[image: {url}]")
+            url = p.get("image_url") or p.get("image", {}).get("url", "")
+            if not url:
+                continue
+            if isinstance(url, str) and url.startswith("data:"):
+                media_type, data = _parse_data_url(url)
+                blocks.append(IRImageBlock(base64_data=data, media_type=media_type))
+                has_image_block = True
+            else:
+                blocks.append(IRTextBlock(text=f"[image: {url}]"))
         # 其他类型（refusal 等）忽略
-    return "\n".join(parts) if parts else None
+
+    if not blocks:
+        return None
+    if has_image_block:
+        return blocks
+    return _content_to_text(blocks)
+
+
+def _content_to_text(content: str | list[IRContentBlock]) -> str:
+    if isinstance(content, str):
+        return content
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, IRTextBlock) and block.text:
+            parts.append(block.text)
+        elif isinstance(block, IRImageBlock):
+            parts.append(f"[image: data:{block.media_type};base64,{block.base64_data}]")
+    return "\n".join(parts)
+
+
+def _parse_data_url(url: str) -> tuple[str, str]:
+    """data:URL → (media_type, base64_data)。"""
+    if not url.startswith("data:"):
+        return "image/png", ""
+    rest = url[5:]
+    if ";" in rest:
+        media_type, rest = rest.split(";", 1)
+    else:
+        media_type = "image/png"
+    if rest.startswith("base64,"):
+        data = rest[7:]
+    else:
+        data = rest
+    return media_type or "image/png", data
 
 
 def _extract_reasoning_text(item: dict) -> str:
@@ -622,8 +687,15 @@ def response_to_ir(body: dict[str, Any]) -> IRResponse:
     """OpenAI Responses API 响应体 → IRResponse。"""
     blocks: list[IRContentBlock] = []
 
-    for item in body.get("output") or []:
+    raw_output = body.get("output")
+    if not raw_output:
+        logger.debug(
+            "responses.response_to_ir: empty output array (model=%s, id=%s)",
+            body.get("model", ""), body.get("id", ""),
+        )
+    for item in raw_output or []:
         if not isinstance(item, dict):
+            logger.debug("responses.response_to_ir: skipped non-dict output item: %r", item)
             continue
         item_type = item.get("type", "")
 
@@ -631,6 +703,7 @@ def response_to_ir(body: dict[str, Any]) -> IRResponse:
             content = item.get("content", [])
             for part in (content if isinstance(content, list) else []):
                 if not isinstance(part, dict):
+                    logger.debug("responses.response_to_ir: skipped non-dict content part: %r", part)
                     continue
                 ptype = part.get("type", "")
                 if ptype == "output_text":
@@ -639,11 +712,21 @@ def response_to_ir(body: dict[str, Any]) -> IRResponse:
                 elif ptype == "refusal":
                     if part.get("refusal"):
                         blocks.append(IRTextBlock(text=part["refusal"]))
+                else:
+                    logger.debug("responses.response_to_ir: skipped unknown content part type=%s", ptype)
 
         elif item_type == "function_call":
             arguments = safe_json_loads(item.get("arguments", "{}"), default={})
+            call_id = item.get("call_id") or item.get("id", "")
+            if not call_id:
+                logger.warning(
+                    "responses.response_to_ir: function_call missing call_id and id (name=%s)",
+                    item.get("name", ""),
+                )
+            if not item.get("name"):
+                logger.warning("responses.response_to_ir: function_call missing name (call_id=%s)", call_id)
             blocks.append(IRToolUseBlock(
-                id=item.get("call_id") or item.get("id", ""),
+                id=call_id,
                 name=item.get("name", ""),
                 input=arguments if isinstance(arguments, dict) else {},
             ))
@@ -652,6 +735,23 @@ def response_to_ir(body: dict[str, Any]) -> IRResponse:
             text = _extract_reasoning_text(item)
             if text:
                 blocks.append(IRThinkingBlock(thinking=text))
+            else:
+                logger.debug("responses.response_to_ir: reasoning item with empty summary (id=%s)", item.get("id", ""))
+
+        elif item_type == "custom_tool_call":
+            # 自定义工具调用（如 apply_patch 反向）—— 同 function_call 处理
+            input_text = item.get("input", "")
+            arguments = safe_json_loads(input_text, default={})
+            if not isinstance(arguments, dict):
+                arguments = {"_raw": input_text}
+            blocks.append(IRToolUseBlock(
+                id=item.get("call_id") or item.get("id", ""),
+                name=item.get("name", ""),
+                input=arguments,
+            ))
+
+        else:
+            logger.debug("responses.response_to_ir: skipped unknown output item type=%s", item_type)
 
     if not blocks:
         blocks.append(IRTextBlock(text=""))
@@ -767,12 +867,23 @@ def _messages_ir_to_responses_input(messages: list[IRMessage]) -> list[dict]:
                 items.append({"type": "message", "role": "user", "content": [
                     {"type": "input_text", "text": text}
                 ]})
+                logger.debug(
+                    "responses._messages_ir_to_responses_input: standalone system message demoted to user role "
+                    "(text_len=%d)",
+                    len(text),
+                )
             continue
 
         if role == "tool":
             if isinstance(content, list):
                 for block in content:
                     if isinstance(block, IRToolResultBlock):
+                        if not block.tool_use_id:
+                            logger.warning(
+                                "responses._messages_ir_to_responses_input: tool_result missing tool_use_id "
+                                "(content_len=%d) — upstream may reject as orphan tool_call",
+                                len(block.content or ""),
+                            )
                         # content 可能是 str 或 list（含 image 等非 text block）。
                         # Responses function_call_output 仅支持字符串，提取 text 部分（lossy）。
                         block_content = block.content
@@ -786,6 +897,17 @@ def _messages_ir_to_responses_input(messages: list[IRMessage]) -> list[dict]:
                             "call_id": block.tool_use_id,
                             "output": block_content,
                         })
+                    elif isinstance(block, IRTextBlock):
+                        # tool 角色但内容是纯文本（非 IRToolResultBlock）—— 容错降级
+                        logger.debug(
+                            "responses._messages_ir_to_responses_input: tool role with plain text block, "
+                            "skipping (text_len=%d)",
+                            len(block.text or ""),
+                        )
+            else:
+                logger.debug(
+                    "responses._messages_ir_to_responses_input: tool role with non-list content, skipping"
+                )
             continue
 
         if role == "assistant":
@@ -927,12 +1049,22 @@ async def parse_stream_to_ir(
             break
         try:
             event = json.loads(data_str)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            logger.debug(
+                "responses.parse_stream_to_ir: failed to parse SSE data (%s): %s",
+                exc, data_str[:200],
+            )
             continue
         if not isinstance(event, dict):
+            logger.debug(
+                "responses.parse_stream_to_ir: non-dict event payload, skipped: %r",
+                data_str[:200],
+            )
             continue
 
         event_type = event.get("type", "")
+        if not event_type:
+            logger.debug("responses.parse_stream_to_ir: event missing 'type' field: %r", data_str[:200])
 
         # Usage 提取（多个事件可能携带 usage）
         if isinstance(event.get("usage"), dict) and event["usage"]:
@@ -1150,7 +1282,7 @@ async def format_ir_as_sse(
     current_reasoning_index: int = 0
     reasoning_buf: str = ""
     text_buf: str = ""
-    tool_args_buf: dict = {}  # 累积所有 tool call 的 input（仅用于 reverse 时拼装）
+    tool_args_buf: dict = {}  # 累积所有 tool call 的 input（key=current_item_id，保证唯一）
     current_tool_call_id: str = ""
     current_tool_name: str = ""
     current_tool_downstream_name: str = ""  # reverse_tool_map[name] 后的名
@@ -1258,7 +1390,7 @@ async def format_ir_as_sse(
             text_buf = ""  # 立即清空，避免下一轮累积
         elif current_item_type == "function_call":
             # 普通 function_call
-            args_raw = tool_args_buf.get(current_tool_call_id, "")
+            args_raw = tool_args_buf.get(current_item_id, "")
             events_out.append(sse_format("response.function_call_arguments.done", {
                 "item_id": current_item_id,
                 "output_index": output_index,
@@ -1284,7 +1416,7 @@ async def format_ir_as_sse(
             all_output_items.append(item_payload)
         elif current_item_type == "custom_tool_call":
             # custom_tool_call（apply_patch 反向）
-            args_raw = tool_args_buf.get(current_tool_call_id, "")
+            args_raw = tool_args_buf.get(current_item_id, "")
             ctc_payload: dict[str, Any] = {
                 "id": current_item_id,
                 "type": "custom_tool_call",
@@ -1309,10 +1441,12 @@ async def format_ir_as_sse(
         return events_out
 
     # ── 起始：response.created ──
+    # id 暂为空，等 message_start 带来上游 id 后统一使用；
+    # 若 message_start 无 id，在 response.in_progress 或 response.completed 时兜底生成
     yield sse_format("response.created", {
         "sequence_number": next_seq(),
         "response": {
-            "id": f"resp_{uuid.uuid4().hex[:24]}",
+            "id": "",
             "object": "response",
             "created": created_ts,
             "model": model,
@@ -1334,7 +1468,7 @@ async def format_ir_as_sse(
         data = event.data or {}
 
         if etype == "message_start":
-            response_id = data.get("id") or response_id
+            response_id = data.get("id") or response_id or f"resp_{uuid.uuid4().hex[:24]}"
             # 使用 client 侧映射名（model 参数 = ctx.response_model or actual_model）
             # 而非 data["model"]（上游原始名）
             if data.get("model"):
@@ -1453,7 +1587,7 @@ async def format_ir_as_sse(
             last_function_call_id = current_item_id
             current_tool_call_id = tool_call_id
             current_tool_name = upstream_name
-            tool_args_buf[tool_call_id] = ""
+            tool_args_buf[current_item_id] = ""
             has_function_calls = True
 
             # 决定是 custom_tool_call 还是 function_call
@@ -1502,7 +1636,7 @@ async def format_ir_as_sse(
         elif etype == "tool_use_delta":
             args_delta = data.get("arguments_delta", "")
             if args_delta and current_item_type == "function_call":
-                tool_args_buf[current_tool_call_id] = tool_args_buf.get(current_tool_call_id, "") + args_delta
+                tool_args_buf[current_item_id] = tool_args_buf.get(current_item_id, "") + args_delta
                 output_index = item_output_index()
                 yield sse_format("response.function_call_arguments.delta", {
                     "item_id": current_item_id,
@@ -1519,10 +1653,10 @@ async def format_ir_as_sse(
                 if not isinstance(final_input, dict):
                     final_input = {}
                 # 若之前没流过 arguments delta，end 时一次写完
-                existing = tool_args_buf.get(current_tool_call_id, "")
+                existing = tool_args_buf.get(current_item_id, "")
                 if not existing:
                     full_args = safe_json_dumps(final_input, default="{}")
-                    tool_args_buf[current_tool_call_id] = full_args
+                    tool_args_buf[current_item_id] = full_args
                 for ev in close_current_item():
                     yield ev
             elif current_item_type == "custom_tool_call":
@@ -1538,7 +1672,7 @@ async def format_ir_as_sse(
                         input_text = safe_json_dumps(final_input, default="{}")
                 else:
                     input_text = str(final_input)
-                tool_args_buf[current_tool_call_id] = input_text
+                tool_args_buf[current_item_id] = input_text
                 # emit custom_tool_call_input.delta（一次性给完 input）
                 output_index = item_output_index()
                 yield sse_format("response.custom_tool_call_input.delta", {

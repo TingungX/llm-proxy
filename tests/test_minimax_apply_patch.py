@@ -3,10 +3,10 @@
 Reproduces: Codex→minimax-m3 stream_error after first tool call.
 
 Root cause (original): MiniMax upstream may send tool_call arguments as a JSON
-string with literal newlines (e.g. `{"input": "*** Begin Patch\n*** Add File: ..."`}),
+string with literal newlines (e.g. `{"input": "*** Begin Patch\n*** Add File: ..."`),
 which is technically invalid JSON. The IR Chat parser's IncrementalJSONParser fails
-to parse this, returning `{"_raw": "..."}`. The Responses IR custom_tool_call handler
-then can't extract the DSL from `_raw`, leaving Codex with an empty input.
+to parse this, returning an empty dict. The Responses IR custom_tool_call handler
+then can't extract the DSL, leaving Codex with an empty input.
 
 With the new structured parameters approach, the upstream should send
 `{"action": "add_file", "filePath": "...", "content": "..."}` format.
