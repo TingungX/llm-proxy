@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from typing import AsyncIterator
@@ -25,7 +26,7 @@ import socket
 import httpx
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from llm_proxy.handlers.base import HandlerStep, PipelineContext
+from llm_proxy.handlers.base import HandlerStep, PipelineContext, PipelineStop
 from llm_proxy.handlers.shared.paths import resolve_path
 from llm_proxy.infra import db
 from llm_proxy.infra.http_client import get_client
@@ -223,9 +224,42 @@ class IRProxyStep(HandlerStep):
                 "Content-Type": "application/json",
             }
 
+        # ── 预检：上游 body 大小 ──
+        # 部分上游（如讯飞 MaaS）对 input length 有字符数限制（262,144 chars）。
+        # 图片 base64 + 工具回调历史容易超限。这里在发送前检测，超限则提前拒绝
+        # 并给出明确错误原因，避免浪费上游调用和产生令人困惑的 stream_error。
+        body_text = json.dumps(upstream_body, ensure_ascii=False)
+        body_chars = len(body_text)
+        b64_images = re.findall(r'data:image/[^,]+;base64,([A-Za-z0-9+/=]+)', body_text)
+        b64_total = sum(len(b) for b in b64_images)
+        # 保守上限：上游字符限制一般不低于 context_window（token 数）。
+        # 文本场景 1 token ≈ 4 chars，但 base64 数据约 1 char = 1 char，
+        # 所以用 context_window（token）× 4 作为字符上限过于宽松。
+        # 用 context_window × 2 作为硬上限（覆盖文本 + 部分 base64 场景）。
+        context_window = s.config.get("models", {}).get(model_id.lower(), {}).get("context_window", 200000)
+        max_safe_chars = context_window * 2
+        if body_chars > max_safe_chars:
+            logger.warning(
+                f"IRProxyStep: rejecting oversize request (chars={body_chars}, "
+                f"b64_image_chars={b64_total}, max_safe={max_safe_chars}, "
+                f"model={model_id})"
+            )
+            self._record_usage(ctx, 0, 0, status="error", error_type="input_too_large")
+            raise PipelineStop(
+                make_openai_error(
+                    f"Request too large: ~{body_chars:,} chars "
+                    f"(text + ~{b64_total:,} base64 image chars). "
+                    f"Upstream limit is ~{context_window} tokens. "
+                    "Try reducing conversation history or image size.",
+                    "invalid_request_error",
+                    400,
+                )
+            )
+
         logger.debug(
             f"IRProxyStep: client={self.client_protocol} → upstream={upstream_protocol}, "
-            f"target={target_url}, stream={ir_request.stream}"
+            f"target={target_url}, stream={ir_request.stream}, "
+            f"body_chars={body_chars}, b64_chars={b64_total}"
         )
 
         # ── 分流：流式 / 非流式 ──
@@ -390,6 +424,7 @@ class IRProxyStep(HandlerStep):
                             error_text = error_body.decode("utf-8", errors="replace")
                             logger.error(f"Upstream stream error {resp.status_code}: {error_text[:500]}")
                             had_error = True
+                            error_type = f"upstream_{resp.status_code}"
                             err_data: dict = {}
                             try:
                                 err_data = json.loads(error_text)

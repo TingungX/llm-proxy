@@ -75,6 +75,25 @@ async def test_replace_images_in_responses_input(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_replace_images_in_responses_message_content(monkeypatch):
+    async def mock_resolve(url):
+        return "[描述：一张图]"
+    monkeypatch.setattr(
+        "llm_proxy.services.vision_service.resolve_image", mock_resolve
+    )
+
+    inp = [{"type": "message", "role": "user", "content": [
+        {"type": "input_text", "text": "hello"},
+        {"type": "input_image", "image_url": "data:image/png;base64,imgdata"},
+    ]}]
+    result = await replace_images_in_responses_input(inp)
+    assert result == [{"type": "message", "role": "user", "content": [
+        {"type": "input_text", "text": "hello"},
+        {"type": "input_text", "text": "[描述：一张图]"},
+    ]}]
+
+
+@pytest.mark.asyncio
 async def test_replace_images_in_anthropic_messages(monkeypatch):
     import base64
 

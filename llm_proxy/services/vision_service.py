@@ -113,16 +113,30 @@ async def replace_images_in_responses_input(input_data: list) -> list:
         if not isinstance(item, dict):
             result.append(item)
             continue
-        if item.get("type") != "input_image":
-            result.append(item)
+        if item.get("type") == "input_image":
+            result.append(await _responses_image_part_to_text(item))
             continue
-        url = item.get("image_url") or item.get("image", {}).get("url", "")
-        if url:
-            text = await resolve_image(url)
-            result.append({"type": "input_text", "text": text})
-        else:
-            result.append(item)
+        if item.get("type") == "message" and isinstance(item.get("content"), list):
+            new_item = dict(item)
+            new_content = []
+            for part in item["content"]:
+                if isinstance(part, dict) and part.get("type") == "input_image":
+                    new_content.append(await _responses_image_part_to_text(part))
+                else:
+                    new_content.append(part)
+            new_item["content"] = new_content
+            result.append(new_item)
+            continue
+        result.append(item)
     return result
+
+
+async def _responses_image_part_to_text(part: dict) -> dict:
+    url = part.get("image_url") or part.get("image", {}).get("url", "")
+    if not url:
+        return part
+    text = await resolve_image(url)
+    return {"type": "input_text", "text": text}
 
 
 async def replace_images_in_anthropic_messages(messages: list[dict]) -> list[dict]:
