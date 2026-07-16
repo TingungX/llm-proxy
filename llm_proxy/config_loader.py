@@ -14,8 +14,18 @@ logger = logging.getLogger(__name__)
 
 
 def load_config() -> dict:
-    with open(CONFIG_PATH) as f:
-        config = json.load(f)
+    try:
+        with open(CONFIG_PATH) as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        logger.error("Config file not found: %s", CONFIG_PATH)
+        raise
+    except json.JSONDecodeError as e:
+        logger.error(
+            "Config file JSON parse error at %s line %s col %s: %s",
+            CONFIG_PATH, e.lineno, e.colno, e.msg,
+        )
+        raise
     if "sidecar" in config:
         warnings.warn(
             "config.json 'sidecar' section is deprecated: sidecar has been replaced "

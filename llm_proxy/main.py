@@ -47,18 +47,44 @@ async def daily_cleanup():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    db.init_db()
-    lifecycle.info("Database initialized")
+    # ── Step 1: Database ──────────────────────────────────────
+    try:
+        db.init_db()
+        lifecycle.info("Database initialized at %s", db.DB_PATH)
+    except Exception as e:
+        lifecycle.error(
+            "Database initialization FAILED at %s: %s",
+            getattr(db, "DB_PATH", "unknown"),
+            e,
+            exc_info=True,
+        )
+        raise
 
+    # ── Step 2: Config / State ────────────────────────────────
     from llm_proxy.state import init_state, get_state
-    init_state()
-    lifecycle.info("State initialized")
+    try:
+        init_state()
+        lifecycle.info("State initialized")
+    except FileNotFoundError:
+        lifecycle.error(
+            "Config file not found at %s. Create config.json from config.example.json",
+            "config.json (check LLM_PROXY_CONFIG_PATH)",
+        )
+        raise
+    except Exception as e:
+        lifecycle.error("State initialization FAILED: %s", e, exc_info=True)
+        raise
 
+    # ── Step 3: Background tasks ──────────────────────────────
     aggregator_task = asyncio.create_task(hourly_aggregator())
     cleanup_task = asyncio.create_task(daily_cleanup())
     lifecycle.info("Background tasks started")
 
     state = get_state()
+    model_count = len(state.config.get("models", {}))
+    lifecycle.info(
+        "Server ready — %d models loaded, port 4000", model_count,
+    )
 
     yield
 

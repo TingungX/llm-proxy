@@ -15,7 +15,8 @@ async def access_log_middleware(request: Request, call_next):
         response: Response = await call_next(request)
     except PipelineStop as ps:
         duration_ms = (time.perf_counter() - start) * 1000
-        logger.info(
+        log_method = logger.warning if ps.response.status_code >= 400 else logger.info
+        log_method(
             "%s %s %s %.1fms",
             request.method,
             request.url.path,
@@ -25,7 +26,7 @@ async def access_log_middleware(request: Request, call_next):
         raise
     except Exception:
         duration_ms = (time.perf_counter() - start) * 1000
-        logger.info(
+        logger.warning(
             "%s %s 500 %.1fms",
             request.method,
             request.url.path,
@@ -33,7 +34,8 @@ async def access_log_middleware(request: Request, call_next):
         )
         raise
     duration_ms = (time.perf_counter() - start) * 1000
-    logger.info(
+    log_method = logger.warning if response.status_code >= 400 else logger.info
+    log_method(
         "%s %s %s %.1fms",
         request.method,
         request.url.path,

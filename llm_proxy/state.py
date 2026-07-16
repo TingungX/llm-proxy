@@ -10,6 +10,7 @@ from llm_proxy.config_loader import load_config
 from llm_proxy.infra.http_client import get_client
 
 logger = logging.getLogger(__name__)
+lifecycle = logging.getLogger("llm_proxy.lifecycle")
 
 
 def _get_enabled_protocols(model_cfg: dict) -> list[str]:
@@ -266,14 +267,27 @@ _instance: State | None = None
 
 def init_state(config: dict | None = None) -> State:
     global _instance
-    _instance = State(config or load_config())
+    cfg = config or load_config()
+    models_count = len(cfg.get("models", {}))
+    compression_enabled = cfg.get("compression", {}).get("enabled", False)
+    error_handling = cfg.get("error_handling", {})
+    lifecycle.info(
+        "Config loaded: %d models, compression=%s, failover=%s",
+        models_count,
+        compression_enabled,
+        error_handling.get("failover_enabled", False),
+    )
+    _instance = State(cfg)
     return _instance
 
 
 def get_state() -> State:
     global _instance
     if _instance is None:
-        _instance = State(load_config())
+        cfg = load_config()
+        models_count = len(cfg.get("models", {}))
+        lifecycle.info("Lazy-init state: %d models from config", models_count)
+        _instance = State(cfg)
     return _instance
 
 
