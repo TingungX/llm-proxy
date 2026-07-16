@@ -155,6 +155,209 @@ class TestAnthropicIRRoundtripRequest:
             "city": "San Francisco"
         }
 
+    def test_tool_result_with_base64_image_replaced_by_placeholder(self):
+        """tool result 含 base64 图片 → tool 消息 content 被替换为占位符，
+        额外生成 user 消息含 image_url。"""
+        import base64 as b64mod
+        from io import BytesIO
+        from PIL import Image
+
+        # 生成一个真实的 PNG 图片 base64（需通过 _detect_base64_image 验证）
+        # 纯 base64 路径要求 len >= 1000，用 300x300 确保超阈值
+        img = Image.new("RGB", (300, 300), color=(255, 0, 0))
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        raw_png_b64 = b64mod.b64encode(buf.getvalue()).decode("utf-8")
+        assert len(raw_png_b64) > 1000
+
+        body = {
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 200,
+            "messages": [
+                {"role": "user", "content": "Read the image"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "read_file",
+                     "input": {"path": "test.png"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1",
+                     "content": raw_png_b64},
+                ]},
+            ],
+        }
+        ir = anthropic_to_ir(body)
+        chat_body = chat_to_upstream(ir)
+        roles = [m["role"] for m in chat_body["messages"]]
+        # 应有 user → assistant → user(image_url) → tool(placeholder)
+        assert roles == ["user", "assistant", "user", "tool"]
+
+        # tool 消息 content 应被替换为占位符，不含原始 base64
+        tool_msg = chat_body["messages"][3]
+        assert tool_msg["role"] == "tool"
+        assert tool_msg["tool_call_id"] == "toolu_1"
+        assert "[image:" in tool_msg["content"]
+        assert raw_png_b64 not in tool_msg["content"]
+        assert len(tool_msg["content"]) < 50
+
+        # user 消息应含 image_url
+        image_msg = chat_body["messages"][2]
+        assert image_msg["role"] == "user"
+        assert image_msg["content"][0]["type"] == "image_url"
+        assert raw_png_b64 in image_msg["content"][0]["image_url"]["url"]
+
+    def test_tool_result_with_data_url_base64_image_replaced_by_placeholder(self):
+        """tool result 含 data:image/...;base64,... 格式 → 同样替换为占位符。"""
+        import base64 as b64mod
+        from io import BytesIO
+        from PIL import Image
+
+        img = Image.new("RGB", (300, 300), color=(0, 255, 0))
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        b64_data = b64mod.b64encode(buf.getvalue()).decode("utf-8")
+        data_url = f"data:image/png;base64,{b64_data}"
+
+        body = {
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 200,
+            "messages": [
+                {"role": "user", "content": "Read the image"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "read_file",
+                     "input": {"path": "test.png"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1",
+                     "content": data_url},
+                ]},
+            ],
+        }
+        ir = anthropic_to_ir(body)
+        chat_body = chat_to_upstream(ir)
+        roles = [m["role"] for m in chat_body["messages"]]
+        assert roles == ["user", "assistant", "user", "tool"]
+
+        tool_msg = chat_body["messages"][3]
+        assert "[image:" in tool_msg["content"]
+        assert b64_data not in tool_msg["content"]
+
+        image_msg = chat_body["messages"][2]
+        assert image_msg["content"][0]["type"] == "image_url"
+
+    def test_tool_result_with_plain_text_not_replaced(self):
+        """普通文本 tool result 不应被替换。"""
+        body = {
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 200,
+            "messages": [
+                {"role": "user", "content": "What's the weather?"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "get_weather",
+                     "input": {"city": "SF"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1",
+                     "content": "72°F, sunny"},
+                ]},
+            ],
+        }
+        ir = anthropic_to_ir(body)
+        chat_body = chat_to_upstream(ir)
+        roles = [m["role"] for m in chat_body["messages"]]
+        # 不应有额外的 user image 消息
+        assert roles == ["user", "assistant", "tool"]
+        tool_msg = chat_body["messages"][2]
+        assert tool_msg["content"] == "72°F, sunny"
+
+    def test_tool_result_base64_image_responses_channel(self):
+        """IR → Responses：tool result 含 base64 → function_call_output 用占位符 +
+        额外 user message 含 input_image。"""
+        import base64 as b64mod
+        from io import BytesIO
+        from PIL import Image
+
+        img = Image.new("RGB", (300, 300), color=(0, 0, 255))
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        raw_b64 = b64mod.b64encode(buf.getvalue()).decode("utf-8")
+
+        body = {
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 200,
+            "messages": [
+                {"role": "user", "content": "Read the image"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "read_file",
+                     "input": {"path": "test.png"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1",
+                     "content": raw_b64},
+                ]},
+            ],
+        }
+        ir = anthropic_to_ir(body)
+        resp_body = responses_to_upstream(ir)
+        items = resp_body["input"]
+
+        # 找到 function_call_output 和后续的 user message
+        fco = next(i for i in items if i.get("type") == "function_call_output")
+        assert fco["call_id"] == "toolu_1"
+        assert "[image:" in fco["output"]
+        assert raw_b64 not in fco["output"]
+
+        img_msg = next(
+            i for i in items
+            if i.get("type") == "message"
+            and i.get("role") == "user"
+            and any(c.get("type") == "input_image" for c in i.get("content", []))
+        )
+        assert img_msg["content"][0]["type"] == "input_image"
+        assert raw_b64 in img_msg["content"][0]["image_url"]
+
+    def test_tool_result_base64_image_anthropic_channel(self):
+        """IR → Anthropic：tool result 含 base64 → content 用占位符 + image block。"""
+        import base64 as b64mod
+        from io import BytesIO
+        from PIL import Image
+
+        img = Image.new("RGB", (300, 300), color=(255, 255, 0))
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        raw_b64 = b64mod.b64encode(buf.getvalue()).decode("utf-8")
+
+        body = {
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 200,
+            "messages": [
+                {"role": "user", "content": "Read the image"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "read_file",
+                     "input": {"path": "test.png"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1",
+                     "content": raw_b64},
+                ]},
+            ],
+        }
+        ir = anthropic_to_ir(body)
+        anth_body = anthropic_to_upstream(ir)
+        messages = anth_body["messages"]
+
+        # tool_result 在最后一条 user message 的 content 中
+        last_user = messages[-1]
+        tr_block = next(b for b in last_user["content"] if b.get("type") == "tool_result")
+        assert tr_block["tool_use_id"] == "toolu_1"
+        # content 应为 list，含 text 占位符 + image block
+        assert isinstance(tr_block["content"], list)
+        text_part = next(b for b in tr_block["content"] if b.get("type") == "text")
+        assert "[image:" in text_part["text"]
+        assert raw_b64 not in text_part["text"]
+        img_part = next(b for b in tr_block["content"] if b.get("type") == "image")
+        assert img_part["source"]["type"] == "base64"
+        assert img_part["source"]["data"] == raw_b64
+
     def test_image_block_converts_to_image_url(self):
         body = {
             "model": "claude-3-5-sonnet",

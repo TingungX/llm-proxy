@@ -11,6 +11,7 @@ from typing import Any, AsyncIterator
 from llm_proxy.protocol.ir._common import (
     build_usage,
     clean_schema,
+    extract_tool_result_image,
     is_openai_o_series,
     map_tool_choice_to_chat,
     safe_json_dumps,
@@ -515,7 +516,11 @@ def to_upstream(ir: IRRequest, upstream_model: str | None = None) -> dict[str, A
 
 
 def _message_ir_to_chat(msg: IRMessage) -> list[dict[str, Any]]:
-    """IRMessage → Chat messages 列表（tool_result 独立）。"""
+    """IRMessage → Chat messages 列表（tool_result 独立）。
+
+    注意：对于包含 base64 图片的 tool result，会额外生成一条带 image_url 的 user 消息，
+    使上游能通过视觉解码器处理图片（避免 base64 数据被当作文本 token 计数）。
+    """
     role = msg.role
     content = msg.content
 
@@ -528,24 +533,32 @@ def _message_ir_to_chat(msg: IRMessage) -> list[dict[str, Any]]:
     if role == "tool":
         # tool 消息：每个 IRToolResultBlock 生成一条独立的 tool 消息
         # Chat 格式要求每个 tool result 有自己的 tool_call_id
+        # 如果 tool result 包含 base64 图片，额外生成 user message 含 image_url
         result: list[dict[str, Any]] = []
         if isinstance(content, list):
             for block in content:
                 if isinstance(block, IRToolResultBlock):
                     if not block.tool_use_id:
                         logger.warning("chat._message_ir_to_chat: tool_result missing tool_use_id")
-                    # content 可能是 str 或 list（含 image 等非 text block）。
-                    # Chat 不支持 tool result 中含 image，提取 text 部分（lossy）。
-                    block_content = block.content
-                    if isinstance(block_content, list):
-                        block_content = "\n".join(
-                            b.get("text", "") for b in block_content
-                            if isinstance(b, dict) and b.get("type") == "text"
+                    # 检测 base64 图片，用占位符替换原始 content
+                    media_type, b64_data, tool_content = extract_tool_result_image(block.content)
+                    if b64_data:
+                        logger.debug(
+                            "chat._message_ir_to_chat: detected base64 image in tool_result "
+                            "(len=%d, type=%s), converting to image_url",
+                            len(b64_data), media_type,
                         )
+                        # 在 tool 消息后插入一条 user 消息，包含图片
+                        img_url = f"data:{media_type};base64,{b64_data}"
+                        result.append({
+                            "role": "user",
+                            "content": [{"type": "image_url", "image_url": {"url": img_url}}],
+                        })
+                    # 保留原始 tool 消息（tool_call_id 配对必需）
                     result.append({
                         "role": "tool",
                         "tool_call_id": block.tool_use_id,
-                        "content": block_content,
+                        "content": tool_content,
                     })
                 else:
                     logger.debug("chat._message_ir_to_chat: skipped non-tool_result block in tool message: %s", type(block).__name__)

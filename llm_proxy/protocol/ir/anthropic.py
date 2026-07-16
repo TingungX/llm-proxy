@@ -17,6 +17,7 @@ from llm_proxy.protocol.constants import STOP_REASON_MAP
 from llm_proxy.protocol.ir._common import (
     build_usage,
     clean_schema,
+    extract_tool_result_image,
     map_tool_choice_to_chat,
     resolve_reasoning_effort,
     safe_json_loads,
@@ -502,11 +503,35 @@ def _message_ir_to_anthropic(msg: IRMessage) -> dict[str, Any]:
                 "input": block.input,
             })
         elif isinstance(block, IRToolResultBlock):
-            tr: dict = {
-                "type": "tool_result",
-                "tool_use_id": block.tool_use_id,
-                "content": block.content,
-            }
+            # 检测 base64 图片，用占位符替换原始 content
+            media_type, b64_data, tool_content = extract_tool_result_image(block.content)
+            if b64_data:
+                logger.debug(
+                    "anthropic._message_ir_to_anthropic: detected base64 image "
+                    "in tool_result (len=%d, type=%s), converting to image block",
+                    len(b64_data), media_type,
+                )
+                tr: dict = {
+                    "type": "tool_result",
+                    "tool_use_id": block.tool_use_id,
+                    "content": [
+                        {"type": "text", "text": tool_content},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": b64_data,
+                            },
+                        },
+                    ],
+                }
+            else:
+                tr = {
+                    "type": "tool_result",
+                    "tool_use_id": block.tool_use_id,
+                    "content": tool_content,
+                }
             if block.is_error:
                 tr["is_error"] = True
             blocks.append(tr)

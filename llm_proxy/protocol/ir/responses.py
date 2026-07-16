@@ -15,6 +15,7 @@ from typing import Any, AsyncIterator
 from llm_proxy.protocol.ir._common import (
     build_usage,
     clean_schema,
+    extract_tool_result_image,
     is_openai_o_series,
     map_tool_choice_to_chat,
     safe_json_dumps,
@@ -884,19 +885,34 @@ def _messages_ir_to_responses_input(messages: list[IRMessage]) -> list[dict]:
                                 "(content_len=%d) — upstream may reject as orphan tool_call",
                                 len(block.content or ""),
                             )
-                        # content 可能是 str 或 list（含 image 等非 text block）。
-                        # Responses function_call_output 仅支持字符串，提取 text 部分（lossy）。
-                        block_content = block.content
-                        if isinstance(block_content, list):
-                            block_content = "\n".join(
-                                b.get("text", "") for b in block_content
-                                if isinstance(b, dict) and b.get("type") == "text"
+                        # 检测 base64 图片，用占位符替换原始 content
+                        media_type, b64_data, tool_output = extract_tool_result_image(block.content)
+                        if b64_data:
+                            logger.debug(
+                                "responses._messages_ir_to_responses_input: detected base64 image "
+                                "in tool_result (len=%d, type=%s), converting to input_image",
+                                len(b64_data), media_type,
                             )
-                        items.append({
-                            "type": "function_call_output",
-                            "call_id": block.tool_use_id,
-                            "output": block_content,
-                        })
+                            # 在 function_call_output 后插入一条 user message 含图片
+                            items.append({
+                                "type": "function_call_output",
+                                "call_id": block.tool_use_id,
+                                "output": tool_output,
+                            })
+                            items.append({
+                                "type": "message",
+                                "role": "user",
+                                "content": [{
+                                    "type": "input_image",
+                                    "image_url": f"data:{media_type};base64,{b64_data}",
+                                }],
+                            })
+                        else:
+                            items.append({
+                                "type": "function_call_output",
+                                "call_id": block.tool_use_id,
+                                "output": tool_output,
+                            })
                     elif isinstance(block, IRTextBlock):
                         # tool 角色但内容是纯文本（非 IRToolResultBlock）—— 容错降级
                         logger.debug(
