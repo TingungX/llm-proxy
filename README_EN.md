@@ -54,7 +54,7 @@ All three request formats can route to any target format. `/v1/responses` alread
 
 LLM Proxy deeply integrates with Codex Desktop's OpenAI Responses API, with full tool conversion support:
 
-- **apply_patch passthrough + DSL repair**: `apply_patch` is downgraded to a single function tool; upstream `arguments` are passed through verbatim as `custom_tool_call.input` to Codex. The return path runs [`repair_apply_patch_dsl`](llm_proxy/protocol/responses_chat/tool_replacement.py) to fix common DSL format issues (missing `*** Begin Patch` / `*** End Patch`, malformed `@@` hunk headers, wrong casing on `Add File` / `Update File` / `Delete File` / `Move to` keywords, etc.).
+- **apply_patch DSL decomposition + reconstruction**: `apply_patch` is Codex's custom tool that uses DSL syntax for file operations. The proxy parses the DSL into structured parameters (action enum + filePath/content/old_str/new_str) for the upstream model via standard function calling. On the return path, structured arguments are reconstructed back into DSL text for Codex. The return path also runs [`repair_apply_patch_dsl`](llm_proxy/protocol/responses_chat/tool_replacement.py) to fix common DSL format issues (missing `*** Begin Patch` / `*** End Patch`, malformed `@@` hunk headers, wrong casing on `Add File` / `Update File` / `Delete File` / `Move to` keywords, etc.).
 - **apply_patch tool description injection**: the server replaces the tool description with `APPLY_PATCH_TOOL_DESCRIPTION`, which explicitly enumerates the `***` marker prefix, the `@@`-on-its-own-line rule, the line-prefix rules (` ` / `- ` / `+ `), and the strict character-level context matching requirement — so the model avoids common pitfalls before writing.
 - **Non-standard tool downgrade**: `namespace` is recursively flattened (sub-tools named with `__` to satisfy upstreams that enforce `^[a-zA-Z0-9_-]+$`), `web_search` is executed client-side, other `custom` tools are passed through
 - **Think tag extraction**: `<think>` tags from upstream responses are extracted into reasoning/thinking blocks
@@ -88,7 +88,7 @@ Point your tool's `api_base` to this proxy. **One proxy serves all your tools.**
 | **Endpoint Authentication** | API-Key-based isolation, each endpoint independently configures available models |
 | **Model Routing & Fallback** | Model family failover chain, auto-switch on 429/503; IRProxyStep built-in exponential backoff retry |
 | **Request Tracking** | Unique Request ID per call, structured logging, web admin panel filtering |
-| **Tool Format Compatibility** | apply_patch passthrough + DSL repair; namespace flattened; other custom tools passed through |
+| **Tool Format Compatibility** | apply_patch DSL decomposition + reconstruction; namespace flattened; other custom tools passed through |
 | **Admin Panel** | Preact + Vite web console for endpoint/model/usage/log management |
 | **Enhanced Usage Filtering** | Usage query supports model_id filter and custom time range; frontend extracted as standalone UsageFilterBar component |
 
@@ -287,7 +287,7 @@ See `config.example.json` for details.
 |--------|------|-------------|
 | POST | `/v1/messages` | Anthropic Messages format (passthrough or cross-protocol) |
 | POST | `/v1/chat/completions` | OpenAI Chat Completions format (passthrough or cross-protocol) |
-| POST | `/v1/responses` | OpenAI Responses format (apply_patch passthrough + DSL repair; namespace/web_search downgrade) |
+| POST | `/v1/responses` | OpenAI Responses format (apply_patch DSL decomposition + reconstruction; namespace/web_search downgrade) |
 | POST | `/v1/messages/count_tokens` | Token counting |
 | GET | `/v1/models` | Model list |
 

@@ -59,8 +59,9 @@
 
 LLM Proxy 全面兼容 Codex Desktop 的 OpenAI Responses API 通信协议：
 
-- **apply_patch 透传 + DSL 修复**：`apply_patch` 直接降级为单个 function tool，
-  上游返回的 `arguments` 原样作为 `custom_tool_call.input` 给 Codex。
+- **apply_patch DSL 拆解 + 还原**：`apply_patch` 是 Codex 的 custom 工具，使用 DSL 格式
+  描述文件操作。服务端将 DSL 文本解析为结构化参数（action 枚举 + filePath/content/old_str/new_str），
+  上游模型通过标准的 function calling 调用。上游返回的结构化参数再还原为 DSL 文本给 Codex。
   返回路径经过 [`repair_apply_patch_dsl`](llm_proxy/protocol/responses_chat/tool_replacement.py)
   修复常见的 DSL 格式问题（缺 `*** Begin Patch` / `*** End Patch`、`@@` hunk header
   不规范、`Add File` / `Update File` / `Delete File` / `Move to` 关键字大小写错误等）

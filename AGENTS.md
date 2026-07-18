@@ -425,7 +425,13 @@ python tests/smoke_test.py          # 冒烟测试
 3. **CSS @import**：所有 CSS 由 app.css 一个入口 import，禁止在 main.css 末尾再 import logs.css
 4. **inline fontSize**：发现一处就清理一类，新加 inline 字号一律拒收
 5. **重复 Modal/Field**：第三次复制前必须先抽组件
-6. **apply_patch 的 old_str 不为空**：对齐 Claude Code 设计，保证多轮历史一致性
+6. **apply_patch 不是透传，是 DSL ↔ 结构化参数的双向拆解**：
+    Codex 的 apply_patch 是 custom 工具，使用 DSL 格式（`*** Begin Patch` / `*** End Patch` 标记）
+    描述文件操作。服务端将 DSL 解析为结构化参数（action 枚举 + filePath/content/old_str/new_str），
+    上游模型通过标准 function calling 调用；上游返回的结构化参数再还原为 DSL 文本给 Codex。
+    反向转换见 `reverse_tool_args_to_apply_patch()` in `tool_replacement.py`。
+    DSL 修复见 `repair_apply_patch_dsl()`。
+    **同时**：`apply_patch` 的 `old_str` 不得为空——对齐 Claude Code 设计，保证多轮历史一致性。
 7. **子节点 Parallel Risk**：多个 subagent 不要同时修改同一文件
 8. **config.json 是 gitignore 的**：用 config.example.json 做模板
 9. **upstream_protocol 标量已弃用**：新加模型用 upstream_protocols 数组
