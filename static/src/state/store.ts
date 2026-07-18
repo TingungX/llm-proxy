@@ -1,4 +1,4 @@
-export { configSignal, modelsSignal, errorHandlingSignal, setConfig, getMappingName } from './config';
+export { configSignal, modelsSignal, errorHandlingSignal, adminAuthSignal, setConfig, getMappingName } from './config';
 export { endpointsSignal, endpointNameMapSignal, setEndpoints, getEndpoint } from './endpoints';
 export {
   usageModeSignal, usageGroupBySignal, hourlyDayOffsetSignal,

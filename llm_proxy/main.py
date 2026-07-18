@@ -99,8 +99,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 from llm_proxy.middleware.request_id import request_id_middleware
 from llm_proxy.middleware.access_log import access_log_middleware
+from llm_proxy.middleware.admin_auth import admin_auth_middleware
 app.middleware("http")(request_id_middleware)
 app.middleware("http")(access_log_middleware)
+app.middleware("http")(admin_auth_middleware)
 app.middleware("http")(catch_all_exceptions)
 
 # 在 app 定义后导入路由，避免循环依赖

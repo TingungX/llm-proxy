@@ -17,6 +17,8 @@ async def api_get_endpoint(endpoint_id: str):
     ep = db.get_endpoint(endpoint_id)
     if not ep:
         return JSONResponse({"error": "Endpoint not found"}, status_code=404)
+    # 不返回原始 api_key，仅保留 hash
+    ep.pop("api_key", None)
     return ep
 
 

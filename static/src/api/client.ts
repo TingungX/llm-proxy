@@ -13,10 +13,19 @@ export async function api<T>(
   init?: RequestInit & { json?: unknown },
 ): Promise<T> {
   const { json, ...rest } = init ?? {};
+
+  // 注入 X-Admin-Key（如果用户已启用高级数据保护）
+  const adminKey = localStorage.getItem('adminKey');
+  const extraHeaders: Record<string, string> = {};
+  if (adminKey && path.startsWith('/api/')) {
+    extraHeaders['X-Admin-Key'] = adminKey;
+  }
+
   const r = await fetch(path, {
     ...rest,
     headers: {
       'Content-Type': 'application/json',
+      ...extraHeaders,
       ...rest?.headers,
     },
     body: json !== undefined ? JSON.stringify(json) : rest?.body,

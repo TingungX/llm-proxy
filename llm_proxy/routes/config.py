@@ -1,6 +1,10 @@
 """GET/PUT /api/config, PUT /api/models/{model_id}, DELETE /api/models/{model_id}, POST /api/providers/{model_id}/detect, POST /api/detect-protocol"""
 
+import copy
+import ipaddress
 import logging
+import socket
+from urllib.parse import urlparse
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -26,9 +30,78 @@ def _entries_from_protocols(protocols: list[str]) -> list[dict]:
     ]
 
 
+def _sanitize_config(config: dict) -> dict:
+    """返回去除 api_key 的配置深拷贝，防止凭据泄露。"""
+    safe = copy.deepcopy(config)
+    for model_cfg in safe.get("models", {}).values():
+        if isinstance(model_cfg, dict):
+            model_cfg.pop("api_key", None)
+    # 注入 admin_auth 状态（不泄露 key_hash）
+    from llm_proxy.middleware.admin_auth import get_admin_auth_status
+    safe["admin_auth"] = get_admin_auth_status()
+    return safe
+
+
+@app.get("/api/admin-auth")
+async def api_get_admin_auth():
+    """返回 admin auth 状态（不含密钥/哈希）。"""
+    from llm_proxy.middleware.admin_auth import get_admin_auth_status
+    return get_admin_auth_status()
+
+
+@app.put("/api/admin-auth")
+async def api_update_admin_auth(request: Request):
+    """设置/修改/禁用 admin key。
+
+    首次启用（当前 disabled）：只需提供 key
+    修改/禁用（当前 enabled）：需提供 current_key 验证
+    """
+    import hashlib
+    body = await request.json()
+    enabled = body.get("enabled", False)
+    new_key = (body.get("key") or "").strip()
+    current_key = (body.get("current_key") or "").strip()
+
+    # 检查是否被 env 强制覆盖
+    import os
+    if os.environ.get("LLM_PROXY_ADMIN_KEY", "").strip():
+        return JSONResponse(
+            {"error": "Admin auth is managed by LLM_PROXY_ADMIN_KEY environment variable"},
+            status_code=403,
+        )
+
+    s = get_state()
+    current_admin_auth = s.config.get("admin_auth", {})
+    currently_enabled = isinstance(current_admin_auth, dict) and current_admin_auth.get("enabled")
+
+    # 如果当前已启用，需要验证 current_key
+    if currently_enabled:
+        current_hash = current_admin_auth.get("key_hash", "")
+        if not current_key or hashlib.sha256(current_key.encode()).hexdigest() != current_hash:
+            return JSONResponse({"error": "Current key is required and must be correct"}, status_code=403)
+
+    if not enabled:
+        # 禁用
+        s.config["admin_auth"] = {"enabled": False}
+    else:
+        # 启用或修改
+        if not new_key or len(new_key) < 6:
+            return JSONResponse({"error": "Key must be at least 6 characters"}, status_code=400)
+        s.config["admin_auth"] = {
+            "enabled": True,
+            "key_hash": hashlib.sha256(new_key.encode()).hexdigest(),
+        }
+
+    from llm_proxy.config_loader import save_config
+    save_config(s.config)
+    await s.reload()
+    logger.info("Admin auth %s", "enabled" if enabled else "disabled")
+    return {"status": "ok", "enabled": enabled}
+
+
 @app.get("/api/config")
 async def api_get_config():
-    return get_state().config
+    return _sanitize_config(get_state().config)
 
 
 @app.get("/api/provider-profiles")
@@ -106,6 +179,53 @@ async def api_delete_model(model_id: str):
     return {"status": "ok"}
 
 
+# SSRF 防护：禁止访问的地址范围
+_SSRF_BLOCKED_NETWORKS = [
+    ipaddress.IPv4Network("10.0.0.0/8"),        # RFC1918
+    ipaddress.IPv4Network("172.16.0.0/12"),      # RFC1918
+    ipaddress.IPv4Network("192.168.0.0/16"),     # RFC1918
+    ipaddress.IPv4Network("127.0.0.0/8"),        # Loopback
+    ipaddress.IPv4Network("169.254.0.0/16"),     # Link-local / cloud metadata
+    ipaddress.IPv4Network("0.0.0.0/8"),          # "This" network
+    ipaddress.IPv6Network("::1/128"),            # IPv6 loopback
+    ipaddress.IPv6Network("fe80::/10"),          # IPv6 link-local
+]
+
+
+def _validate_api_base(api_base: str) -> str | None:
+    """验证 api_base 不为内网/敏感地址，返回错误消息或 None（通过）。"""
+    try:
+        parsed = urlparse(api_base)
+    except Exception:
+        return f"Invalid URL: {api_base}"
+
+    if parsed.scheme not in ("http", "https"):
+        return f"Unsupported scheme: {parsed.scheme}"
+
+    hostname = parsed.hostname
+    if not hostname:
+        return f"Missing hostname in URL: {api_base}"
+
+    # DNS 解析 hostname → IP
+    try:
+        addr_info = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return f"Cannot resolve hostname: {hostname}"
+
+    for family, _, _, _, sockaddr in addr_info:
+        ip_str = sockaddr[0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+
+        for net in _SSRF_BLOCKED_NETWORKS:
+            if ip in net:
+                return f"Access to {ip_str} ({hostname}) is blocked for security reasons"
+
+    return None  # 通过校验
+
+
 @app.post("/api/detect-protocol")
 async def api_detect_protocol(request: Request):
     """探测给定 api_base 的协议，不依赖已保存的模型"""
@@ -118,6 +238,12 @@ async def api_detect_protocol(request: Request):
             {"error": "api_base and api_key are required"},
             status_code=400
         )
+
+    # SSRF 防护：阻止访问内网地址
+    ssrf_err = _validate_api_base(api_base)
+    if ssrf_err:
+        logger.warning("SSRF blocked: %s (api_base=%s)", ssrf_err, api_base)
+        return JSONResponse({"error": ssrf_err}, status_code=400)
 
     protocols = await detect_upstream_protocols(api_base, api_key)
 

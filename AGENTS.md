@@ -401,6 +401,23 @@ python tests/smoke_test.py          # 冒烟测试
 - class 命名：单词（模态框根）、父-子（元素）、形容词（状态）、短横线连接（工具）
 - 禁止驼峰式、组件前缀、BEM
 
+## 管理 API 安全
+
+所有 `/api/*` 管理路由受 `LLM_PROXY_ADMIN_KEY` 环境变量保护：
+
+| 变量 | 说明 |
+|------|------|
+| `LLM_PROXY_ADMIN_KEY` | 管理 API 密钥。设置后所有 `/api/*` 路由必须携带 `X-Admin-Key` 头或 `Authorization: Bearer <key>`。未设置时放行但记录 WARNING。 |
+
+**数据脱敏**：
+- `GET /api/config` — 自动剥离所有模型的 `api_key` 字段
+- `GET /api/endpoints` / `GET /api/endpoints/{id}` — 不返回原始 `api_key`，仅保留 `api_key_hash`
+
+**SSRF 防护**：
+- `POST /api/detect-protocol` — 禁止访问 loopback / RFC1918 / link-local / cloud metadata 地址
+
+在公开部署前必须设置 `LLM_PROXY_ADMIN_KEY`。
+
 ## 已知陷阱
 
 1. **Grid stretch + Preact**：并排 card 必须写 height: 100%，不能依赖默认 stretch

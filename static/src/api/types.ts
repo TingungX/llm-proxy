@@ -182,6 +182,12 @@ export interface LatencyResult {
   error?: string;
 }
 
+// ===== Admin Auth =====
+export interface AdminAuthStatus {
+  enabled: boolean;
+  source: 'env' | 'config' | null;
+}
+
 // ===== Protocol Detection =====
 export interface ProtocolDetectionResult {
   upstream_protocols?: ProtocolEntry[];

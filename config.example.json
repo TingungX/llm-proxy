@@ -1,4 +1,9 @@
 {
+  "admin_auth": {
+    "_comment": "Set enabled=true to require X-Admin-Key header on all /api/* routes. Use the frontend settings panel or PUT /api/admin-auth to enable. key_hash is auto-generated when you set a key.",
+    "enabled": false,
+    "key_hash": ""
+  },
   "models": {
     "deepseek-v4-pro": {
       "api_base": "https://api.deepseek.com/",
@@ -69,4 +74,3 @@
     "default_preset": "default"
   }
 }
-
