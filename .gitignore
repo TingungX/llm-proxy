@@ -7,6 +7,7 @@ venv/
 
 # Logs
 *.log
+logs/
 
 # OS
 .DS_Store
@@ -14,6 +15,8 @@ venv/
 # Config (contains API keys)
 config.json
 config.docker.json
+provider_profiles.json
+provider_profiles.docker.json
 *.bak.*
 
 # Data (runtime-generated)

@@ -7,9 +7,13 @@ services:
     volumes:
       - ./usage.db:/app/usage.db
       - ./config.json:/app/config.json:ro
+      # 日志挂载到宿主机：logging_config.py 统一写 /app/logs/llm-proxy.log
+      - ./logs:/app/logs
     environment:
       # 日志级别：INFO 使 lifecycle/access_log 可见，ERROR 只保留错误
       - LLM_PROXY_LOG_LEVEL=INFO
+      # 日志文件路径（容器内）——与宿主机 ./logs 通过 volume 映射
+      - LLM_PROXY_LOG_FILE=/app/logs/llm-proxy.log
       # 显式声明 DB 路径
       - LLM_PROXY_DB_PATH=/app/usage.db
       # 走 Steam++ (Watt Toolkit) 代理访问被墙上游（opencode.ai 等）

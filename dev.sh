@@ -20,7 +20,9 @@ if [ -f ".dev-env" ]; then
     set +a
 fi
 
-LOG_FILE="dev-server.log"
+# 日志由 logging_config.py 统一写到 logs/llm-proxy.log（唯一真相源），
+# 不再让 dev.sh 自己维护 dev-server.log。screen 窗口仍可见 stdout。
+LOG_FILE="logs/llm-proxy.log"
 
 stop_dev() {
     # Kill screen session
@@ -74,7 +76,8 @@ start_dev() {
 
     echo "Starting dev server on port $PORT (log level=$LOG_LEVEL)..."
 
-    # Create screen session running the dev server
+    # 日志由 logging_config.py 统一写到 logs/llm-proxy.log；
+    # screen 仍捕获 stdout，可用 ./dev.sh log 或 screen -r 实时查看。
     screen -dmS "$SCREEN_NAME" \
         env LLM_PROXY_DEV=true LLM_PROXY_LOG_LEVEL="$LOG_LEVEL" \
         .venv/bin/uvicorn llm_proxy.main:app \
@@ -87,8 +90,7 @@ start_dev() {
             --reload-include '*.html' \
             --reload-include '*.js' \
             --reload-include '*.css' \
-            --reload-include '*.json' \
-            2>&1 | tee "$LOG_FILE"
+            --reload-include '*.json'
 
     # Wait for server to be ready
     for i in $(seq 1 15); do
@@ -128,4 +130,3 @@ case "${1:-start}" in
         exit 1
         ;;
 esac
-

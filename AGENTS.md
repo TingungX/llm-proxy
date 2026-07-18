@@ -249,6 +249,25 @@ config.json → config_loader.load_config() → State.__init__()
 - 流式 chunk 日志为 DEBUG 级别（dev 环境可见）
 - httpx/httpcore 已抑制为 WARNING
 
+### 日志文件路径（唯一真相源）
+
+**所有运行方式（dev.sh / start.sh / docker）统一写 `logs/llm-proxy.log`**，由
+`llm_proxy/logging_config.py` 的 `RotatingFileHandler` 落盘——不再由 shell 脚本
+各自重定向 stdout 到 `dev-server.log` / `proxy.log`。
+
+| 运行方式 | 日志文件 | 实时查看命令 |
+|---|---|---|
+| `./dev.sh start` | `logs/llm-proxy.log` | `./dev.sh log` 或 `screen -r llm-proxy-dev` |
+| `./start.sh` | `logs/llm-proxy.log` | `tail -f logs/llm-proxy.log` |
+| `docker compose up` | 宿主机 `./logs/llm-proxy.log`（volume 挂载） | `tail -f logs/llm-proxy.log` |
+
+- 文件路径由 `LLM_PROXY_LOG_FILE` 环境变量控制（默认 `logs/llm-proxy.log`）
+- 单文件 10MB、保留 5 份轮转（`RotatingFileHandler`），总计约 60MB
+- stdout handler 仍保留：screen 窗口、`docker logs`、手动 uvicorn 仍可实时看到
+- **禁止** 在 shell 脚本里再 `>> $LOG_FILE` 重定向——会与 file handler 重复写、
+  uvicorn reload 时还可能 truncate 文件
+- Agent 排查日志：直接 `tail -f /path/to/llm-proxy/logs/llm-proxy.log`，无需推断运行方式
+
 ## IR 层新通道迁移路径
 
 endpoint.settings 加 "ir_enabled": true → handler 根据 flag 选择 IRProxyStep 或 ProxyStep。

@@ -6,7 +6,8 @@ cd "$ROOT_DIR"
 
 PORT="${PORT:-4000}"
 HOST="${HOST:-0.0.0.0}"
-LOG_FILE="${LOG_FILE:-proxy.log}"
+# 日志由 logging_config.py 统一写到 logs/llm-proxy.log（与 start.sh 一致）。
+LOG_FILE="${LOG_FILE:-logs/llm-proxy.log}"
 PID_FILE="${PID_FILE:-.llm-proxy.pid}"
 START_SCRIPT="$ROOT_DIR/start.sh"
 
@@ -63,9 +64,9 @@ else
 fi
 
 echo "Starting llm-proxy on port $PORT..."
+# 日志由 logging_config.py 落盘；nohup 仅脱离终端，不再重定向到 LOG_FILE。
 mkdir -p "$(dirname "$LOG_FILE")"
-touch "$LOG_FILE"
-PORT="$PORT" HOST="$HOST" LOG_FILE="$LOG_FILE" nohup "$START_SCRIPT" >> "$LOG_FILE" 2>&1 &
+PORT="$PORT" HOST="$HOST" LOG_FILE="$LOG_FILE" nohup "$START_SCRIPT" >/dev/null 2>&1 &
 new_pid=$!
 echo "$new_pid" > "$PID_FILE"
 

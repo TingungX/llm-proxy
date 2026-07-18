@@ -22,6 +22,9 @@ COPY static/dist/ ./static/dist/
 COPY docker_healthcheck.py .
 RUN chmod +x docker_healthcheck.py
 
+# 日志目录：logging_config.py 会在运行时 mkdir，但提前创建可让 volume 挂载点权限正确。
+RUN mkdir -p /app/logs && chown llmproxy:llmproxy /app/logs
+
 # 创建非 root 用户
 RUN useradd -m -u 1000 llmproxy && \
     chown -R llmproxy:llmproxy /app
