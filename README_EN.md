@@ -15,7 +15,7 @@ Supported protocol conversions:
 |----------------|------------------------------|-------|
 | Anthropic Messages | Anthropic Messages / OpenAI Chat Completions | `/v1/messages` |
 | OpenAI Chat Completions | OpenAI Chat Completions / Anthropic Messages | `/v1/chat/completions` |
-| OpenAI Responses | OpenAI Chat Completions | `/v1/responses` |
+| OpenAI Responses | OpenAI Chat Completions / Anthropic Messages | `/v1/responses` |
 
 → **Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses — all three request formats can route to any upstream model through their respective paths.**
 
@@ -100,7 +100,7 @@ Point your tool's `api_base` to this proxy. **One proxy serves all your tools.**
 Request (Anthropic / Chat / Responses)
   │
   ▼
-Handler Pipeline (Auth → ModelResolve → ProtocolSelect → ... → Proxy)
+Handler Pipeline (Auth → ModelResolve → ... → Proxy / IRProxyStep)
   │
   ├── Same protocol ──→ Direct passthrough to upstream
   │
@@ -397,9 +397,9 @@ llm-proxy/
 ├── tests/                         # Tests
 ├── docs/                          # Documentation
 ├── config.example.json            # Configuration template
+├── provider_profiles.example.json # Vendor profile template
 ├── Dockerfile / docker-compose.yml
 └── start.sh                       # Startup script
-├── provider_profiles.example.json # Vendor profile template
 ```
 
 ---

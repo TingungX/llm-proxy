@@ -14,7 +14,7 @@
 | 请求格式 | 可转换的上游格式 | 请求路由 |
 | Anthropic Messages | Anthropic Messages / OpenAI Chat Completions | `/v1/messages` |
 | OpenAI Chat Completions | OpenAI Chat Completions / Anthropic Messages | `/v1/chat/completions` |
-| OpenAI Responses | OpenAI Chat Completions | `/v1/responses` |
+| OpenAI Responses | OpenAI Chat Completions / Anthropic Messages | `/v1/responses` |
 
 → **Anthropic 、 OpenAI Chat Completions 和 OpenAI Responses 三种请求格式均可由指定路径路由到任意格式的上游模型。**
 
@@ -111,7 +111,7 @@ LLM Proxy 全面兼容 Codex Desktop 的 OpenAI Responses API 通信协议：
 请求 (Anthropic / Chat / Responses)
   │
   ▼
-Handler Pipeline (Auth → ModelResolve → ProtocolSelect → ... → Proxy)
+Handler Pipeline (Auth → ModelResolve → ... → Proxy / IRProxyStep)
   │
   ├── 同协议 ──→ 透传到上游
   │

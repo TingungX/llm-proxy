@@ -30,10 +30,10 @@ llm-proxy/
       openai.py                 POST /v1/chat/completions
       responses.py              POST /v1/responses
       misc.py                   GET /, /health, /v1/models, /count_tokens
-      config.py                 配置 CRUD
+      config.py                 配置 CRUD（含 provider-profiles / thinking-effort-defaults / model CRUD / detect-protocol）
       endpoints.py              端点 CRUD
-      usage.py                  用量查询
-      logs.py                   日志查询
+      usage.py                  用量查询（含 /api/usage/summary）
+      logs.py                   日志查询（含 /api/logs/summary, /api/logs/filter-options）
       latency.py                延迟测试
 
     handlers/                   Pipeline 模式处理（见 handlers/AGENTS.md）
@@ -48,17 +48,19 @@ llm-proxy/
       anthropic_openai/         [旧通道] PendingDeprecationWarning
       responses_chat/           [旧通道] PendingDeprecationWarning
       capabilities.py           协议可达性表 + select_upstream 算法
+      effort_mapping.py         config-driven thinking effort 映射引擎
+      provider_profiles.py      厂商 thinking/reasoning 格式差异注册表
       errors.py                 错误格式化
+      sse.py                    SSE 透传
+      think_tag.py              Think 标签检测
+      detector.py               上游协议检测
+      constants.py              常量
       ...
 
     services/                   纯业务逻辑
       tool_call_fix.py          孤立 tool_call 修复
       vision_service.py         图像处理
       input_compressor.py       输入压缩
-
-    protocol/
-      effort_mapping.py         config-driven thinking effort 映射引擎
-      provider_profiles.py      厂商 thinking/reasoning 格式差异注册表
 
     infra/                      基础设施
       db.py                     SQLite 操作（用量记录、端点管理）
@@ -94,10 +96,13 @@ llm-proxy/
 所有对外 API 请求走 Pipeline 步骤链：
 1. **AuthStep** — 提取 API Key → 匹配端点 → 校验权限
 2. **ModelResolveStep** — 解析模型名 → 端点权限校验 → 返回六元组
-3. **VisionFallbackStep** — 不支持视觉的模型：图片→文本降级
-4. **CompressionStep** — 输入压缩（节省 token）
-5. **ResponsesConvertStep** — 仅在 Responses 路由中，Responses→Chat 格式转换
-6. **ProxyStep / IRProxyStep** — 根据 upstream_protocol 转发（同协议透传 / 跨协议转换 / IR 路径）
+3. **OpenAIProtocolStep** — 仅在 OpenAI Chat 路由中，多协议选择 + custom/namespace 工具降级
+4. **ToolCallFixStep** — 仅在 OpenAI Chat 路由中，孤立 tool_call 修复
+5. **VisionFallbackStep** — 不支持视觉的模型：图片→文本降级
+6. **CompressionStep** — 输入压缩（节省 token）
+7. **ProxyStep / IRProxyStep** — 根据路由选择：
+   - Messages 和 Chat 路由 → **ProxyStep**（同协议透传 / 旧通道跨协议转换）
+   - Responses 路由 → **IRProxyStep**（IR 抽象层：协议选择、IR 转换、重试）
 
 步骤可抛出 PipelineStop(response) 中断管道，中间件识别并返回。
 
@@ -143,7 +148,8 @@ client_resp = convert_response("openai/responses", "anthropic", upstream_body)
 
 **provider_profiles.py** — 厂商 thinking/reasoning 格式差异注册表：
 - 用 dataclass 声明 8 家厂商的 thinking_format、effort_field、effort_aliases 等差异
-- `encode_thinking_field(body, effort, profile)` 在协议层自动构造正确的请求字段
+- `apply_thinking_to_chat_body(body, effort, profile)` 和 `apply_thinking_to_anthropic_body(body, effort, profile)` 在协议层自动构造正确的请求字段，根据 thinking_format 类型分支处理
+- `get_provider_profile(provider, registry)` 按 provider key 查找 profile，无匹配时返回 None
 - 支持的 thinking_format：`thinking_enabled_disabled`、`thinking_adaptive_disabled`、`thinking_type_plus_reasoning_effort`、`reasoning_effort_only`、`reasoning_effort_fixed`、`enable_thinking_boolean`、`chat_template_kwargs_enable_thinking`
 - profile 数据源：`provider_profiles.json`（运行时）或 `provider_profiles.example.json`（模板），路径由 `LLM_PROXY_PROVIDER_PROFILES_PATH` 环境变量控制
 
@@ -179,18 +185,23 @@ routes/messages.py → MessagesHandler.handle()
 ### OpenAI Chat 格式（POST /v1/chat/completions）
 ```
 routes/openai.py → OpenAIHandler.handle()
-  Auth → ModelResolve → OpenAIProtocol → ToolCallFix → VisionFallback → Compression → Proxy
+  Auth → ModelResolve → OpenAIProtocolStep → ToolCallFix → VisionFallback → Compression → Proxy
     Proxy._proxy_to_chat()
       同协议透传 或 Chat→Responses 转换
 ```
 
+OpenAIProtocolStep 确定上游协议（多协议选择 + custom/namespace 工具降级到 chat-completions）。
+
 ### OpenAI Responses 格式（POST /v1/responses）
 ```
 routes/responses.py → ResponsesHandler.handle()
-  Auth → ModelResolve → ProtocolSelect → VisionFallback → Compression → ResponsesConvert → Proxy
-    Proxy._proxy_to_chat()
-      Responses→Chat 流式/非流式转换 或 同协议透传
+  Auth → ModelResolve → VisionFallback → Compression → IRProxyStep
+    IRProxyStep(client_protocol="openai/responses")
+      内部走 IR 抽象层：Responses→IR→upstream_body → 上游 SSE → IR→client SSE
 ```
+
+Responses 路由已直接走 IRProxyStep（不走 ProtocolSelectStep / ResponsesConvertStep / ProxyStep）。
+IRProxyStep 内部包含：协议选择、同协议透传、跨协议 IR 转换、流式/非流式处理、429/503 指数退避重试。
 
 ## 关键 API 一览
 
@@ -227,7 +238,7 @@ routes/responses.py → ResponsesHandler.handle()
 | 旧通道（不推荐） | from llm_proxy.protocol.anthropic_openai import ... |
 | 旧通道（不推荐） | from llm_proxy.protocol.responses_chat import ... |
 | Effort 映射 | from llm_proxy.protocol.effort_mapping import apply_effort_mapping |
-| 厂商 Profile | from llm_proxy.protocol.provider_profiles import ProviderProfile, load_provider_profiles, encode_thinking_field |
+| 厂商 Profile | from llm_proxy.protocol.provider_profiles import ProviderProfile, load_provider_profiles, get_provider_profile, apply_thinking_to_chat_body, apply_thinking_to_anthropic_body |
 
 **禁止**：
 - `from llm_proxy import state` + `state.xxx`（必须走 get_state()）
@@ -420,8 +431,8 @@ python tests/smoke_test.py          # 冒烟测试
     API 输出已经是结构化格式；旧字符串数组输入仍兼容但新加模型必须用结构化格式。
 17. **thinking_effort 配置链**：模型级 effort 映射有三层逻辑（`get_model_effort_mapping`）：
     先查模型自身配置 → 再查厂商 profile → 最后查全局默认。`thinking_effort_mode` 控制优先级。
-    厂商 thinking 格式编码由 `encode_thinking_field()` 自动处理，不要在协议层硬编码
-    厂商判断。
+    厂商 thinking 格式编码由 `apply_thinking_to_chat_body()` / `apply_thinking_to_anthropic_body()`
+    自动处理，不要在协议层硬编码厂商判断。
 18. **provider_profiles 数据源路径**：默认读取 `provider_profiles.json`（与 config.json 同级，
     已 gitignore），由 `LLM_PROXY_PROVIDER_PROFILES_PATH` 环境变量覆盖。
     `provider_profiles.example.json` 是模板，不要直接修改。
