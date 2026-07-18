@@ -31,6 +31,35 @@ async def api_get_config():
     return get_state().config
 
 
+@app.get("/api/provider-profiles")
+async def api_get_provider_profiles():
+    """返回所有厂商 profile，包含完整的 thinking format 详情。"""
+    registry = get_state().provider_profiles
+    return {
+        key: {
+            "display_name": p.display_name,
+            "default_api_base": p.default_api_base,
+            "default_thinking_effort_preset": p.default_thinking_effort_preset,
+            "thinking_format": p.thinking_format,
+            "default_thinking_type": p.default_thinking_type,
+            "disable_thinking_value": p.disable_thinking_value,
+            "effort_field": p.effort_field,
+            "fixed_effort": p.fixed_effort,
+            "effort_aliases": p.effort_aliases,
+            "supports_reasoning_split": p.supports_reasoning_split,
+            "preserve_reasoning_content": p.preserve_reasoning_content,
+        }
+        for key, p in registry.items()
+    }
+
+
+@app.get("/api/thinking-effort-defaults")
+async def api_get_thinking_effort_defaults():
+    """返回内置的默认 thinking effort mapping 配置，供前端展示系统默认规则。"""
+    from llm_proxy.protocol.effort_mapping import get_default_mapping_config
+    return get_default_mapping_config()
+
+
 @app.put("/api/config")
 async def api_update_config(request: Request):
     new_config = await request.json()

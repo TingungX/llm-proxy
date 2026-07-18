@@ -3,11 +3,17 @@
 import logging
 
 from llm_proxy.handlers.base import PipelineContext, HandlerStep
+from llm_proxy.protocol.effort_mapping import apply_effort_mapping
+from llm_proxy.protocol.provider_profiles import (
+    apply_thinking_to_chat_body,
+    get_provider_profile,
+)
 from llm_proxy.protocol.responses_chat.request import (
     CodexToolSpec,
     convert_input_to_messages,
     convert_tools_to_chat,
 )
+from llm_proxy.state import get_state
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +33,7 @@ class ResponsesConvertStep(HandlerStep):
             return  # 不需要转换
 
         body = ctx.body
-        _, _, actual_model, _, _, _ = ctx.resolved
+        _, _, actual_model, model_id, _, _ = ctx.resolved
 
         input_data = body.get("input", [])
         instructions = body.get("instructions")
@@ -93,20 +99,25 @@ class ResponsesConvertStep(HandlerStep):
         if body.get("tool_choice"):
             chat_body["tool_choice"] = body["tool_choice"]
 
-        # reasoning.effort 映射
+        # reasoning.effort 映射（按模型 preset）
         reasoning = body.get("reasoning")
+        mapped_effort: str | None = None
+        model_effort_mapping = get_state().get_model_effort_mapping(model_id)
         if isinstance(reasoning, dict) and "effort" in reasoning:
             effort = reasoning["effort"]
-            effort_map = {
-                "none": "none",
-                "auto": "auto",
-                "minimal": "low",
-                "low": "low",
-                "medium": "medium",
-                "high": "high",
-                "xhigh": "xhigh",
-            }
-            chat_body["reasoning_effort"] = effort_map.get(effort, "auto")
+            mapped_effort = apply_effort_mapping(effort, model_effort_mapping)
+            # 未命中规则且无 "*" 兜底时回退到 "auto"（与旧硬编码 map.get(effort, "auto") 一致）
+            chat_body["reasoning_effort"] = mapped_effort if mapped_effort else "auto"
+
+        # 按厂商 profile 编码 thinking/reasoning（含 MiniMax reasoning_split）
+        profile = get_provider_profile(
+            get_state().get_model_provider(model_id), get_state().provider_profiles
+        )
+        apply_thinking_to_chat_body(
+            chat_body,
+            mapped_effort or (reasoning.get("effort") if isinstance(reasoning, dict) else None),
+            profile,
+        )
 
         # 流式请求
         stream = body.get("stream", False)

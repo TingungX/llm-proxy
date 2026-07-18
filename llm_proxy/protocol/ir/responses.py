@@ -12,6 +12,7 @@ import uuid
 import time
 from typing import Any, AsyncIterator
 
+from llm_proxy.protocol.effort_mapping import apply_effort_mapping
 from llm_proxy.protocol.ir._common import (
     build_usage,
     clean_schema,
@@ -59,8 +60,13 @@ logger = logging.getLogger(__name__)
 # ── 请求：Responses → IR ──────────────────────────────────────────
 
 
-def to_ir(body: dict[str, Any]) -> IRRequest:
-    """OpenAI Responses API 请求体 → IRRequest。"""
+def to_ir(body: dict[str, Any], mapping_config: dict | None = None) -> IRRequest:
+    """OpenAI Responses API 请求体 → IRRequest。
+
+    Args:
+        body: Responses API 格式请求体
+        mapping_config: 全局 thinking_effort_mapping 配置；None 时使用默认兜底
+    """
     model = body.get("model", "")
 
     # instructions → system_prompt
@@ -101,16 +107,9 @@ def to_ir(body: dict[str, Any]) -> IRRequest:
     if isinstance(reasoning, dict):
         effort = reasoning.get("effort")
         if effort:
-            effort_map = {
-                "none": "none",
-                "auto": "auto",
-                "minimal": "low",
-                "low": "low",
-                "medium": "medium",
-                "high": "high",
-                "xhigh": "xhigh",
-            }
-            ir_request.reasoning_effort = effort_map.get(effort, "auto")
+            mapped = apply_effort_mapping(effort, mapping_config)
+            # 未命中规则且无 "*" 兜底时回退到 "auto"（与旧硬编码 map.get(effort, "auto") 一致）
+            ir_request.reasoning_effort = mapped if mapped else "auto"
 
     # tools — 处理 apply_patch / namespace / web_search 等
     tools = body.get("tools") or []

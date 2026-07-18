@@ -6,6 +6,9 @@ export interface UsageParams {
   group_by?: string;
   granularity?: string;
   endpoint_id?: string;
+  model_id?: string;
+  since?: string;
+  until?: string;
 }
 
 function buildQuery(params: Record<string, unknown>): URLSearchParams {
@@ -24,6 +27,8 @@ export function fetchUsageSummary(): Promise<UsageSummary> {
   return api<UsageSummary>('/api/usage/summary');
 }
 
-export function fetchUsageHeatmap(params: { days?: number; endpoint_id?: string } = {}): Promise<HeatmapResponse> {
+export function fetchUsageHeatmap(
+  params: { days?: number; endpoint_id?: string; model_id?: string; since?: string; until?: string } = {},
+): Promise<HeatmapResponse> {
   return api<HeatmapResponse>(`/api/usage?${buildQuery({ ...params, view: 'heatmap' })}`);
 }

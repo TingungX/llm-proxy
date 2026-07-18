@@ -450,7 +450,8 @@ def get_usage(
     end: str,
     group_by: str = "model",
     granularity: str = "hour",
-    endpoint_id: str = None
+    endpoint_id: str = None,
+    model_id: str = None,
 ) -> list[dict]:
     """查询用量数据
 
@@ -460,6 +461,7 @@ def get_usage(
         group_by: 分组维度 (model/endpoint)
         granularity: 时间粒度 (hour/day)
         endpoint_id: 按端点筛选（可选）
+        model_id: 按模型筛选（可选）
 
     Returns:
         [{time, group_key, input_tokens, output_tokens, count}]
@@ -474,9 +476,16 @@ def get_usage(
     end_dt = datetime.fromisoformat(end) + timedelta(days=1)
     end_extended = end_dt.strftime("%Y-%m-%d")
 
-    # 构建端点筛选条件
-    ep_where = "AND endpoint_id = ?" if endpoint_id else ""
-    ep_params = [endpoint_id] if endpoint_id else []
+    # 构建筛选条件（endpoint + model 正交）
+    where_clauses: list[str] = []
+    where_params: list = []
+    if endpoint_id:
+        where_clauses.append("endpoint_id = ?")
+        where_params.append(endpoint_id)
+    if model_id:
+        where_clauses.append("model_id = ?")
+        where_params.append(model_id)
+    extra_where = ("AND " + " AND ".join(where_clauses)) if where_clauses else ""
 
     record_window_start = (datetime.now(BEIJING_TZ) - timedelta(days=RECORD_RETENTION_DAYS)).strftime("%Y-%m-%d %H:00:00")
     today_start = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
@@ -493,9 +502,9 @@ def get_usage(
                 SUM(total_output_tokens) as output_tokens,
                 SUM(request_count) as count
             FROM usage_hourly
-            WHERE hour_start >= ? AND hour_start < ? {ep_where}
+            WHERE hour_start >= ? AND hour_start < ? {extra_where}
             GROUP BY time, group_key
-        """, [start, end_extended] + ep_params)
+        """, [start, end_extended] + where_params)
         hourly_rows = c.fetchall()
 
         c.execute(f"""
@@ -506,9 +515,9 @@ def get_usage(
                 SUM(output_tokens) as output_tokens,
                 COUNT(*) as count
             FROM usage_records
-            WHERE timestamp >= ? AND timestamp < ? {ep_where}
+            WHERE timestamp >= ? AND timestamp < ? {extra_where}
             GROUP BY time, group_key
-        """, [record_window_start, end_extended] + ep_params)
+        """, [record_window_start, end_extended] + where_params)
         record_rows = c.fetchall()
 
         all_rows = hourly_rows + record_rows
@@ -524,9 +533,9 @@ def get_usage(
                 SUM(total_output_tokens) as output_tokens,
                 SUM(request_count) as count
             FROM usage_daily
-            WHERE date >= ? AND date < ? {ep_where}
+            WHERE date >= ? AND date < ? {extra_where}
             GROUP BY time, group_key
-        """, [start, end_extended] + ep_params)
+        """, [start, end_extended] + where_params)
         daily_rows = c.fetchall()
 
         c.execute(f"""
@@ -537,9 +546,9 @@ def get_usage(
                 SUM(output_tokens) as output_tokens,
                 COUNT(*) as count
             FROM usage_records
-            WHERE timestamp >= ? AND timestamp < ? {ep_where}
+            WHERE timestamp >= ? AND timestamp < ? {extra_where}
             GROUP BY time, group_key
-        """, [record_window_start, end_extended] + ep_params)
+        """, [record_window_start, end_extended] + where_params)
         record_rows = c.fetchall()
 
         all_rows = daily_rows + record_rows
@@ -620,7 +629,8 @@ def get_usage_heatmap(
     start: str,
     end: str,
     group_by: str = "model",
-    endpoint_id: str = None
+    endpoint_id: str = None,
+    model_id: str = None,
 ) -> list[dict]:
     """查询热力图数据（按天聚合的扁平列表）
 
@@ -629,6 +639,7 @@ def get_usage_heatmap(
         end: 结束日期 (YYYY-MM-DD)
         group_by: 分组维度（仅用于筛选，结果不拆分 group_key）
         endpoint_id: 按端点筛选（可选）
+        model_id: 按模型筛选（可选）
 
     Returns:
         [{date, total_tokens}]
@@ -639,8 +650,16 @@ def get_usage_heatmap(
     end_dt = datetime.fromisoformat(end) + timedelta(days=1)
     end_extended = end_dt.strftime("%Y-%m-%d")
 
-    ep_where = "AND endpoint_id = ?" if endpoint_id else ""
-    ep_params = [endpoint_id] if endpoint_id else []
+    # 构建筛选条件（endpoint + model 正交）
+    where_clauses: list[str] = []
+    where_params: list = []
+    if endpoint_id:
+        where_clauses.append("endpoint_id = ?")
+        where_params.append(endpoint_id)
+    if model_id:
+        where_clauses.append("model_id = ?")
+        where_params.append(model_id)
+    extra_where = ("AND " + " AND ".join(where_clauses)) if where_clauses else ""
 
     # usage_daily（历史）
     c.execute(f"""
@@ -649,9 +668,9 @@ def get_usage_heatmap(
             SUM(total_input_tokens) as input_tokens,
             SUM(total_output_tokens) as output_tokens
         FROM usage_daily
-        WHERE date >= ? AND date < ? {ep_where}
+        WHERE date >= ? AND date < ? {extra_where}
         GROUP BY date
-    """, [start, end_extended] + ep_params)
+    """, [start, end_extended] + where_params)
     daily_rows = c.fetchall()
 
     # usage_records（近7天，补充 usage_daily 未覆盖的近期数据）
@@ -662,9 +681,9 @@ def get_usage_heatmap(
             SUM(input_tokens) as input_tokens,
             SUM(output_tokens) as output_tokens
         FROM usage_records
-        WHERE timestamp >= ? AND timestamp < ? {ep_where}
+        WHERE timestamp >= ? AND timestamp < ? {extra_where}
         GROUP BY date
-    """, [recent_start, end_extended] + ep_params)
+    """, [recent_start, end_extended] + where_params)
     record_rows = c.fetchall()
 
     conn.close()

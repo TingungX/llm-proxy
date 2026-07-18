@@ -8,6 +8,7 @@ import time
 import uuid
 from typing import Any, AsyncIterator
 
+from llm_proxy.protocol.effort_mapping import apply_effort_mapping
 from llm_proxy.protocol.ir._common import (
     build_usage,
     clean_schema,
@@ -48,8 +49,13 @@ logger = logging.getLogger(__name__)
 # ── 请求：Chat → IR ──────────────────────────────────────────────
 
 
-def to_ir(body: dict[str, Any]) -> IRRequest:
-    """OpenAI Chat Completions 请求体 → IRRequest。"""
+def to_ir(body: dict[str, Any], mapping_config: dict | None = None) -> IRRequest:
+    """OpenAI Chat Completions 请求体 → IRRequest。
+
+    Args:
+        body: Chat Completions 格式请求体
+        mapping_config: 全局 thinking_effort_mapping 配置；None 时使用默认兜底
+    """
     model = body.get("model", "")
 
     messages: list[IRMessage] = []
@@ -104,7 +110,9 @@ def to_ir(body: dict[str, Any]) -> IRRequest:
         ir_request.stream = bool(body["stream"])
 
     if "reasoning_effort" in body:
-        ir_request.reasoning_effort = body["reasoning_effort"]
+        mapped = apply_effort_mapping(body["reasoning_effort"], mapping_config)
+        if mapped:
+            ir_request.reasoning_effort = mapped
 
     if "stop" in body:
         stop_val = body["stop"]

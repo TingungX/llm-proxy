@@ -41,6 +41,32 @@
   "error_handling": {
     "failover_enabled": true,
     "no_retry_enabled": true
+  },
+  "thinking_effort_mapping": {
+    "presets": [
+      {
+        "name": "default",
+        "type": "any_to_any",
+        "rules": {
+          "none": "none",
+          "auto": "auto",
+          "minimal": "low",
+          "low": "low",
+          "medium": "medium",
+          "high": "high",
+          "xhigh": "xhigh",
+          "max": "xhigh"
+        }
+      },
+      {
+        "name": "Thinking:ON",
+        "type": "thinking_on",
+        "rules": {
+          "*": "high"
+        }
+      }
+    ],
+    "default_preset": "default"
   }
 }
 

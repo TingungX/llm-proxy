@@ -14,6 +14,29 @@ export interface ModelConfig {
   context_window?: number;
   vision_support?: boolean;
   allow_proxy?: boolean;
+  provider?: string;
+  thinking_effort_mode?: 'default' | 'provider' | 'custom';
+  thinking_effort_preset?: string | EffortPreset;
+}
+
+export interface ProviderProfileInfo {
+  display_name: string;
+  default_api_base: string;
+  default_thinking_effort_preset?: string | null;
+  /** thinking format 类型：thinking_type_plus_reasoning_effort / thinking_enabled_disabled / ... */
+  thinking_format?: string | null;
+  /** 默认 thinking type（如 enabled / adaptive） */
+  default_thinking_type?: string | null;
+  /** 禁用 thinking 的值（如 disabled） */
+  disable_thinking_value?: string | null;
+  /** 厂商专属字段名（如 enable_thinking） */
+  effort_field?: string | null;
+  /** 固定 effort 值（如 Kimi K3 的 max） */
+  fixed_effort?: string | null;
+  /** effort 别名映射（如 low→high） */
+  effort_aliases?: Record<string, string | null>;
+  supports_reasoning_split?: boolean;
+  preserve_reasoning_content?: boolean;
 }
 
 export interface ErrorHandlingConfig {
@@ -21,9 +44,23 @@ export interface ErrorHandlingConfig {
   no_retry_enabled: boolean;
 }
 
+export type EffortPresetType = 'any_to_any' | 'thinking_on' | string;
+
+export interface EffortPreset {
+  name: string;
+  type: EffortPresetType;
+  rules: Record<string, string>;
+}
+
+export interface ThinkingEffortMapping {
+  presets: EffortPreset[];
+  default_preset: string;
+}
+
 export interface Config {
   models: Record<string, ModelConfig>;
   error_handling: ErrorHandlingConfig;
+  thinking_effort_mapping?: ThinkingEffortMapping;
   sidecar?: {
     bin_path: string;
     start_port: number;

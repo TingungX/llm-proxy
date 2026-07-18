@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'preact/hooks';
 import { modelsSignal, errorHandlingSignal, configSignal, setConfig } from '../state/store';
 import { deleteModel, testLatency } from '../api/models';
 import { saveConfig, fetchConfig } from '../api/config';
@@ -6,10 +7,12 @@ import { esc } from '../utils/format';
 import { showToast } from '../components/Toast';
 import { Toggle } from '../components/Toggle';
 import { ProtocolBadge } from '../components/ProtocolChip';
+import { ThinkingEffortMappingCard } from '../components/ThinkingEffortMappingCard';
+import { fetchProviderProfiles } from '../api/providers';
 import { getModelProtocols } from '../utils/protocol';
 import { openModelModal } from '../modals/ModelModal';
 import { EDIT_ICON, DELETE_ICON } from '../utils/icons';
-import type { ModelConfig } from '../api/types';
+import type { ModelConfig, ProviderProfileInfo } from '../api/types';
 
 function formatContextWindow(cw?: number): string {
   if (!cw) return '—';
@@ -85,9 +88,15 @@ function openEditModel(name: string) { openModelModal(name); }
 export function ConfigPage() {
   const models = Object.entries(modelsSignal.value);
   const eh = errorHandlingSignal.value;
+  const [providers, setProviders] = useState<Record<string, ProviderProfileInfo>>({});
+
+  useEffect(() => {
+    fetchProviderProfiles().then(setProviders).catch(() => {});
+  }, []);
 
   return (
-    <div class="two-col">
+    <div class="config-page">
+      {/* 模型表格：全宽大横行 */}
       <div class="card">
         <div class="card-header">
           <h2>已有模型</h2>
@@ -97,6 +106,7 @@ export function ConfigPage() {
           <thead>
             <tr>
               <th>模型</th>
+              <th>厂商</th>
               <th>协议</th>
               <th>上下文</th>
               <th>延迟</th>
@@ -106,18 +116,28 @@ export function ConfigPage() {
           <tbody>
             {models.length === 0 ? (
               <tr>
-                <td colspan={5} style={{ color: 'var(--text-muted)', textAlign: 'center', padding: '20px' }}>
+                <td colspan={6} style={{ color: 'var(--text-muted)', textAlign: 'center', padding: '20px' }}>
                   暂无模型
                 </td>
               </tr>
             ) : (
               models.map(([name, v]: [string, ModelConfig]) => {
                 const displayName = v.display_name || v.upstream_model || name;
+                const pvd = v.provider ? providers[v.provider] : null;
                 return (
                   <tr key={name}>
                     <td>
                       <div class="value">{esc(displayName)}</div>
                       <div class="hint">{esc(name)}</div>
+                    </td>
+                    <td>
+                      {v.provider ? (
+                        <span class="provider-badge" title={v.provider}>
+                          {pvd?.display_name ?? v.provider}
+                        </span>
+                      ) : (
+                        <span class="text-xs text-muted">—</span>
+                      )}
                     </td>
                     <td>
                       <div style={{ display: 'flex', gap: '3px', flexWrap: 'wrap' }}>
@@ -160,21 +180,26 @@ export function ConfigPage() {
         </table>
       </div>
 
-      <div class="card">
-        <h2>错误处理配置</h2>
-        <div style={{ marginTop: '8px' }}>
-          <Toggle
-            checked={eh.failover_enabled}
-            onChange={(v: boolean) => handleErrorHandlingChange('failover_enabled', v)}
-            label="自动转移"
-          />
-          <Toggle
-            checked={eh.no_retry_enabled}
-            onChange={(v: boolean) => handleErrorHandlingChange('no_retry_enabled', v)}
-            label="取消重试"
-          />
+      <div class="two-col">
+        <div class="card">
+          <h2>错误处理配置</h2>
+          <div style={{ marginTop: '8px' }}>
+            <Toggle
+              checked={eh.failover_enabled}
+              onChange={(v: boolean) => handleErrorHandlingChange('failover_enabled', v)}
+              label="自动转移"
+            />
+            <Toggle
+              checked={eh.no_retry_enabled}
+              onChange={(v: boolean) => handleErrorHandlingChange('no_retry_enabled', v)}
+              label="取消重试"
+            />
+          </div>
         </div>
+        <div></div>
       </div>
+
+      <ThinkingEffortMappingCard providers={providers} />
     </div>
   );
 }

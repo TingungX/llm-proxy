@@ -29,6 +29,13 @@ from llm_proxy.infra import db
 from llm_proxy.state import get_state, resolve_model_for_endpoint
 from llm_proxy.logging_config import REQUEST_ID_CTX
 from llm_proxy.services.vision_service import replace_images_in_anthropic_messages
+from llm_proxy.protocol.effort_mapping import apply_effort_mapping
+from llm_proxy.protocol.ir._common import resolve_reasoning_effort
+from llm_proxy.protocol.provider_profiles import (
+    ProviderProfile,
+    apply_thinking_to_anthropic_body,
+    apply_thinking_to_chat_body,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,9 +81,46 @@ def _status_to_code(status: int) -> str:
     return _STATUS_CODE_MAP.get(status, "api_error")
 
 
-def _needs_reasoning_split(api_base: str) -> bool:
-    """检测上游是否为 MiniMax（将 thinking 塞在 content 里），需要注入 reasoning_split=True"""
-    return "minimaxi.com" in (api_base or "").lower()
+def _model_provider_profile(model_id: str) -> ProviderProfile | None:
+    """取模型的厂商 profile。"""
+    return get_state().get_model_provider_profile(model_id)
+
+
+def _apply_provider_chat_thinking(
+    body: dict, effort: str | None, model_id: str
+) -> None:
+    """按厂商 profile 把规范 effort 编码进 Chat Completions 请求体。"""
+    profile = _model_provider_profile(model_id)
+    if profile:
+        apply_thinking_to_chat_body(body, effort, profile)
+
+
+def _apply_provider_anthropic_thinking(
+    body: dict, effort: str | None, model_id: str
+) -> None:
+    """按厂商 profile 把规范 effort 编码进 Anthropic Messages 请求体。"""
+    profile = _model_provider_profile(model_id)
+    if profile:
+        apply_thinking_to_anthropic_body(body, effort, profile)
+
+
+def _map_chat_reasoning_effort(body: dict, model_id: str) -> str | None:
+    """从 Chat 请求体提取并映射 reasoning_effort（按模型 preset）。"""
+    effort = body.get("reasoning_effort")
+    if effort is None:
+        return None
+    return apply_effort_mapping(effort, get_state().get_model_effort_mapping(model_id))
+
+
+def _resolve_reasoning_effort_for_model(body: dict, model_id: str) -> str | None:
+    """从 Anthropic 请求体提取并映射 reasoning_effort（按模型 preset）。"""
+    return resolve_reasoning_effort(body, get_state().get_model_effort_mapping(model_id))
+
+
+def _needs_reasoning_split(model_id: str) -> bool:
+    """检测上游是否需要注入 reasoning_split=True。"""
+    profile = _model_provider_profile(model_id)
+    return bool(profile and profile.supports_reasoning_split)
 
 
 def _estimate_tokens(body: dict) -> dict:
@@ -249,6 +293,9 @@ class ProxyStep(HandlerStep):
                 out_body["messages"] = await replace_images_in_anthropic_messages(out_body["messages"])
 
         out_body["model"] = actual_model
+        # 按厂商 profile 编码 Anthropic 格式 thinking/reasoning
+        effort = _resolve_reasoning_effort_for_model(out_body, model_id)
+        _apply_provider_anthropic_thinking(out_body, effort, model_id)
         stream = out_body.get("stream", False)
         model_paths = get_state().paths_map.get(model_id.lower(), {})
         messages_path = resolve_path(model_paths, "anthropic/messages")
@@ -416,10 +463,12 @@ class ProxyStep(HandlerStep):
         )
 
         # 1. 转换请求
-        chat_body = anthropic_to_chat(body)
+        model_effort_mapping = get_state().get_model_effort_mapping(model_id)
+        chat_body = anthropic_to_chat(body, model_effort_mapping)
         chat_body["model"] = actual_model
-        if _needs_reasoning_split(api_base):
-            chat_body["reasoning_split"] = True
+        # 按厂商 profile 编码 thinking/reasoning（含 MiniMax reasoning_split）
+        effort = _resolve_reasoning_effort_for_model(body, model_id)
+        _apply_provider_chat_thinking(chat_body, effort, model_id)
         stream = chat_body.get("stream", False)
 
         state = get_state()
@@ -490,8 +539,10 @@ class ProxyStep(HandlerStep):
 
                 if result.applied:
                     # 用整流后的 body 重新转换并重试
-                    retry_chat_body = anthropic_to_chat(rectified_body)
+                    retry_chat_body = anthropic_to_chat(rectified_body, model_effort_mapping)
                     retry_chat_body["model"] = actual_model
+                    retry_effort = _resolve_reasoning_effort_for_model(rectified_body, model_id)
+                    _apply_provider_chat_thinking(retry_chat_body, retry_effort, model_id)
                     try:
                         retry_resp = await client.post(
                             target_url, json=retry_chat_body, headers=req_headers, timeout=120.0
@@ -802,7 +853,7 @@ class ProxyStep(HandlerStep):
         if ctx.converter == "responses_to_chat":
             # 已是转换后的 chat_body
             chat_body = body
-            if _needs_reasoning_split(api_base):
+            if _needs_reasoning_split(model_id):
                 chat_body["reasoning_split"] = True
             reverse_tool_map = ctx.reverse_tool_map
             tool_spec_map = ctx.tool_spec_map
@@ -941,8 +992,12 @@ class ProxyStep(HandlerStep):
         body = ctx.body
         out_body = dict(body)
         out_body["model"] = actual_model
-        if _needs_reasoning_split(api_base):
+        if _needs_reasoning_split(model_id):
             out_body["reasoning_split"] = True
+        # 按厂商 profile 编码 thinking/reasoning
+        _apply_provider_chat_thinking(
+            out_body, _map_chat_reasoning_effort(out_body, model_id), model_id
+        )
         stream = out_body.get("stream", False)
         model_paths = get_state().paths_map.get(model_id.lower(), {})
         chat_path = resolve_path(model_paths, "openai/chat-completions")

@@ -231,9 +231,21 @@ class TestStripThinkTags:
         assert len(outputs) == 1
         assert outputs[0]["type"] == "message"
 
-    def test_needs_reasoning_split(self):
+    def test_needs_reasoning_split(self, monkeypatch):
         from llm_proxy.handlers.shared.proxy import _needs_reasoning_split
-        assert _needs_reasoning_split("https://api.minimaxi.com") is True
-        assert _needs_reasoning_split("https://api.openai.com") is False
+        from llm_proxy.state import State
+
+        test_state = State({
+            "models": {
+                "minimax-model": {"api_base": "", "api_key": "", "provider": "minimax"},
+                "openai-model": {"api_base": "", "api_key": "", "provider": "openai"},
+            }
+        })
+        monkeypatch.setattr(
+            "llm_proxy.handlers.shared.proxy.get_state", lambda: test_state
+        )
+
+        assert _needs_reasoning_split("minimax-model") is True
+        assert _needs_reasoning_split("openai-model") is False
         assert _needs_reasoning_split("") is False
-        assert _needs_reasoning_split("https://api.MiniMaxi.com/v1") is True
+        assert _needs_reasoning_split("unknown-model") is False

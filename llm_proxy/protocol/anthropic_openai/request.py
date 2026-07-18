@@ -10,6 +10,8 @@ import json
 import logging
 import re
 
+from llm_proxy.protocol.effort_mapping import apply_effort_mapping
+
 logger = logging.getLogger(__name__)
 
 # ── Billing Header 清理 ──────────────────────────────────────────────
@@ -88,11 +90,12 @@ def supports_reasoning_effort(model: str) -> bool:
     return False
 
 
-def resolve_reasoning_effort(body: dict) -> str | None:
+def resolve_reasoning_effort(body: dict, mapping_config: dict | None = None) -> str | None:
     """从 Anthropic 请求体解析出 OpenAI reasoning_effort 值。
 
     Priority 1: output_config.effort — 用户显式指定
-      low/medium/high → 直接映射; max → xhigh; 未知值 → 不注入
+      交由 apply_effort_mapping 处理：命中规则返回映射值；
+      未命中且无 "*" 兜底时返回 None（不注入）。
 
     Priority 2: thinking.type + budget_tokens — 从 Anthropic thinking 配置推导
       adaptive → xhigh
@@ -101,17 +104,16 @@ def resolve_reasoning_effort(body: dict) -> str | None:
       enabled + budget >= 16000 → high
       enabled 无 budget → high
       disabled / 缺失 → 不注入
+
+    Args:
+        body: Anthropic 请求体
+        mapping_config: 全局 thinking_effort_mapping 配置；None 时使用默认兜底
+            （默认规则与原硬编码 effort_map 一致，保证旧行为不变）
     """
     # Priority 1: explicit output_config.effort
     effort = (body.get("output_config") or {}).get("effort")
     if effort is not None:
-        effort_map = {
-            "low": "low",
-            "medium": "medium",
-            "high": "high",
-            "max": "xhigh",
-        }
-        return effort_map.get(effort)
+        return apply_effort_mapping(effort, mapping_config)
 
     # Priority 2: thinking fallback
     thinking = body.get("thinking")
@@ -120,17 +122,17 @@ def resolve_reasoning_effort(body: dict) -> str | None:
 
     thinking_type = thinking.get("type")
     if thinking_type == "adaptive":
-        return "xhigh"
+        return apply_effort_mapping("xhigh", mapping_config)
     if thinking_type == "enabled":
         budget = thinking.get("budget_tokens")
         if budget is None:
-            return "high"
+            return apply_effort_mapping("high", mapping_config)
         budget = int(budget)
         if budget < 4000:
-            return "low"
+            return apply_effort_mapping("low", mapping_config)
         if budget < 16000:
-            return "medium"
-        return "high"
+            return apply_effort_mapping("medium", mapping_config)
+        return apply_effort_mapping("high", mapping_config)
 
     # disabled 或其他 → 不注入
     return None
@@ -404,11 +406,12 @@ def _convert_message_to_openai(role: str, content) -> list[dict]:
 
 # ── 主转换函数 ────────────────────────────────────────────────────────
 
-def anthropic_to_chat(body: dict) -> dict:
+def anthropic_to_chat(body: dict, mapping_config: dict | None = None) -> dict:
     """将 Anthropic Messages API 请求转换为 OpenAI Chat Completions 请求。
 
     Args:
         body: Anthropic 格式请求体
+        mapping_config: 全局 thinking_effort_mapping 配置；None 时使用默认兜底
 
     Returns:
         OpenAI Chat Completions 格式请求体
@@ -471,7 +474,7 @@ def anthropic_to_chat(body: dict) -> dict:
 
     # reasoning_effort — 仅对支持模型注入
     if model and supports_reasoning_effort(model):
-        effort = resolve_reasoning_effort(body)
+        effort = resolve_reasoning_effort(body, mapping_config)
         if effort:
             result["reasoning_effort"] = effort
 

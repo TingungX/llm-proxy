@@ -1500,3 +1500,86 @@ class TestResponsesFailedStatusMapping:
         }
         ir = responses_response_to_ir(upstream)
         assert ir.stop_reason != "end_turn", f"cancelled status mapped to end_turn: {ir.stop_reason}"
+
+
+class TestReasoningContentPreservation:
+    """DeepSeek 等厂商的 reasoning_content 在多轮对话中不能丢失。"""
+
+    def test_chat_request_roundtrip_preserves_reasoning_content(self):
+        """Chat 请求中的 reasoning_content → IR → Chat 请求仍保留。"""
+        body = {
+            "model": "deepseek-chat",
+            "messages": [
+                {"role": "user", "content": "Solve this."},
+                {
+                    "role": "assistant",
+                    "content": "The answer is 42.",
+                    "reasoning_content": "Let me calculate...",
+                },
+            ],
+        }
+        ir = chat_to_ir(body)
+        upstream = chat_to_upstream(ir)
+        assistant_msg = upstream["messages"][1]
+        assert assistant_msg.get("reasoning_content") == "Let me calculate..."
+        assert assistant_msg.get("content") == "The answer is 42."
+
+    def test_chat_response_to_ir_preserves_reasoning_content(self):
+        """Chat 响应中的 reasoning_content 必须进入 IRThinkingBlock。"""
+        chat_resp = {
+            "id": "x",
+            "model": "deepseek-chat",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Answer",
+                    "reasoning_content": "Reasoning",
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {},
+        }
+        ir = chat_response_to_ir(chat_resp)
+        types = [type(b).__name__ for b in ir.content_blocks]
+        assert "IRThinkingBlock" in types
+        thinking = next(b for b in ir.content_blocks if isinstance(b, IRThinkingBlock))
+        assert thinking.thinking == "Reasoning"
+
+    def test_anthropic_thinking_block_to_chat_reasoning_content(self):
+        """Anthropic thinking block → Chat reasoning_content（跨协议保留）。"""
+        anth_resp = {
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "Internal reasoning"},
+                {"type": "text", "text": "Public reply"},
+            ],
+            "stop_reason": "end_turn",
+            "usage": {},
+        }
+        chat = convert_response("anthropic", "openai/chat-completions", anth_resp)
+        msg = chat["choices"][0]["message"]
+        assert msg.get("reasoning_content") == "Internal reasoning"
+        assert msg.get("content") == "Public reply"
+
+    def test_responses_reasoning_item_to_chat_reasoning_content(self):
+        """Responses reasoning item → Chat reasoning_content（跨协议保留）。"""
+        resp_body = {
+            "id": "resp_1",
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [
+                {"type": "reasoning", "summary": [
+                    {"type": "summary_text", "text": "Internal reasoning"},
+                ]},
+                {"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "Public reply"},
+                ]},
+            ],
+            "usage": {},
+        }
+        chat = convert_response("openai/responses", "openai/chat-completions", resp_body)
+        msg = chat["choices"][0]["message"]
+        assert msg.get("reasoning_content") == "Internal reasoning"
+        assert msg.get("content") == "Public reply"

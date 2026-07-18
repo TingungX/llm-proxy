@@ -1,0 +1,102 @@
+{
+  "deepseek": {
+    "display_name": "DeepSeek",
+    "default_api_base": "https://api.deepseek.com/",
+    "default_thinking_effort_preset": "default",
+    "thinking": {
+      "format": "thinking_type_plus_reasoning_effort",
+      "default_type": "enabled",
+      "disable_value": "disabled",
+      "effort_aliases": {
+        "none": "disabled",
+        "auto": "high",
+        "minimal": "high",
+        "low": "high",
+        "medium": "high",
+        "high": "high",
+        "xhigh": "max",
+        "max": "max"
+      }
+    },
+    "response": {
+      "preserve_reasoning_content": true
+    }
+  },
+  "minimax": {
+    "display_name": "MiniMax",
+    "default_api_base": "https://api.minimax.io/",
+    "default_thinking_effort_preset": "default",
+    "thinking": {
+      "format": "thinking_adaptive_disabled",
+      "default_type": "adaptive",
+      "disable_value": "disabled"
+    },
+    "response": {
+      "supports_reasoning_split": true
+    }
+  },
+  "moonshot-k2": {
+    "display_name": "Kimi K2.x",
+    "default_api_base": "https://api.moonshot.cn/",
+    "default_thinking_effort_preset": "default",
+    "thinking": {
+      "format": "thinking_enabled_disabled",
+      "default_type": "enabled",
+      "disable_value": "disabled"
+    }
+  },
+  "moonshot-k3": {
+    "display_name": "Kimi K3",
+    "default_api_base": "https://api.moonshot.cn/",
+    "default_thinking_effort_preset": "default",
+    "thinking": {
+      "format": "reasoning_effort_fixed",
+      "fixed_value": "max"
+    }
+  },
+  "zhipu": {
+    "display_name": "智谱 GLM",
+    "default_api_base": "https://open.bigmodel.cn/api/paas/v4/",
+    "default_thinking_effort_preset": "default",
+    "thinking": {
+      "format": "thinking_enabled_disabled",
+      "default_type": "enabled",
+      "disable_value": "disabled"
+    }
+  },
+  "alibabacloud-glm": {
+    "display_name": "阿里云 GLM",
+    "default_api_base": "",
+    "default_thinking_effort_preset": "default",
+    "thinking": {
+      "format": "enable_thinking_boolean",
+      "field": "enable_thinking"
+    }
+  },
+  "vllm-glm": {
+    "display_name": "vLLM GLM",
+    "default_api_base": "",
+    "default_thinking_effort_preset": "default",
+    "thinking": {
+      "format": "chat_template_kwargs_enable_thinking"
+    }
+  },
+  "glm-anthropic": {
+    "display_name": "GLM (Anthropic 入口)",
+    "default_api_base": "",
+    "default_thinking_effort_preset": "default",
+    "thinking": {
+      "format": "reasoning_effort_only",
+      "effort_aliases": {
+        "none": null,
+        "auto": "medium",
+        "minimal": "low",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "high",
+        "max": "high"
+      }
+    }
+  }
+}

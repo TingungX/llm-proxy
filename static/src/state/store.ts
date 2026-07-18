@@ -2,15 +2,16 @@ export { configSignal, modelsSignal, errorHandlingSignal, setConfig, getMappingN
 export { endpointsSignal, endpointNameMapSignal, setEndpoints, getEndpoint } from './endpoints';
 export {
   usageModeSignal, usageGroupBySignal, hourlyDayOffsetSignal,
-  heatmapDaysSignal, usageEndpointFilterSignal, heatmapEndpointFilterSignal,
+  heatmapDaysSignal, usageEndpointFilterSignal, usageModelFilterSignal,
+  usageCustomTimeRangeSignal,
   usageChartRef, endpointUsageChartRef,
   usageRefreshTrigger, heatmapRefreshTrigger,
   setHeatmapDays, setUsageMode, setUsageGroupBy, setHourlyDayOffset,
-  setUsageEndpointFilter, setHeatmapEndpointFilter,
+  setUsageEndpointFilter, setUsageModelFilter, setUsageCustomTimeRange,
   loadHeatmapDaysFromLocalStorage,
   HEATMAP_DAYS_OPTIONS,
 } from './usage';
-export type { UsageMode, UsageGroupBy } from './usage';
+export type { UsageMode, UsageGroupBy, UsageCustomTimeRange } from './usage';
 export {
   logsSignal, logsTotalSignal, logsOffsetSignal, logsLimitSignal,
   logsLoadingSignal, logFilterSignal, hasActiveFiltersSignal,

@@ -1,15 +1,21 @@
 import { signal } from '@preact/signals';
 
-export type UsageMode = '30d' | '7d' | '1h';
+export type UsageMode = '30d' | '7d' | '1h' | 'custom';
 export type UsageGroupBy = 'model' | 'endpoint';
 export type UsageSplitMode = 'merged' | 'split';
+
+export interface UsageCustomTimeRange {
+  since: string;
+  until: string;
+}
 
 export const usageModeSignal = signal<UsageMode>('30d');
 export const usageGroupBySignal = signal<UsageGroupBy>('model');
 export const hourlyDayOffsetSignal = signal(0);
 export const heatmapDaysSignal = signal(365);
 export const usageEndpointFilterSignal = signal('');
-export const heatmapEndpointFilterSignal = signal('');
+export const usageModelFilterSignal = signal('');
+export const usageCustomTimeRangeSignal = signal<UsageCustomTimeRange | null>(null);
 export const usageSplitModeSignal = signal<UsageSplitMode>('split');
 
 export const usageChartRef = signal<unknown>(null);
@@ -52,6 +58,7 @@ export function setUsageMode(mode: UsageMode): void {
     hourlyDayOffsetSignal.value = 0;
   }
   usageRefreshTrigger.value++;
+  heatmapRefreshTrigger.value++;
 }
 
 export function setUsageGroupBy(group: UsageGroupBy): void {
@@ -67,10 +74,18 @@ export function setHourlyDayOffset(offset: number): void {
 export function setUsageEndpointFilter(endpointId: string): void {
   usageEndpointFilterSignal.value = endpointId;
   usageRefreshTrigger.value++;
+  heatmapRefreshTrigger.value++;
 }
 
-export function setHeatmapEndpointFilter(endpointId: string): void {
-  heatmapEndpointFilterSignal.value = endpointId;
+export function setUsageModelFilter(modelId: string): void {
+  usageModelFilterSignal.value = modelId;
+  usageRefreshTrigger.value++;
+  heatmapRefreshTrigger.value++;
+}
+
+export function setUsageCustomTimeRange(range: UsageCustomTimeRange | null): void {
+  usageCustomTimeRangeSignal.value = range;
+  usageRefreshTrigger.value++;
   heatmapRefreshTrigger.value++;
 }
 

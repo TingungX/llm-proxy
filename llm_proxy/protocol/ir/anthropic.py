@@ -53,8 +53,13 @@ logger = logging.getLogger(__name__)
 # ── 请求：Anthropic → IR ──────────────────────────────────────────
 
 
-def to_ir(body: dict[str, Any]) -> IRRequest:
-    """Anthropic Messages API 请求体 → IRRequest。"""
+def to_ir(body: dict[str, Any], mapping_config: dict | None = None) -> IRRequest:
+    """Anthropic Messages API 请求体 → IRRequest。
+
+    Args:
+        body: Anthropic 格式请求体
+        mapping_config: 全局 thinking_effort_mapping 配置；None 时使用默认兜底
+    """
     model = body.get("model", "")
 
     system_texts: list[str] = []
@@ -108,7 +113,7 @@ def to_ir(body: dict[str, Any]) -> IRRequest:
 
     # reasoning_effort
     if model and supports_reasoning_effort(model):
-        effort = resolve_reasoning_effort(body)
+        effort = resolve_reasoning_effort(body, mapping_config)
         if effort:
             ir_request.reasoning_effort = effort
 

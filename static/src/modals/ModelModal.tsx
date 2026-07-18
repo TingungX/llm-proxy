@@ -1,8 +1,9 @@
-import { useEffect } from 'preact/hooks';
-import { modelsSignal, setConfig, modelModalOpen, modelModalEditing, closeModelModal } from '../state/store';
+import { useEffect, useState } from 'preact/hooks';
+import { modelsSignal, configSignal, setConfig, modelModalOpen, modelModalEditing, closeModelModal } from '../state/store';
 import { saveModel } from '../api/models';
 import { detectProtocol as apiDetectProtocol } from '../api/endpoints';
 import { fetchConfig } from '../api/config';
+import { fetchProviderProfiles } from '../api/providers';
 import { showToast } from '../components/Toast';
 import { ApiCallError } from '../api/client';
 import { useFormState } from '../hooks/useFormState';
@@ -12,7 +13,9 @@ import { Modal } from '../components/Modal';
 import { Field } from '../components/Field';
 import { ProtocolChip } from '../components/ProtocolChip';
 import { Toggle } from '../components/Toggle';
-import type { ModelConfig } from '../api/types';
+import { ComboBox } from '../components/ComboBox';
+import { EffortStrategyFieldset } from '../components/EffortStrategyFieldset';
+import type { ModelConfig, ProviderProfileInfo } from '../api/types';
 
 interface ModelFormValues extends Record<string, unknown> {
   name: string;
@@ -29,6 +32,14 @@ interface ModelFormValues extends Record<string, unknown> {
   pathOpenaiResponses: string;
   visionSupport: boolean;
   allowProxy: boolean;
+  provider: string;
+  thinkingEffortMode: 'default' | 'provider' | 'custom';
+  thinkingEffortCustomType: string;
+  thinkingEffortCustomRules: Record<string, string>;
+}
+
+function emptyRules(): Record<string, string> {
+  return { low: 'low', medium: 'medium', high: 'high', '*': 'medium' };
 }
 
 function getInitialValues(name: string | null): ModelFormValues {
@@ -37,7 +48,10 @@ function getInitialValues(name: string | null): ModelFormValues {
     contextWindow: '', contextWindowUnit: '1000',
     chipAnthropic: false, chipOpenaiChat: false, chipOpenaiResponses: false,
     pathAnthropic: '', pathOpenaiChat: '', pathOpenaiResponses: '',
-    visionSupport: false, allowProxy: false,
+    visionSupport: false, allowProxy: false, provider: '',
+    thinkingEffortMode: 'default',
+    thinkingEffortCustomType: 'any_to_any',
+    thinkingEffortCustomRules: emptyRules(),
   };
   if (name) {
     const m: ModelConfig | undefined = (modelsSignal.value as Record<string, ModelConfig>)[name];
@@ -49,6 +63,30 @@ function getInitialValues(name: string | null): ModelFormValues {
         else { cw = String(m.context_window / 1000); cwUnit = '1000'; }
       }
       const pc = extractProtocolConfig(m);
+
+      // 解析 thinking effort 模式
+      let mode = m.thinking_effort_mode;
+      const presetVal = m.thinking_effort_preset;
+      if (!mode) {
+        // 向后兼容：老配置无 mode 但有 preset → 视为 custom
+        mode = presetVal ? 'custom' : 'default';
+      }
+      let customType = 'any_to_any';
+      let customRules: Record<string, string> = emptyRules();
+      if (mode === 'custom') {
+        if (typeof presetVal === 'object' && presetVal && 'rules' in presetVal) {
+          customType = presetVal.type ?? 'any_to_any';
+          customRules = { ...presetVal.rules };
+        } else if (typeof presetVal === 'string' && presetVal) {
+          // 命名引用 → 从全局 presets 复制
+          const globalPreset = configSignal.value?.thinking_effort_mapping?.presets.find(p => p.name === presetVal);
+          if (globalPreset) {
+            customType = globalPreset.type;
+            customRules = { ...globalPreset.rules };
+          }
+        }
+      }
+
       return {
         ...base,
         name,
@@ -65,6 +103,10 @@ function getInitialValues(name: string | null): ModelFormValues {
         pathOpenaiResponses: pc.paths.openai_responses,
         visionSupport: m.vision_support ?? false,
         allowProxy: m.allow_proxy ?? false,
+        provider: m.provider ?? '',
+        thinkingEffortMode: mode as 'default' | 'provider' | 'custom',
+        thinkingEffortCustomType: customType,
+        thinkingEffortCustomRules: customRules,
       };
     }
   }
@@ -75,10 +117,18 @@ export function ModelModal() {
   const isOpen = modelModalOpen.value;
   const editing = modelModalEditing.value;
   const form = useFormState<ModelFormValues>(getInitialValues(editing));
+  const [profiles, setProfiles] = useState<Record<string, ProviderProfileInfo>>({});
 
   useEffect(() => {
     if (isOpen) form.reset(getInitialValues(editing));
   }, [isOpen, editing]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    fetchProviderProfiles().then(setProfiles).catch(() => {
+      // 失败时静默，provider 字段仍可手动输入
+    });
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
@@ -88,7 +138,7 @@ export function ModelModal() {
 
   const onSave = async () => {
     if (!v.name) { form.setErrors({ name: '必填' }); return; }
-    const data: Partial<ModelConfig> = {
+    const data: Record<string, unknown> = {
       display_name: v.displayName || undefined,
       api_base: v.apiBase,
       api_key: v.apiKey,
@@ -97,7 +147,20 @@ export function ModelModal() {
       context_window: v.contextWindow ? Math.round(Number(v.contextWindow) * Number(v.contextWindowUnit)) : undefined,
       vision_support: v.visionSupport || undefined,
       allow_proxy: v.allowProxy || undefined,
+      provider: v.provider || undefined,
     };
+
+    // Thinking effort：按模式写入（type 字段已废弃，统一用 'any_to_any'）
+    if (v.thinkingEffortMode === 'custom') {
+      data.thinking_effort_mode = 'custom';
+      data.thinking_effort_preset = {
+        type: 'any_to_any',
+        rules: { ...v.thinkingEffortCustomRules },
+      };
+    } else {
+      data.thinking_effort_mode = v.thinkingEffortMode;
+      data.thinking_effort_preset = null; // 清理旧的内联值
+    }
     try {
       await form.handleSubmit(async () => {
         await saveModel(v.name, data);
@@ -151,6 +214,21 @@ export function ModelModal() {
           <Field label="显示名称" hint="留空则使用配置键">
             <input class="w-full" value={v.displayName} onInput={(e: Event) => form.setField('displayName', (e.target as HTMLInputElement).value)} />
           </Field>
+          <Field label="厂商 (Provider)" hint="选择或输入厂商标识，用于自动适配 thinking/reasoning 格式">
+            <ComboBox
+              value={v.provider}
+              options={Object.entries(profiles).map(([key, p]) => ({ value: key, label: p.display_name }))}
+              onInput={(value) => {
+                form.setField('provider', value);
+                const profile = profiles[value];
+                if (profile && !v.apiBase) {
+                  form.setField('apiBase', profile.default_api_base);
+                }
+              }}
+              placeholder="如 deepseek、minimax、moonshot-k3"
+            />
+          </Field>
+
           <Field label="API Base" hint="如 https://api.example.com">
             <input class="w-full" value={v.apiBase} onInput={(e: Event) => form.setField('apiBase', (e.target as HTMLInputElement).value)} placeholder="https://..." />
           </Field>
@@ -204,6 +282,16 @@ export function ModelModal() {
           </div>
         </div>
       </div>
+
+      <EffortStrategyFieldset
+        mode={v.thinkingEffortMode as 'default' | 'provider' | 'custom'}
+        provider={v.provider || ''}
+        customRules={v.thinkingEffortCustomRules}
+        profiles={profiles}
+        onModeChange={(mode) => form.setField('thinkingEffortMode', mode)}
+        onRulesChange={(rules) => form.setField('thinkingEffortCustomRules', rules)}
+      />
+
       <div class="modal-actions">
         <button class="ghost" onClick={closeModelModal}>取消</button>
         <button class="primary" onClick={onSave} disabled={form.submitting.value}>{form.submitting.value ? '保存中...' : '保存'}</button>

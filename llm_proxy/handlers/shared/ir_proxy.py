@@ -16,9 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import time
-import uuid
 from typing import AsyncIterator
 
 import socket
@@ -35,6 +33,12 @@ from llm_proxy.protocol.errors import make_anthropic_error, make_openai_error
 from llm_proxy.protocol.ir import REGISTRY, _resolve
 from llm_proxy.protocol.ir._stream import keepalive_wrapper
 from llm_proxy.protocol.ir.types import IRStreamEvent
+from llm_proxy.protocol.provider_profiles import (
+    ProviderProfile,
+    apply_thinking_to_anthropic_body,
+    apply_thinking_to_chat_body,
+    get_provider_profile,
+)
 from llm_proxy.services.tool_call_fix import fix_orphaned_tool_calls
 from llm_proxy.state import get_state
 from llm_proxy.logging_config import REQUEST_ID_CTX
@@ -135,6 +139,24 @@ def _client_for(model_id: str | None):
     return get_client()
 
 
+def _model_provider_profile(model_id: str) -> ProviderProfile | None:
+    """取模型的厂商 profile。"""
+    return get_state().get_model_provider_profile(model_id)
+
+
+def _apply_provider_thinking(
+    upstream_body: dict, upstream_proto: str, effort: str | None, model_id: str
+) -> None:
+    """按厂商 profile 把规范 effort 编码进上游请求体。"""
+    profile = _model_provider_profile(model_id)
+    if not profile or not profile.thinking_format:
+        return
+    if upstream_proto == "openai":
+        apply_thinking_to_chat_body(upstream_body, effort, profile)
+    elif upstream_proto == "anthropic":
+        apply_thinking_to_anthropic_body(upstream_body, effort, profile)
+
+
 class IRProxyStep(HandlerStep):
     """基于 IR 的统一代理步骤。
 
@@ -192,12 +214,19 @@ class IRProxyStep(HandlerStep):
         client_proto = _resolve(self.client_protocol)
         upstream_proto = _resolve(upstream_protocol)
         try:
-            ir_request = REGISTRY[client_proto].to_ir(ctx.body)
+            model_effort_mapping = get_state().get_model_effort_mapping(model_id)
+            ir_request = REGISTRY[client_proto].to_ir(ctx.body, model_effort_mapping)
             upstream_body = REGISTRY[upstream_proto].to_upstream(ir_request, upstream_model=actual_model)
         except Exception as e:
             logger.error(f"IR conversion failed: {e}", exc_info=True)
             self._record_usage(ctx, 0, 0, status="error", error_type="ir_conversion_error")
             raise
+
+        # 按厂商 profile 编码 thinking/reasoning 格式（含 MiniMax reasoning_split、
+        # DeepSeek thinking.type + reasoning_effort 等）
+        _apply_provider_thinking(
+            upstream_body, upstream_proto, ir_request.reasoning_effort, model_id
+        )
 
         # Chat 上游严格校验 tool_call_id 配对：每个 tool 消息必须能在前序
         # assistant(tool_calls) 找到对应 id。Codex 中断 apply_patch 后重建的
@@ -224,42 +253,9 @@ class IRProxyStep(HandlerStep):
                 "Content-Type": "application/json",
             }
 
-        # ── 预检：上游 body 大小 ──
-        # 部分上游（如讯飞 MaaS）对 input length 有字符数限制（262,144 chars）。
-        # 图片 base64 + 工具回调历史容易超限。这里在发送前检测，超限则提前拒绝
-        # 并给出明确错误原因，避免浪费上游调用和产生令人困惑的 stream_error。
-        body_text = json.dumps(upstream_body, ensure_ascii=False)
-        body_chars = len(body_text)
-        b64_images = re.findall(r'data:image/[^,]+;base64,([A-Za-z0-9+/=]+)', body_text)
-        b64_total = sum(len(b) for b in b64_images)
-        # 保守上限：上游字符限制一般不低于 context_window（token 数）。
-        # 文本场景 1 token ≈ 4 chars，但 base64 数据约 1 char = 1 char，
-        # 所以用 context_window（token）× 4 作为字符上限过于宽松。
-        # 用 context_window × 2 作为硬上限（覆盖文本 + 部分 base64 场景）。
-        context_window = s.config.get("models", {}).get(model_id.lower(), {}).get("context_window", 200000)
-        max_safe_chars = context_window * 2
-        if body_chars > max_safe_chars:
-            logger.warning(
-                f"IRProxyStep: rejecting oversize request (chars={body_chars}, "
-                f"b64_image_chars={b64_total}, max_safe={max_safe_chars}, "
-                f"model={model_id})"
-            )
-            self._record_usage(ctx, 0, 0, status="error", error_type="input_too_large")
-            raise PipelineStop(
-                make_openai_error(
-                    f"Request too large: ~{body_chars:,} chars "
-                    f"(text + ~{b64_total:,} base64 image chars). "
-                    f"Upstream limit is ~{context_window} tokens. "
-                    "Try reducing conversation history or image size.",
-                    "invalid_request_error",
-                    400,
-                )
-            )
-
         logger.debug(
             f"IRProxyStep: client={self.client_protocol} → upstream={upstream_protocol}, "
-            f"target={target_url}, stream={ir_request.stream}, "
-            f"body_chars={body_chars}, b64_chars={b64_total}"
+            f"target={target_url}, stream={ir_request.stream}"
         )
 
         # ── 分流：流式 / 非流式 ──
@@ -463,7 +459,7 @@ class IRProxyStep(HandlerStep):
                     # 由于 yield 都发生在 status_code 检查通过之后，连接级异常（在拿到 resp 之前）
                     # 一定属于「未 flush」，可安全重试。
                     if attempt < _RETRY_MAX and isinstance(
-                        e, (httpx.ConnectError, httpx.TimeoutException, socket.gaierror, socket.timeout, OSError)
+                        e, (httpx.ConnectError, httpx.RemoteProtocolError, httpx.TimeoutException, socket.gaierror, socket.timeout, OSError)
                     ):
                         wait = 2 ** attempt
                         logger.warning(f"IR stream connect error: {e}, retrying in {wait}s (attempt {attempt + 1}/{_RETRY_MAX + 1})")

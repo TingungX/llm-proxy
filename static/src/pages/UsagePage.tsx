@@ -1,21 +1,23 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import {
   usageModeSignal, usageGroupBySignal, hourlyDayOffsetSignal,
-  heatmapDaysSignal, usageEndpointFilterSignal, heatmapEndpointFilterSignal,
+  heatmapDaysSignal, usageEndpointFilterSignal, usageModelFilterSignal,
+  usageCustomTimeRangeSignal,
   usageSplitModeSignal,
   usageRefreshTrigger, heatmapRefreshTrigger,
   setHeatmapDays, setUsageMode, setUsageGroupBy, setHourlyDayOffset,
-  setUsageEndpointFilter, setHeatmapEndpointFilter, setUsageSplitMode,
+  setUsageSplitMode,
   loadHeatmapDaysFromLocalStorage,
   HEATMAP_DAYS_OPTIONS,
   type UsageSplitMode,
 } from '../state/usage';
-import { endpointsSignal, endpointNameMapSignal } from '../state/endpoints';
+import { endpointNameMapSignal } from '../state/endpoints';
 import { fetchUsage, fetchUsageSummary, fetchUsageHeatmap } from '../api/usage';
 import { showToast } from '../components/Toast';
 import { ChartCanvas } from '../components/ChartCanvas';
 import type { ChartHoverPayload } from '../components/ChartCanvas';
-import { formatNumber, esc } from '../utils/format';
+import { UsageFilterBar } from '../components/UsageFilterBar';
+import { formatNumber } from '../utils/format';
 import { localDateToBackendPrefix } from '../utils/date';
 import type { UsageDataPoint, HeatmapDataPoint, UsageSummary } from '../api/types';
 import type { ChartConfiguration } from 'chart.js';
@@ -300,7 +302,8 @@ export function UsagePage() {
   const hourlyDayOffset = hourlyDayOffsetSignal.value;
   const heatmapDays = heatmapDaysSignal.value;
   const usageEpFilter = usageEndpointFilterSignal.value;
-  const heatmapEpFilter = heatmapEndpointFilterSignal.value;
+  const usageModelFilter = usageModelFilterSignal.value;
+  const customRange = usageCustomTimeRangeSignal.value;
   const usageSplitMode = usageSplitModeSignal.value;
   const refreshTick = usageRefreshTrigger.value;
   const heatmapTick = heatmapRefreshTrigger.value;
@@ -308,7 +311,6 @@ export function UsagePage() {
   const [summary, setSummary] = useState<UsageSummary | null>(null);
   const [usageData, setUsageData] = useState<UsageDataPoint[]>([]);
   const [heatmapData, setHeatmapData] = useState<HeatmapDataPoint[]>([]);
-  const [endpoints, setLocalEndpoints] = useState<Array<{ id: string; name: string }>>([]);
   const [usageLoading, setUsageLoading] = useState(false);
   const [heatmapLoading, setHeatmapLoading] = useState(false);
   const [chartHover, setChartHover] = useState<ChartHoverPayload | null>(null);
@@ -323,10 +325,6 @@ export function UsagePage() {
   }, []);
 
   useEffect(() => {
-    setLocalEndpoints(endpointsSignal.value.map(ep => ({ id: ep.endpoint_id, name: ep.name || ep.endpoint_id })));
-  }, [endpointsSignal.value.length]);
-
-  useEffect(() => {
     let cancelled = false;
     fetchUsageSummary()
       .then(s => { if (!cancelled) setSummary(s); })
@@ -338,15 +336,21 @@ export function UsagePage() {
     let cancelled = false;
     setUsageLoading(true);
 
-    const days = usageMode === '30d' ? 30 : 7;
-    const granularity = usageMode === '1h' ? 'hour' : 'day';
-
     const params: Record<string, string | number> = {
-      days,
       group_by: usageGroupBy,
-      granularity,
     };
+
+    // 自定义时间范围优先于 days 模式
+    if (usageMode === 'custom' && customRange) {
+      params.since = customRange.since;
+      params.until = customRange.until;
+      params.granularity = 'day';
+    } else {
+      params.days = usageMode === '30d' ? 30 : 7;
+      params.granularity = usageMode === '1h' ? 'hour' : 'day';
+    }
     if (usageEpFilter) params.endpoint_id = usageEpFilter;
+    if (usageModelFilter) params.model_id = usageModelFilter;
 
     fetchUsage(params)
       .then(resp => {
@@ -370,7 +374,7 @@ export function UsagePage() {
       });
 
     return () => { cancelled = true; };
-  }, [usageMode, usageGroupBy, hourlyDayOffset, usageEpFilter, refreshTick]);
+  }, [usageMode, usageGroupBy, hourlyDayOffset, usageEpFilter, usageModelFilter, customRange, refreshTick]);
 
   useEffect(() => {
     let cancelled = false;
@@ -380,7 +384,8 @@ export function UsagePage() {
       days: heatmapDays,
       view: 'heatmap',
     };
-    if (heatmapEpFilter) params.endpoint_id = heatmapEpFilter;
+    if (usageEpFilter) params.endpoint_id = usageEpFilter;
+    if (usageModelFilter) params.model_id = usageModelFilter;
 
     fetchUsageHeatmap(params)
       .then(resp => {
@@ -395,7 +400,7 @@ export function UsagePage() {
       });
 
     return () => { cancelled = true; };
-  }, [heatmapDays, heatmapEpFilter, heatmapTick]);
+  }, [heatmapDays, usageEpFilter, usageModelFilter, heatmapTick]);
 
   function handleHeatmapCellClick(dateStr: string): void {
     const today = getTodayDate();
@@ -442,6 +447,7 @@ export function UsagePage() {
 
   return (
     <div id="tab-usage">
+      <UsageFilterBar />
       <div class="usage-overview-row">
         <div class="card usage-overview-card">
           <h2 class="section-title">用量概览</h2>
@@ -469,14 +475,6 @@ export function UsagePage() {
           <div class="usage-toolbar">
             <h2 class="section-title">用量热力图</h2>
             <span style={{ flex: 1 }} />
-            <select
-              class="usage-ep-select"
-              value={heatmapEpFilter}
-              onChange={(e: Event) => setHeatmapEndpointFilter((e.target as HTMLSelectElement).value)}
-            >
-              <option value="">全部端点</option>
-              {endpoints.map(ep => <option value={ep.id}>{esc(ep.name || ep.id)}</option>)}
-            </select>
             <select
               class="usage-ep-select"
               value={String(heatmapDays)}
@@ -515,20 +513,6 @@ export function UsagePage() {
               onClick={() => setUsageGroupBy('endpoint')}
             >按端点</button>
           </div>
-          <div class="seg-group" id="usage-time-btns">
-            <button
-              class={`seg-btn${usageMode === '30d' ? ' active' : ''}`}
-              onClick={() => setUsageMode('30d')}
-            >近 30 天</button>
-            <button
-              class={`seg-btn${usageMode === '7d' ? ' active' : ''}`}
-              onClick={() => setUsageMode('7d')}
-            >近 7 天</button>
-            <button
-              class={`seg-btn${usageMode === '1h' ? ' active' : ''}`}
-              onClick={() => setUsageMode('1h')}
-            >逐小时</button>
-          </div>
           <div class="seg-group" id="usage-split-btns" title="选择输入/输出的显示方式">
             <button
               class={`seg-btn${usageSplitMode === 'merged' ? ' active' : ''}`}
@@ -539,15 +523,6 @@ export function UsagePage() {
               onClick={() => setUsageSplitMode('split')}
             >分条</button>
           </div>
-          <span style={{ flex: 1 }} />
-          <select
-            class="usage-ep-select"
-            value={usageEpFilter}
-            onChange={(e: Event) => setUsageEndpointFilter((e.target as HTMLSelectElement).value)}
-          >
-            <option value="">全部端点</option>
-            {endpoints.map(ep => <option value={ep.id}>{esc(ep.name || ep.id)}</option>)}
-          </select>
         </div>
         <div
           class={`hourly-day-slider${usageMode === '1h' ? ' visible' : ''}`}

@@ -8,6 +8,11 @@ from typing import Optional
 
 from llm_proxy.config_loader import load_config
 from llm_proxy.infra.http_client import get_client
+from llm_proxy.protocol.provider_profiles import (
+    ProviderProfile,
+    get_provider_profile,
+    load_provider_profiles,
+)
 
 logger = logging.getLogger(__name__)
 lifecycle = logging.getLogger("llm_proxy.lifecycle")
@@ -207,6 +212,10 @@ class State:
         self.paths_map = self._build_paths_map(config)
         self.allow_proxy_map = self._build_allow_proxy_map(config)
         self.compression_config = config.get("compression", {})
+        self.thinking_effort_mapping = config.get("thinking_effort_mapping", {})
+        self._thinking_effort_preset_map = self._build_thinking_effort_preset_map(config)
+        self.provider_profiles = load_provider_profiles()
+        self.provider_map = self._build_provider_map(config)
 
     def resolve_model(self, model: str, endpoint_family_routing: dict | None = None):
         return resolve_model_for_endpoint(
@@ -221,6 +230,92 @@ class State:
         self.paths_map = self._build_paths_map(self.config)
         self.allow_proxy_map = self._build_allow_proxy_map(self.config)
         self.compression_config = self.config.get("compression", {})
+        self.thinking_effort_mapping = self.config.get("thinking_effort_mapping", {})
+        self._thinking_effort_preset_map = self._build_thinking_effort_preset_map(self.config)
+        self.provider_profiles = load_provider_profiles()
+        self.provider_map = self._build_provider_map(self.config)
+
+    @staticmethod
+    def _build_thinking_effort_preset_map(cfg: dict) -> dict[str, str]:
+        """构建 {model_id(lower): thinking_effort_preset}，仅收集字符串引用。"""
+        result: dict[str, str] = {}
+        for k, v in cfg.get("models", {}).items():
+            preset = v.get("thinking_effort_preset")
+            if isinstance(preset, str) and preset:
+                result[k.lower()] = preset
+        return result
+
+    def _resolve_preset_by_name(self, preset_name: str, mapping: dict) -> dict | None:
+        """根据 preset_name 在 mapping 中查找，返回单 preset 的 mapping 或 None。"""
+        if not preset_name or not mapping:
+            return None
+        presets = mapping.get("presets", [])
+        for p in presets:
+            if isinstance(p, dict) and p.get("name") == preset_name:
+                return {"presets": [p], "default_preset": preset_name}
+        return None
+
+    def get_model_effort_mapping(self, model_id: str) -> dict:
+        """返回模型实际生效的 thinking_effort_mapping。
+
+        支持三种模式（由 thinking_effort_mode 字段控制）：
+        - "default"：始终使用全局 default_preset
+        - "provider"：使用厂商 profile 的 default_thinking_effort_preset
+        - "custom"：使用模型自带的 thinking_effort_preset（dict=内联规则 / string=全局 preset 名）
+        - 未设置（向后兼容）：旧优先级链（模型显式 preset → 厂商默认 → 全局默认）
+        """
+        mapping = self.thinking_effort_mapping
+        if not mapping:
+            return mapping
+
+        model_cfg = self.config.get("models", {}).get(model_id, {})
+        if not isinstance(model_cfg, dict):
+            return mapping
+
+        mode = model_cfg.get("thinking_effort_mode")
+
+        if mode == "custom":
+            preset = model_cfg.get("thinking_effort_preset")
+            if isinstance(preset, dict) and "rules" in preset:
+                # 内联自定义 preset
+                p = {
+                    "name": preset.get("name", f"custom-{model_id.lower()}"),
+                    "type": preset.get("type", "any_to_any"),
+                    "rules": preset.get("rules", {}),
+                }
+                return {"presets": [p], "default_preset": p["name"]}
+            if isinstance(preset, str) and preset:
+                # 命名引用
+                result = self._resolve_preset_by_name(preset, mapping)
+                if result is not None:
+                    return result
+            # custom mode 但无有效 preset → 兜底全局
+            return mapping
+
+        elif mode == "provider":
+            profile = self.get_model_provider_profile(model_id)
+            if profile and profile.default_thinking_effort_preset:
+                result = self._resolve_preset_by_name(
+                    profile.default_thinking_effort_preset, mapping
+                )
+                if result is not None:
+                    return result
+            return mapping
+
+        else:
+            # mode == "default" 或未设置：向后兼容的优先级链
+            preset_name = self._thinking_effort_preset_map.get(model_id.lower())
+
+            if not preset_name:
+                profile = self.get_model_provider_profile(model_id)
+                if profile and profile.default_thinking_effort_preset:
+                    preset_name = profile.default_thinking_effort_preset
+
+            if preset_name:
+                result = self._resolve_preset_by_name(preset_name, mapping)
+                if result is not None:
+                    return result
+            return mapping
 
     @staticmethod
     def _build_vision_map(cfg: dict) -> dict[str, bool]:
@@ -258,6 +353,24 @@ class State:
             k.lower(): v.get("allow_proxy", False)
             for k, v in cfg.get("models", {}).items()
         }
+
+    @staticmethod
+    def _build_provider_map(cfg: dict) -> dict[str, str]:
+        """构建 {model_id(lower): provider_key}。"""
+        return {
+            k.lower(): v.get("provider", "")
+            for k, v in cfg.get("models", {}).items()
+            if v.get("provider")
+        }
+
+    def get_model_provider(self, model_id: str) -> str | None:
+        """返回模型的 provider key，未配置返回 None。"""
+        return self.provider_map.get(model_id.lower()) or None
+
+    def get_model_provider_profile(self, model_id: str) -> ProviderProfile | None:
+        """返回模型的 provider profile，未配置返回 None。"""
+        provider = self.get_model_provider(model_id)
+        return get_provider_profile(provider, self.provider_profiles)
 
 
 # ─── Singleton access ─────────────────────────────────────────────

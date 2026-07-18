@@ -68,7 +68,7 @@ from llm_proxy.protocol.ir.types import (
 class ProtocolConverter:
     """协议转换器。每个协议提供此接口的具体实现。"""
 
-    def to_ir(self, body: dict) -> IRRequest:  # pragma: no cover - abstract
+    def to_ir(self, body: dict, mapping_config: dict | None = None) -> IRRequest:  # pragma: no cover - abstract
         raise NotImplementedError
 
     def to_upstream(self, ir: IRRequest, upstream_model: str | None = None) -> dict:  # pragma: no cover - abstract
@@ -107,8 +107,8 @@ class ProtocolConverter:
 
 
 class AnthropicConverter(ProtocolConverter):
-    def to_ir(self, body):
-        return anthropic_to_ir(body)
+    def to_ir(self, body, mapping_config=None):
+        return anthropic_to_ir(body, mapping_config)
 
     def to_upstream(self, ir, upstream_model=None):
         return anthropic_to_upstream(ir, upstream_model)
@@ -129,8 +129,8 @@ class AnthropicConverter(ProtocolConverter):
 
 
 class ChatConverter(ProtocolConverter):
-    def to_ir(self, body):
-        return chat_to_ir(body)
+    def to_ir(self, body, mapping_config=None):
+        return chat_to_ir(body, mapping_config)
 
     def to_upstream(self, ir, upstream_model=None):
         return chat_to_upstream(ir, upstream_model)
@@ -151,8 +151,8 @@ class ChatConverter(ProtocolConverter):
 
 
 class ResponsesConverter(ProtocolConverter):
-    def to_ir(self, body):
-        return responses_to_ir(body)
+    def to_ir(self, body, mapping_config=None):
+        return responses_to_ir(body, mapping_config)
 
     def to_upstream(self, ir, upstream_model=None):
         return responses_to_upstream(ir, upstream_model)
@@ -190,9 +190,9 @@ def _resolve(protocol: str) -> str:
     return ALIASES.get(protocol, protocol)
 
 
-def convert_request(client_protocol: str, upstream_protocol: str, body: dict) -> dict:
+def convert_request(client_protocol: str, upstream_protocol: str, body: dict, mapping_config: dict | None = None) -> dict:
     """client 协议 → IR → upstream 协议（一步到位）。"""
-    ir = REGISTRY[_resolve(client_protocol)].to_ir(body)
+    ir = REGISTRY[_resolve(client_protocol)].to_ir(body, mapping_config)
     return REGISTRY[_resolve(upstream_protocol)].to_upstream(ir)
 
 

@@ -20,6 +20,8 @@ from typing import Any
 
 from PIL import Image
 
+from llm_proxy.protocol.effort_mapping import apply_effort_mapping
+
 logger = logging.getLogger(__name__)
 
 
@@ -84,25 +86,21 @@ def supports_reasoning_effort(model: str) -> bool:
     return False
 
 
-_EFFORT_MAP_OUTPUT_CONFIG = {
-    "low": "low",
-    "medium": "medium",
-    "high": "high",
-    "max": "xhigh",
-}
-
-
-def resolve_reasoning_effort(body: dict) -> str | None:
+def resolve_reasoning_effort(body: dict, mapping_config: dict | None = None) -> str | None:
     """从 Anthropic 请求中提取 reasoning_effort 值。
 
     Priority 1: body["output_config"]["effort"]
     Priority 2: body["thinking"] 配置 fallback
+
+    Args:
+        body: Anthropic 格式请求体
+        mapping_config: 全局 thinking_effort_mapping 配置；None 时使用默认兜底
     """
     output_config = body.get("output_config")
     if isinstance(output_config, dict):
         effort = output_config.get("effort")
         if effort:
-            mapped = _EFFORT_MAP_OUTPUT_CONFIG.get(effort)
+            mapped = apply_effort_mapping(effort, mapping_config)
             if mapped:
                 return mapped
 
@@ -111,15 +109,15 @@ def resolve_reasoning_effort(body: dict) -> str | None:
         thinking_type = thinking.get("type")
         budget = thinking.get("budget_tokens")
         if thinking_type == "adaptive":
-            return "xhigh"
+            return apply_effort_mapping("xhigh", mapping_config)
         if thinking_type == "enabled":
             if budget is None:
-                return "high"
+                return apply_effort_mapping("high", mapping_config)
             if budget < 4000:
-                return "low"
+                return apply_effort_mapping("low", mapping_config)
             if budget < 16000:
-                return "medium"
-            return "high"
+                return apply_effort_mapping("medium", mapping_config)
+            return apply_effort_mapping("high", mapping_config)
 
     return None
 

@@ -6,7 +6,7 @@ services:
       - "4000:4000"
     volumes:
       - ./usage.db:/app/usage.db
-      - ./config.json:/app/config.json:ro
+      - ./config.json:/app/config.json
       # 日志挂载到宿主机：logging_config.py 统一写 /app/logs/llm-proxy.log
       - ./logs:/app/logs
     environment:
