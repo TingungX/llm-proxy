@@ -53,6 +53,61 @@ export function EffortStrategyFieldset({ mode, provider, customRules, profiles, 
     fetchThinkingEffortDefaults().then(setSysDefaults).catch(() => {});
   }, []);
 
+  // 二元开关 / 固定值厂商：生成实际行为展示表，不套用 any_to_any 规则
+  function buildBinaryDisplay(p: ProviderProfileInfo):
+    | { source: string; presetName: string; rules: Record<string, string> }
+    | null
+  {
+    const fmt = p.thinking_format;
+    if (fmt === 'thinking_enabled_disabled') {
+      return {
+        source: `厂商格式 (${p.display_name})`,
+        presetName: '开关',
+        rules: {
+          'none': `off (${p.disable_thinking_value || 'disabled'})`,
+          '* (any)': `on (${p.default_thinking_type || 'enabled'})`,
+        },
+      };
+    }
+    if (fmt === 'thinking_adaptive_disabled') {
+      return {
+        source: `厂商格式 (${p.display_name})`,
+        presetName: '开关',
+        rules: {
+          'none': `off (${p.disable_thinking_value || 'disabled'})`,
+          '* (any)': `on (${p.default_thinking_type || 'adaptive'})`,
+        },
+      };
+    }
+    if (fmt === 'enable_thinking_boolean' || fmt === 'chat_template_kwargs_enable_thinking') {
+      return {
+        source: `厂商格式 (${p.display_name})`,
+        presetName: '开关',
+        rules: { 'none': 'off', '* (any)': 'on' },
+      };
+    }
+    if (fmt === 'reasoning_effort_fixed') {
+      return {
+        source: `厂商格式 (${p.display_name})`,
+        presetName: '固定值',
+        rules: { '* (any)': p.fixed_effort || '—' },
+      };
+    }
+    if ((fmt === 'thinking_type_plus_reasoning_effort' || fmt === 'reasoning_effort_only')
+        && p.effort_aliases && Object.keys(p.effort_aliases).length > 0) {
+      const rules: Record<string, string> = {};
+      for (const [k, v] of Object.entries(p.effort_aliases)) {
+        rules[k] = v ?? '(remove)';
+      }
+      return {
+        source: `厂商格式 (${p.display_name})`,
+        presetName: '别名映射',
+        rules,
+      };
+    }
+    return null;
+  }
+
   // 解析当前生效的规则（用于 default / provider 模式的只读展示）
   function resolveReadonlyRules():
     | { source: string; presetName: string; rules: Record<string, string> }
@@ -74,10 +129,18 @@ export function EffortStrategyFieldset({ mode, provider, customRules, profiles, 
       return null;
     }
     if (mode === 'provider' && profile) {
+      // 二元开关 / 固定值厂商：直接展示实际行为，不套 any_to_any 规则表
+      const binary = buildBinaryDisplay(profile);
+      if (binary) return binary;
+
       const pn = profile.default_thinking_effort_preset;
       if (pn) {
         const gm = configSignal.value?.thinking_effort_mapping;
-        const pp = gm?.presets?.find(p => p.name === pn);
+        let pp = gm?.presets?.find(p => p.name === pn);
+        // 全局 config 未保存映射时，回退到系统内置默认
+        if (!pp?.rules && sysDefaults?.presets) {
+          pp = sysDefaults.presets.find(p => p.name === pn);
+        }
         if (pp?.rules) return { source: `厂商推荐 (${profile.display_name})`, presetName: pp.name, rules: pp.rules };
       }
       // 无预设名 → 展示厂商 aliases
@@ -132,7 +195,7 @@ export function EffortStrategyFieldset({ mode, provider, customRules, profiles, 
         ))}
       </div>
 
-      {/* default / provider：只读展示 */}
+{/* default / provider：只读展示 */}
       {(mode === 'default' || mode === 'provider') && ro && (
         <div>
           <div class="text-xs text-muted mb-8">{ro.source} · 预设 <strong>{ro.presetName}</strong></div>
@@ -170,22 +233,6 @@ export function EffortStrategyFieldset({ mode, provider, customRules, profiles, 
       {/* 自定义：可编辑 sheet */}
       {mode === 'custom' && (
         <div>
-          {/* 格式提醒 */}
-          {profile ? (
-            <div class="model-format-info mb-8" style="background: rgba(91,155,213,0.04); border-color: rgba(91,155,213,0.2);">
-              <span class="text-xs text-muted">
-                厂商格式由上方「厂商」字段决定（{profile.display_name} → <code>{formatLabel(profile.thinking_format)}</code>），
-                此处仅编辑 effort → effort 映射规则。如需更换格式，请修改厂商。
-              </span>
-            </div>
-          ) : (
-            <div class="model-format-info model-format-info-warn mb-8">
-              <span class="text-xs text-muted">
-                未指定厂商，映射后的 effort 直接作为 <code>reasoning_effort</code> 透传。
-              </span>
-            </div>
-          )}
-
           <div class="text-xs text-muted mb-8">规则键 <code>*</code> 作为兜底，匹配所有未列出的 effort。</div>
 
           {Object.keys(customRules).length > 0 ? (
@@ -243,6 +290,15 @@ export function EffortStrategyFieldset({ mode, provider, customRules, profiles, 
               onRulesChange({ ...customRules, [newKey]: 'low' });
             }}
           >+ 添加规则</button>
+          {profile ? (
+            <div class="text-xs text-muted mt-8">
+              映射后的 effort 经 {profile.display_name} 格式编码：<code>{formatLabel(profile.thinking_format)}</code>
+            </div>
+          ) : (
+            <div class="text-xs text-muted mt-8">
+              未指定厂商，映射后的 effort 直接作为 <code>reasoning_effort</code> 透传。
+            </div>
+          )}
         </div>
       )}
 
@@ -272,4 +328,3 @@ export function EffortStrategyFieldset({ mode, provider, customRules, profiles, 
     </fieldset>
   );
 }
-

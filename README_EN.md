@@ -84,11 +84,13 @@ Point your tool's `api_base` to this proxy. **One proxy serves all your tools.**
 | **Legacy Channels in Migration** | `anthropic_openai/` serves Anthropic cross-protocol; `responses_chat/` serves Chat→Responses conversion and apply_patch DSL repair |
 | **Multi-Upstream Aggregation** | One proxy for DeepSeek, MiniMax, GLM (iFlytek), OpenCode, and more |
 | **RTK (Input Compression / Beta)** | Built-in input compression tool (Rust Token Killer), strips CLI output noise from tool_results, truncates long code blocks, collapses blank lines |
+| **Thinking Effort Mapping** | Config-driven effort mapping engine; model-level preset overrides global default; 8 vendor thinking/reasoning format differences centrally managed and auto-encoded |
 | **Endpoint Authentication** | API-Key-based isolation, each endpoint independently configures available models |
-| **Model Routing & Fallback** | Model family failover chain, auto-switch on 429/503 |
+| **Model Routing & Fallback** | Model family failover chain, auto-switch on 429/503; IRProxyStep built-in exponential backoff retry |
 | **Request Tracking** | Unique Request ID per call, structured logging, web admin panel filtering |
 | **Tool Format Compatibility** | apply_patch passthrough + DSL repair; namespace flattened; other custom tools passed through |
 | **Admin Panel** | Preact + Vite web console for endpoint/model/usage/log management |
+| **Enhanced Usage Filtering** | Usage query supports model_id filter and custom time range; frontend extracted as standalone UsageFilterBar component |
 
 ---
 
@@ -262,11 +264,18 @@ Models are configured in `config.json`. Each model entry contains:
 | `api_key` | Upstream API Key |
 | `upstream_model` | Actual model name sent to upstream |
 | `upstream_protocol` | Scalar field (legacy compat); prefer `upstream_protocols` array |
-| `upstream_protocols` | Array like `["anthropic", "openai"]`, protocol selection is automatic via reachability table |
+| `upstream_protocols` | Structured array like `[{"protocol": "openai", "enabled": true, "path": "/v1/chat/completions"}]`, protocol selection is automatic via reachability table |
 | `upstream_paths` | Protocol-specific upstream paths (optional) |
 | `vision_support` | Whether image input is supported |
+| `provider` | Vendor identifier (e.g. `deepseek`), linked to provider_profiles.py for thinking/reasoning format configuration |
+| `thinking_effort_mode` | Effort mapping mode: `default` / `provider` / `custom` |
+| `thinking_effort_preset` | Effective in custom mode, can be a preset name string or inline rules dict |
 
 Endpoints (API key auth, model allowlist, family routing) are configured at runtime via the admin panel or API, stored in SQLite, and support hot reload.
+
+The global config also supports an optional `thinking_effort_mapping` section for effort preset rules.
+When absent, built-in defaults are used with behavior identical to the previous hardcoded version.
+See `config.example.json` for details.
 
 ---
 
@@ -288,9 +297,13 @@ Endpoints (API key auth, model allowlist, family routing) are configured at runt
 |--------|------|-------------|
 | GET/PUT | `/api/config` | Read/write configuration |
 | GET/POST/PUT/DEL | `/api/endpoints` | Endpoint CRUD |
-| GET | `/api/usage[?days=&group_by=&granularity=]` | Usage statistics |
+| PUT/DEL | `/api/models/{model_id}` | Single model config incremental update / delete |
+| GET | `/api/provider-profiles` | Vendor thinking/reasoning profile list |
+| GET | `/api/thinking-effort-defaults` | System default effort mapping config |
+| POST | `/api/providers/{model_id}/detect` | Detect model vendor |
+| GET | `/api/usage[?days=&group_by=&granularity=&model_id=]` | Usage statistics (supports model_id filter and custom time range) |
 | GET | `/api/logs/list` | Log query |
-| POST | `/api/latency` | Latency test |
+| POST | `/api/latency` | Latency test (supports multi-protocol + proxy config) |
 | POST | `/api/detect-protocol` | Detect upstream protocol |
 
 ---
@@ -353,7 +366,9 @@ llm-proxy/
 │   │       └── ir_proxy.py        # New IRProxyStep (uses IR layer)
 │   ├── protocol/                  # Protocol conversion layer
 │   │   ├── capabilities.py        # Protocol reachability table + upstream selection
-│   │   ├── ir/                    # ★ IR Abstraction Layer (new)
+│   │   ├── effort_mapping.py      # Config-driven thinking effort mapping engine
+│   │   ├── provider_profiles.py   # Vendor thinking/reasoning format registry
+│   │   ├── ir/                    # ★ IR Abstraction Layer
 │   │   │   ├── __init__.py        #   ProtocolConverter base class + REGISTRY
 │   │   │   ├── types.py           #   IRRequest/IRResponse/IRMessage/IRContentBlock
 │   │   │   ├── _common.py         #   Shared utility functions
@@ -384,6 +399,7 @@ llm-proxy/
 ├── config.example.json            # Configuration template
 ├── Dockerfile / docker-compose.yml
 └── start.sh                       # Startup script
+├── provider_profiles.example.json # Vendor profile template
 ```
 
 ---
@@ -397,4 +413,3 @@ This software is released under the [GNU Affero General Public License v3.0](htt
 In short: you are free to use, modify, and distribute this software, but **if you use it for commercial purposes (including but not limited to serving as a backend component of a commercial service), you must make the complete source code (including your modifications and the complete system it interacts with) available to all users under the same license.**
 
 Core requirement: **Commercial use requires open source; closed-source commercial use is prohibited.**
-

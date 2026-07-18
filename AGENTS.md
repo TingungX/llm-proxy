@@ -56,6 +56,10 @@ llm-proxy/
       vision_service.py         图像处理
       input_compressor.py       输入压缩
 
+    protocol/
+      effort_mapping.py         config-driven thinking effort 映射引擎
+      provider_profiles.py      厂商 thinking/reasoning 格式差异注册表
+
     infra/                      基础设施
       db.py                     SQLite 操作（用量记录、端点管理）
       archive.py                JSONL 用量归档
@@ -79,6 +83,7 @@ llm-proxy/
   Dockerfile                    Docker 构建（port 4000）
   docker-compose.yml            Docker Compose 部署
   config.example.json           配置示例
+  provider_profiles.example.json 厂商 profile 模板
   proxy.py                      向后兼容入口（import llm_proxy.main:app）
 ```
 
@@ -92,9 +97,22 @@ llm-proxy/
 3. **VisionFallbackStep** — 不支持视觉的模型：图片→文本降级
 4. **CompressionStep** — 输入压缩（节省 token）
 5. **ResponsesConvertStep** — 仅在 Responses 路由中，Responses→Chat 格式转换
-6. **ProxyStep** — 根据 upstream_protocol 转发（同协议透传 / 跨协议转换 / IR 路径）
+6. **ProxyStep / IRProxyStep** — 根据 upstream_protocol 转发（同协议透传 / 跨协议转换 / IR 路径）
 
 步骤可抛出 PipelineStop(response) 中断管道，中间件识别并返回。
+
+#### Thinking Effort 映射集成
+
+effort mapping 嵌入在 ProxyStep / IRProxyStep 内部的请求体构造阶段：
+- `state.get_model_effort_mapping(model_id)` 读取模型级 effort 映射配置
+- 返回的三元组 (mode, preset_name, rules) 决定最终注入的 reasoning_effort / thinking 字段值
+- 向前兼容：无配置时行为与旧版硬编码 effort_map 完全一致
+- 厂商级 thinking 格式编码由 `provider_profiles.py` 自动处理（见协议层文档）
+
+**模型级 effort 配置三种模式**：
+- `default`：使用全局 `thinking_effort_mapping.default_preset`
+- `provider`：使用对应厂商 profile 的 `default_thinking_effort_preset`
+- `custom`：使用模型自带的 `thinking_effort_preset`（内联规则字典或全局 preset 名引用）
 
 ### 2. 协议转换架构（参见 protocol/AGENTS.md）
 
@@ -114,6 +132,20 @@ client_resp = convert_response("openai/responses", "anthropic", upstream_body)
 ```
 
 协议选择走 select_upstream()（capabilities.py）：同协议优先 → 按 IMPLEMENTED_CONVERSIONS 顺序选。
+
+### Thinking Effort 映射与厂商 Profile
+
+**effort_mapping.py** — config-driven 的 thinking effort 映射引擎：
+- 从 `config.thinking_effort_mapping` 读取多 preset 规则
+- 支持 `"*"` 兜底键、`any_to_any` / `thinking_on` 等 preset type
+- `apply_effort_mapping(effort, mapping_config)` 纯函数，无状态
+- config 缺失时用 `get_default_mapping_config()` 兜底，行为与旧版硬编码一致
+
+**provider_profiles.py** — 厂商 thinking/reasoning 格式差异注册表：
+- 用 dataclass 声明 8 家厂商的 thinking_format、effort_field、effort_aliases 等差异
+- `encode_thinking_field(body, effort, profile)` 在协议层自动构造正确的请求字段
+- 支持的 thinking_format：`thinking_enabled_disabled`、`thinking_adaptive_disabled`、`thinking_type_plus_reasoning_effort`、`reasoning_effort_only`、`reasoning_effort_fixed`、`enable_thinking_boolean`、`chat_template_kwargs_enable_thinking`
+- profile 数据源：`provider_profiles.json`（运行时）或 `provider_profiles.example.json`（模板），路径由 `LLM_PROXY_PROVIDER_PROFILES_PATH` 环境变量控制
 
 ### 3. 模型与端点
 
@@ -171,8 +203,15 @@ routes/responses.py → ResponsesHandler.handle()
 | GET | /v1/models | 模型列表（支持 Codex ModelInfo 格式） |
 | GET/PUT | /api/config | 全局配置（PUT 自动删除 family_routing） |
 | CRUD | /api/endpoints | 端点管理 |
-| GET | /api/usage | 用量查询 |
+| GET | /api/provider-profiles | 厂商 thinking/reasoning profile 列表 |
+| GET | /api/thinking-effort-defaults | 系统默认 effort mapping 配置 |
+| PUT | /api/models/{model_id} | 更新单个模型配置（增量合并） |
+| DEL | /api/models/{model_id} | 删除单个模型配置 |
+| POST | /api/providers/{model_id}/detect | 检测模型所属厂商 |
+| GET | /api/usage | 用量查询（支持 model_id 筛选、自定义时间范围） |
 | GET | /api/logs/* | 日志查询 |
+| POST | /api/latency | 延迟测试（支持多协议 + proxy 配置） |
+| POST | /api/detect-protocol | 检测上游协议 |
 
 ## Import 规则
 
@@ -187,6 +226,8 @@ routes/responses.py → ResponsesHandler.handle()
 | IR 转换（推荐） | from llm_proxy.protocol.ir import convert_request, convert_response |
 | 旧通道（不推荐） | from llm_proxy.protocol.anthropic_openai import ... |
 | 旧通道（不推荐） | from llm_proxy.protocol.responses_chat import ... |
+| Effort 映射 | from llm_proxy.protocol.effort_mapping import apply_effort_mapping |
+| 厂商 Profile | from llm_proxy.protocol.provider_profiles import ProviderProfile, load_provider_profiles, encode_thinking_field |
 
 **禁止**：
 - `from llm_proxy import state` + `state.xxx`（必须走 get_state()）
@@ -204,22 +245,43 @@ config.json（已 gitignore，参考 config.example.json）：
       "api_base": "...",
       "api_key": "...",
       "upstream_model": "实际发给上游的模型名",
-      "upstream_protocols": ["anthropic", "openai"],
+      "upstream_protocols": [
+        {"protocol": "openai", "enabled": true, "path": "/v1/chat/completions"}
+      ],
       "vision_support": false,
       "context_window": 1000000,
       "display_name": "前端展示用",
-      "allow_proxy": false
+      "allow_proxy": false,
+      "provider": "deepseek",
+      "thinking_effort_mode": "default",
+      "thinking_effort_preset": "default",
+      "effort_overrides": {}
     }
   },
   "error_handling": { "failover_enabled": true, "no_retry_enabled": true },
-  "compression": { "enabled": true, "max_input_tokens": 80000 }
+  "compression": { "enabled": true, "max_input_tokens": 80000 },
+  "thinking_effort_mapping": {
+    "presets": [
+      {
+        "name": "default",
+        "type": "any_to_any",
+        "rules": {"low": "low", "medium": "medium", "high": "high", "*": "medium"}
+      }
+    ],
+    "default_preset": "default"
+  }
 }
 ```
 
 注意：
+- **upstream_protocols 已从字符串数组迁移到 ProtocolEntry 结构化格式**：`{"protocol": "...", "enabled": bool, "path": "..."}`。旧版字符串数组仍兼容（自动转成 enabled=true 的 entry），但新加模型必须用结构化格式。
 - family_routing 仅存在端点的 family_routing 字段（不在 config.json 里）
 - api_base 不含 /v1/... 后缀
 - upstream_protocol（标量）已被 upstream_protocols（数组）取代，但标量仍兼容
+- `thinking_effort_mapping` 为可选节，缺失时使用内置默认映射（行为与旧版硬编码一致）
+- `provider` 字段关联到 `provider_profiles.py` 中的厂商 profile，控制 thinking/reasoning 请求格式编码
+- `thinking_effort_mode` 可选值：`default` / `provider` / `custom`
+- `thinking_effort_preset`：custom 模式下可为 preset 名字符串（引用全局）或内联 rules 字典
 
 ## 配置加载链
 
@@ -352,6 +414,23 @@ python tests/smoke_test.py          # 冒烟测试
     统一用 `uuid4().hex[:24]` 独立生成，**禁止**引用上游 `tool_call.id`（可能含 Chat 格式的
     不可用前缀如 `call_`）或 block.id（与 item_id 语义不同）。`StreamState` 新增 `func_item_ids`
     字典持久化每轮 tool call 的 item_id，避免流式过程中重建 item_id 时不一致。
+16. **upstream_protocols 结构化格式**：`c9dbf55` 后 `upstream_protocols` 从字符串数组迁移到
+    `ProtocolEntry` 结构化格式 `{"protocol": "...", "enabled": true, "path": "..."}`。
+    前端用 `extractProtocolConfig()` / `toUpstreamProtocols()` 工具函数转换。
+    API 输出已经是结构化格式；旧字符串数组输入仍兼容但新加模型必须用结构化格式。
+17. **thinking_effort 配置链**：模型级 effort 映射有三层逻辑（`get_model_effort_mapping`）：
+    先查模型自身配置 → 再查厂商 profile → 最后查全局默认。`thinking_effort_mode` 控制优先级。
+    厂商 thinking 格式编码由 `encode_thinking_field()` 自动处理，不要在协议层硬编码
+    厂商判断。
+18. **provider_profiles 数据源路径**：默认读取 `provider_profiles.json`（与 config.json 同级，
+    已 gitignore），由 `LLM_PROXY_PROVIDER_PROFILES_PATH` 环境变量覆盖。
+    `provider_profiles.example.json` 是模板，不要直接修改。
+19. **IRProxyStep retry 逻辑**：`ir_proxy.py` 内置 429/503 指数退避重试 + 连接级异常重试。
+    HTTP 状态码级错误自动重试，连接超时/DNS 错误也会触发重试。`x-should-retry: false` 头
+    阻止 SDK 重试但不影响代理内部重试。
+20. **config.json thinking_effort_mapping 节**：`PUT /api/config` 会保存 `thinking_effort_mapping`
+    节到 config.json。但此节是可选配置——缺失时使用 `get_default_mapping_config()` 内置默认，
+    行为与旧版硬编码完全一致。
 
 ## 更多细节
 

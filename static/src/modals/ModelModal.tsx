@@ -69,7 +69,14 @@ function getInitialValues(name: string | null): ModelFormValues {
       const presetVal = m.thinking_effort_preset;
       if (!mode) {
         // 向后兼容：老配置无 mode 但有 preset → 视为 custom
-        mode = presetVal ? 'custom' : 'default';
+        if (presetVal) {
+          mode = 'custom';
+        } else if (m.provider) {
+          // 有厂商的模型默认使用厂商映射
+          mode = 'provider';
+        } else {
+          mode = 'default';
+        }
       }
       let customType = 'any_to_any';
       let customRules: Record<string, string> = emptyRules();

@@ -95,11 +95,13 @@ LLM Proxy 全面兼容 Codex Desktop 的 OpenAI Responses API 通信协议：
 | **统一 IR 抽象层** | `protocol/ir/` 零外部依赖的中间表示层，ProtocolConverter 注册表模式，新增协议只需实现一个子类 |
 | **旧通道迁移期运行** | `anthropic_openai/` 服务 Anthropic 跨协议；`responses_chat/` 服务 Chat→Responses 转换与 apply_patch DSL 修复 |
 | **多上游聚合** | 一个代理接入 DeepSeek、MiniMax、GLM、OpenCode 等多个模型提供商 |
+| **Thinking Effort 映射** | config-driven 的 effort 映射引擎，模型级 preset 可覆盖全局默认；8 家厂商 thinking/reasoning 格式差异集中管理，自动编码 |
 | **RTK 输入压缩** | 内置输入压缩工具（Rust Token Killer），压缩 tool_result 中的 CLI 输出噪声 |
 | **端点认证与隔离** | 基于 API Key 的端点隔离，每个端点独立配置可用模型 |
-| **模型路由与 Fallback** | 模型 family failover 链，429/503 自动切换 |
+| **模型路由与 Fallback** | 模型 family failover 链，429/503 自动切换；IRProxyStep 内置指数退避重试 |
 | **请求跟踪** | 每请求唯一 Request ID，结构化日志，Web 管理面板筛选查询 |
 | **管理面板** | Preact + Vite 构建的 Web 控制台，管理端点/模型/用量/日志 |
+| **用量筛选增强** | 用量查询支持 model_id 筛选和自定义时间范围，前端提取独立 UsageFilterBar 组件 |
 
 ---
 
@@ -271,11 +273,17 @@ sudo systemctl enable --now llm-proxy
 | `api_key` | 上游 API Key |
 | `upstream_model` | 实际发给上游的模型名 |
 | `upstream_protocol` | 标量字段（兼容保留）；建议用 `upstream_protocols` 数组 |
-| `upstream_protocols` | 数组，如 `["anthropic", "openai"]`，协议选择根据可达性表自动决定 |
+| `upstream_protocols` | 结构化数组，如 `[{"protocol": "openai", "enabled": true, "path": "/v1/chat/completions"}]`，协议选择根据可达性表自动决定 |
 | `upstream_paths` | 各协议对应的上游路径（可选） |
 | `vision_support` | 是否支持图片输入 |
+| `provider` | 厂商标识（如 `deepseek`），关联到 provider_profiles.py 中的 thinking/reasoning 格式配置 |
+| `thinking_effort_mode` | effort 映射模式：`default` / `provider` / `custom` |
+| `thinking_effort_preset` | custom 模式下有效，可为 preset 名字符串或内联 rules 字典 |
 
 端点（API Key 认证、模型白名单、family routing）通过管理面板或 API 配置，存储在 SQLite 中，支持运行态热更新。
+
+全局配置还支持 `thinking_effort_mapping` 节（可选），用于配置 effort 预设映射规则。
+缺失时使用内置默认映射，行为与旧版硬编码完全一致。参见 `config.example.json`。
 
 ---
 
@@ -297,9 +305,13 @@ sudo systemctl enable --now llm-proxy
 |------|------|------|
 | GET/PUT | `/api/config` | 读写配置 |
 | GET/POST/PUT/DEL | `/api/endpoints` | 端点 CRUD |
-| GET | `/api/usage[?days=&group_by=&granularity=]` | 用量查询 |
+| PUT/DEL | `/api/models/{model_id}` | 单个模型配置增量更新 / 删除 |
+| GET | `/api/provider-profiles` | 厂商 thinking/reasoning profile 列表 |
+| GET | `/api/thinking-effort-defaults` | 系统默认 effort mapping 配置 |
+| POST | `/api/providers/{model_id}/detect` | 检测模型所属厂商 |
+| GET | `/api/usage[?days=&group_by=&granularity=&model_id=]` | 用量查询（支持 model_id 筛选和自定义时间范围） |
 | GET | `/api/logs/list` | 日志查询 |
-| POST | `/api/latency` | 延迟测试 |
+| POST | `/api/latency` | 延迟测试（支持多协议 + proxy 配置） |
 | POST | `/api/detect-protocol` | 检测上游协议 |
 
 ---
@@ -362,7 +374,9 @@ llm-proxy/
 │   │       └── ir_proxy.py        # 新 IRProxyStep（引用 IR 层）
 │   ├── protocol/                  # 协议转换层
 │   │   ├── capabilities.py        # 协议可达性表 + 上游选择算法
-│   │   ├── ir/                    # ★ IR 抽象层（新增）
+│   │   ├── effort_mapping.py      # config-driven thinking effort 映射引擎
+│   │   ├── provider_profiles.py   # 厂商 thinking/reasoning 格式差异注册表
+│   │   ├── ir/                    # ★ IR 抽象层
 │   │   │   ├── __init__.py        #   ProtocolConverter 基类 + REGISTRY
 │   │   │   ├── types.py           #   IRRequest/IRResponse/IRMessage/IRContentBlock
 │   │   │   ├── _common.py         #   共享工具函数
@@ -391,6 +405,7 @@ llm-proxy/
 ├── tests/                         # 测试
 ├── docs/                          # 文档
 ├── config.example.json            # 配置模板
+├── provider_profiles.example.json # 厂商 profile 模板
 ├── Dockerfile / docker-compose.yml
 └── start.sh                       # 启动入口
 ```

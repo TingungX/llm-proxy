@@ -1409,34 +1409,38 @@ input[type="checkbox"] { width: auto; }
 .thinking-effort-modes {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
-  margin-bottom: 8px;
+  gap: 6px;
+  margin-bottom: 12px;
 }
 .thinking-effort-mode {
-  flex: 1 1 auto;
-  min-width: max-content;
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  justify-content: flex-start;
-  gap: 6px;
-  padding: 5px 12px;
-  white-space: nowrap;
+  padding: 6px 14px;
   font-size: var(--fs-sm);
+  color: var(--text-secondary);
+  background: transparent;
   border: 1px solid var(--border);
   border-radius: 6px;
   cursor: pointer;
   user-select: none;
-  transition: background 0.15s, border-color 0.15s;
-  overflow: hidden;
+  white-space: nowrap;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
 }
-.thinking-effort-mode span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+.thinking-effort-mode:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.thinking-effort-mode input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+  pointer-events: none;
 }
 .thinking-effort-mode:has(input:checked) {
   background: var(--accent-bg);
   border-color: var(--accent);
+  color: var(--text);
 }
 /* ===== Model Modal Format Info ===== */
 .model-format-info {
