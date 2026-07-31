@@ -4,12 +4,12 @@
 
 ## 项目是什么
 
-LLM Proxy 是一个**基于 FastAPI 的 LLM API 聚合网关**。它接收 Anthropic Messages、OpenAI Chat Completions、OpenAI Responses 三种客户端格式的请求，路由到任意格式的上游模型，并做双向协议转换。
+LLM Proxy 是一个**基于 FastAPI 的 LLM API 聚合网关**。它接收 Anthropic Messages、OpenAI Chat Completions、OpenAI Responses 三种客户端格式的请求，路由到协议矩阵支持的任意上游格式，并做双向协议转换。
 
 ## 一句话数据流
 
 ```
-Client → FastAPI → Middlewares (request_id → access_log → catch_all_exceptions)
+Client → FastAPI → Middlewares (request_id → access_log → admin_auth → catch_all_exceptions)
                    → Routes (薄委托层)
                    → Handlers (Pipeline 模式: Auth → ModelResolve → ... → Proxy)
                    → Upstream LLM API
@@ -69,7 +69,7 @@ llm-proxy/
       url_utils.py              URL 工具
 
     middleware/                 FastAPI 中间件
-      request_id.py, access_log.py, __init__.py (catch_all_exceptions)
+      request_id.py, access_log.py, admin_auth.py, __init__.py (catch_all_exceptions)
 
   static/                       前端（Preact + Vite）
     src/                        TSX 源码
@@ -102,7 +102,7 @@ llm-proxy/
 6. **CompressionStep** — 输入压缩（节省 token）
 7. **ProxyStep / IRProxyStep** — 根据路由选择：
    - Messages 和 Chat 路由 → **ProxyStep**（同协议透传 / 旧通道跨协议转换）
-   - Responses 路由 → **IRProxyStep**（IR 抽象层：协议选择、IR 转换、重试）
+   - Responses 路由 → **IRProxyStep**（同协议裸透传 / 跨协议 IR 转换 + 429/503 重试）
 
 步骤可抛出 PipelineStop(response) 中断管道，中间件识别并返回。
 
@@ -197,11 +197,13 @@ OpenAIProtocolStep 确定上游协议（多协议选择 + custom/namespace 工�
 routes/responses.py → ResponsesHandler.handle()
   Auth → ModelResolve → VisionFallback → Compression → IRProxyStep
     IRProxyStep(client_protocol="openai/responses")
-      内部走 IR 抽象层：Responses→IR→upstream_body → 上游 SSE → IR→client SSE
+      同协议（Responses→Responses）→ HTTP 裸透传，仅映射 model 名
+      跨协议 → IR 抽象层：Responses→IR→upstream_body → 上游 SSE → IR→client SSE
 ```
 
 Responses 路由已直接走 IRProxyStep（不走 ProtocolSelectStep / ResponsesConvertStep / ProxyStep）。
-IRProxyStep 内部包含：协议选择、同协议透传、跨协议 IR 转换、流式/非流式处理、429/503 指数退避重试。
+IRProxyStep 内部包含：协议选择、同协议裸透传（流式走字节 relay，保留 SSE `\n\n` 帧界）、
+跨协议 IR 转换、流式/非流式处理、429/503 指数退避重试。
 
 ## 关键 API 一览
 
@@ -212,15 +214,17 @@ IRProxyStep 内部包含：协议选择、同协议透传、跨协议 IR 转换�
 | POST | /v1/responses | OpenAI Responses API 格式 |
 | POST | /v1/messages/count_tokens | Token 计数 |
 | GET | /v1/models | 模型列表（支持 Codex ModelInfo 格式） |
-| GET/PUT | /api/config | 全局配置（PUT 自动删除 family_routing） |
-| CRUD | /api/endpoints | 端点管理 |
+| GET/PUT | /api/admin-auth | 管理 API 认证状态查询 / 启用-修改-禁用 |
+| GET/PUT | /api/config | 全局配置（GET 剥离 api_key；PUT 自动剔除 family_routing/model_map 并 reload） |
+| CRUD | /api/endpoints | 端点管理（不返回原始 api_key，仅 api_key_hash） |
 | GET | /api/provider-profiles | 厂商 thinking/reasoning profile 列表 |
 | GET | /api/thinking-effort-defaults | 系统默认 effort mapping 配置 |
-| PUT | /api/models/{model_id} | 更新单个模型配置（增量合并） |
+| PUT | /api/models/{model_id} | 更新单个模型配置（增量合并；空 api_key 不覆盖已有凭据） |
 | DEL | /api/models/{model_id} | 删除单个模型配置 |
 | POST | /api/providers/{model_id}/detect | 检测模型所属厂商 |
-| GET | /api/usage | 用量查询（支持 model_id 筛选、自定义时间范围） |
-| GET | /api/logs/* | 日志查询 |
+| GET | /api/usage | 用量查询（endpoint_id / model_id 筛选、since/until 时间范围、view=heatmap） |
+| GET | /api/usage/summary | 用量汇总 |
+| GET | /api/logs/* | 日志查询（list / summary / filter-options） |
 | POST | /api/latency | 延迟测试（支持多协议 + proxy 配置） |
 | POST | /api/detect-protocol | 检测上游协议 |
 
@@ -251,6 +255,10 @@ config.json（已 gitignore，参考 config.example.json）：
 
 ```json
 {
+  "admin_auth": {
+    "enabled": false,
+    "key_hash": ""
+  },
   "models": {
     "模型ID": {
       "api_base": "...",
@@ -286,6 +294,7 @@ config.json（已 gitignore，参考 config.example.json）：
 
 注意：
 - **upstream_protocols 已从字符串数组迁移到 ProtocolEntry 结构化格式**：`{"protocol": "...", "enabled": bool, "path": "..."}`。旧版字符串数组仍兼容（自动转成 enabled=true 的 entry），但新加模型必须用结构化格式。
+- `admin_auth` 节由 `PUT /api/admin-auth` 或前端「高级数据保护」面板管理：密钥只存 SHA-256 `key_hash`，`GET /api/config` 仅注入启用状态（不含 key_hash）；设置 `LLM_PROXY_ADMIN_KEY` 环境变量时由环境变量强制接管
 - family_routing 仅存在端点的 family_routing 字段（不在 config.json 里）
 - api_base 不含 /v1/... 后缀
 - upstream_protocol（标量）已被 upstream_protocols（数组）取代，但标量仍兼容
@@ -301,21 +310,22 @@ config.json → config_loader.load_config() → State.__init__()
                     → 构建 model_map, vision_map, protocols_map, paths_map, allow_proxy_map
 ```
 
-端点配置存储在 usage.db 的 endpoints 表中。PUT /api/config 会将端点覆盖合入数据库。
+端点配置存储在 usage.db 的 endpoints 表中，通过 /api/endpoints CRUD 管理。
+PUT /api/config 只保存 config.json 并 reload（自动剔除 family_routing / model_map）。
 
 ## 错误处理规则
 
 - 全局中间件 catch_all_exceptions 捕获所有异常，识别 PipelineStop 并返回其响应
 - Pipeline 步骤内错误：raise PipelineStop(make_xxx_error(...))
 - 未预期异常：中间件兜底 500
-- failover 触发：499 / 503；链由 family_routing 配置的 failover 字段动态决定
+- failover 触发：429 / 503（或响应 error.type 为 rate_limit_error / overloaded_error）；链由 family_routing 配置的 failover 字段动态决定
 - x-should-retry: false 阻止 SDK 重试
 
 ## 日志体系
 
 - 统一格式：%(asctime)s %(levelname)s [%(request_id)s] %(name)s: %(message)s
 - Request ID：每请求 8 位 hex，REQUEST_ID_CTX ContextVar，响应头 x-request-id
-- 中间件顺序（外→内）：request_id → access_log → catch_all_exceptions
+- 中间件顺序（外→内）：request_id → access_log → admin_auth → catch_all_exceptions
 - Access Log 走 llm_proxy.access logger
 - API Key 脱敏：handlers/shared/auth.py 的 _extract_api_key() + 前 4 位
 - 生命周期日志走 llm_proxy.lifecycle logger，不受全局级别影响
@@ -343,7 +353,8 @@ config.json → config_loader.load_config() → State.__init__()
 
 ## IR 层新通道迁移路径
 
-endpoint.settings 加 "ir_enabled": true → handler 根据 flag 选择 IRProxyStep 或 ProxyStep。
+现状：/v1/responses 已固定走 IRProxyStep；同协议时内部裸透传，跨协议才做 IR 转换。
+Messages / Chat 路由仍走 ProxyStep（旧通道）。
 全量切换后删除 anthropic_openai/ 和 responses_chat/ 通道。
 
 ## 开发与部署
@@ -403,20 +414,29 @@ python tests/smoke_test.py          # 冒烟测试
 
 ## 管理 API 安全
 
-所有 `/api/*` 管理路由受 `LLM_PROXY_ADMIN_KEY` 环境变量保护：
+所有 `/api/*` 管理路由按三层优先级认证：
+
+1. `LLM_PROXY_ADMIN_KEY` 环境变量 — 强制认证（部署级保护，优先级最高）
+2. config.json 的 `admin_auth.enabled=true` — 前端「高级数据保护」或 `PUT /api/admin-auth` 启用
+3. 默认 — 放行（零配置，个人本机部署最友好）
+
+认证方式：请求携带 `X-Admin-Key` 头或 `Authorization: Bearer <key>`。
 
 | 变量 | 说明 |
 |------|------|
-| `LLM_PROXY_ADMIN_KEY` | 管理 API 密钥。设置后所有 `/api/*` 路由必须携带 `X-Admin-Key` 头或 `Authorization: Bearer <key>`。未设置时放行但记录 WARNING。 |
+| `LLM_PROXY_ADMIN_KEY` | 管理 API 密钥。设置后所有 `/api/*` 路由必须认证；`PUT /api/admin-auth` 返回 403（由环境变量接管） |
+| `PUT /api/admin-auth` | 启用/修改/禁用管理密钥：首次启用只需 `key`（≥6 字符）；已启用时修改/禁用需 `current_key` 验证；只保存 SHA-256 `key_hash` |
+| `GET /api/admin-auth` | 返回 `{enabled, source}`，不含 key_hash |
 
 **数据脱敏**：
 - `GET /api/config` — 自动剥离所有模型的 `api_key` 字段
 - `GET /api/endpoints` / `GET /api/endpoints/{id}` — 不返回原始 `api_key`，仅保留 `api_key_hash`
+- `PUT /api/models/{id}` 带空 `api_key` 时不覆盖已有凭据（前端未重新输入则保留原 key）
 
 **SSRF 防护**：
 - `POST /api/detect-protocol` — 禁止访问 loopback / RFC1918 / link-local / cloud metadata 地址
 
-在公开部署前必须设置 `LLM_PROXY_ADMIN_KEY`。
+在公开部署前必须设置 `LLM_PROXY_ADMIN_KEY`（或通过管理面板启用 admin auth）。
 
 ## 已知陷阱
 
@@ -441,6 +461,7 @@ python tests/smoke_test.py          # 冒烟测试
 13. **SSE data type 必须注入**：`sse_format()` 自动在 data JSON 顶层注入 `type` 字段（与 `event:` 头镜像）。
     Codex / Claude Code 只解析 data 的 `type` 字段，不认 `event:` 头；缺失则收不到任何事件，
     最终报错 "stream closed before response.completed"。这是流式响应的常见遗漏点。
+    同协议流式透传用 `aiter_bytes()` 字节 relay 保留 `\n\n` 帧界（`5e0b8cd`），不要改成逐行重写。
 14. **developer role → system 降级**：`protocol/ir/chat.py` 在 `_message_ir_to_chat()` 中自动将
     `role == "developer"` 降级为 `"system"`。OpenAI 引入 developer role 后部分上游（如 DeepSeek）
     不兼容此角色值，必须降级否则请求失败。
@@ -465,6 +486,9 @@ python tests/smoke_test.py          # 冒烟测试
 20. **config.json thinking_effort_mapping 节**：`PUT /api/config` 会保存 `thinking_effort_mapping`
     节到 config.json。但此节是可选配置——缺失时使用 `get_default_mapping_config()` 内置默认，
     行为与旧版硬编码完全一致。
+21. **Responses 同协议 ≠ 工具转换**：IRProxyStep 在 client 与 upstream 均为 openai/responses 时走 HTTP
+    裸透传，只映射 model 名，不做 apply_patch DSL / namespace 等工具降级；跨协议
+    （responses→chat / responses→anthropic）才进入 IR 转换路径。
 
 ## 更多细节
 

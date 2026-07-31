@@ -13,10 +13,10 @@
 
 | 请求格式 | 可转换的上游格式 | 请求路由 |
 | Anthropic Messages | Anthropic Messages / OpenAI Chat Completions | `/v1/messages` |
-| OpenAI Chat Completions | OpenAI Chat Completions / Anthropic Messages | `/v1/chat/completions` |
-| OpenAI Responses | OpenAI Chat Completions / Anthropic Messages | `/v1/responses` |
+| OpenAI Chat Completions | OpenAI Chat Completions / OpenAI Responses | `/v1/chat/completions` |
+| OpenAI Responses | OpenAI Responses / OpenAI Chat Completions / Anthropic Messages | `/v1/responses` |
 
-→ **Anthropic 、 OpenAI Chat Completions 和 OpenAI Responses 三种请求格式均可由指定路径路由到任意格式的上游模型。**
+→ **Anthropic 、 OpenAI Chat Completions 和 OpenAI Responses 三种请求格式均可由指定路径路由到协议矩阵支持的任意上游格式。**
 
 ---
 
@@ -42,11 +42,12 @@
 |------------|------------|----------|----------|
 | Anthropic Messages | Anthropic / Chat | `/v1/messages` | 同协议透传 / `anthropic_openai/` 旧通道 |
 | OpenAI Chat Completions | Chat / Responses | `/v1/chat/completions` | 同协议透传 / `responses_chat/` 旧通道 |
-| OpenAI Responses API | Responses / Chat / Anthropic | `/v1/responses` | **IR 通道**（`protocol/ir/`）|
+| OpenAI Responses API | Responses / Chat / Anthropic | `/v1/responses` | 同协议裸透传 / **IR 通道**（`protocol/ir/`）|
 
-所有三种请求格式均可路由到任意目标格式；目前 `/v1/responses` 已直接走 IR 抽象层（`IRProxyStep`），
-其他两个路由仍在逐步迁移到 IR 通道。任意两个协议间的单次请求仅经过一次 IR 转换（`client → IR → upstream`），
-不产生级联转换损耗。
+三种请求格式均可按上方矩阵路由到对应上游；目前 `/v1/responses` 已直接走 IR 抽象层（`IRProxyStep`），
+其他两个路由仍在逐步迁移到 IR 通道。IRProxyStep 在客户端与上游同协议（Responses→Responses）时
+直接 HTTP 裸透传（仅映射 model 名，字节级 relay 保留 SSE 帧界），跨协议才经过一次 IR 转换
+（`client → IR → upstream`），不产生级联转换损耗。
 
 > 迁移目标：把 `/v1/messages` 和 `/v1/chat/completions` 也接入 IRProxyStep，全量切换后删除
 > `anthropic_openai/` 和 `responses_chat/` 旧通道。
@@ -74,6 +75,8 @@ LLM Proxy 全面兼容 Codex Desktop 的 OpenAI Responses API 通信协议：
 - **SSE 事件 type 安全**：每个 SSE data payload 自动注入 `type` 字段（与 `event:` 头镜像），
   Codex 只解析 data JSON 的 `type`，不认 `event:` 头；缺失会导致 "stream closed before
   response.completed" 错误
+- **同协议裸透传**：客户端与上游同为 OpenAI Responses 时直接字节级转发（仅映射 model 名），
+  保留 SSE `\n\n` 帧界；apply_patch DSL / namespace 工具降级仅在跨协议转换时生效
 - **协议转换**：无论上游是 Chat Completions 还是 Anthropic Messages，自动完成双向转换
 
 参考 [`config.toml.example`](config.toml.example) 快速配置 Codex Desktop 接入。
@@ -92,7 +95,7 @@ LLM Proxy 全面兼容 Codex Desktop 的 OpenAI Responses API 通信协议：
 
 | 功能 | 说明 |
 |------|------|
-| **全协议互转** | Anthropic / Chat / Responses 三种协议任意互转；`/v1/responses` 已走 IR 抽象层，其他两个路由由旧通道提供迁移期兼容 |
+| **全协议互转** | Anthropic / Chat / Responses 三种协议按可达性表互转；`/v1/responses` 同协议裸透传、跨协议走 IR 抽象层，其他两个路由由旧通道提供迁移期兼容 |
 | **统一 IR 抽象层** | `protocol/ir/` 零外部依赖的中间表示层，ProtocolConverter 注册表模式，新增协议只需实现一个子类 |
 | **旧通道迁移期运行** | `anthropic_openai/` 服务 Anthropic 跨协议；`responses_chat/` 服务 Chat→Responses 转换与 apply_patch DSL 修复 |
 | **多上游聚合** | 一个代理接入 DeepSeek、MiniMax、GLM、OpenCode 等多个模型提供商 |
@@ -101,8 +104,9 @@ LLM Proxy 全面兼容 Codex Desktop 的 OpenAI Responses API 通信协议：
 | **端点认证与隔离** | 基于 API Key 的端点隔离，每个端点独立配置可用模型 |
 | **模型路由与 Fallback** | 模型 family failover 链，429/503 自动切换；IRProxyStep 内置指数退避重试 |
 | **请求跟踪** | 每请求唯一 Request ID，结构化日志，Web 管理面板筛选查询 |
-| **管理面板** | Preact + Vite 构建的 Web 控制台，管理端点/模型/用量/日志 |
-| **用量筛选增强** | 用量查询支持 model_id 筛选和自定义时间范围，前端提取独立 UsageFilterBar 组件 |
+| **管理面板** | Preact + Vite 构建的 Web 控制台，管理端点/模型/用量/日志/密钥 |
+| **管理 API 认证** | `LLM_PROXY_ADMIN_KEY` 或 config `admin_auth` 启用后，所有 `/api/*` 需 `X-Admin-Key` / Bearer 认证；凭据脱敏 + SSRF 防护 |
+| **用量筛选增强** | 用量查询支持端点/模型筛选和自定义时间范围，前端提取独立 UsageFilterBar 组件 |
 
 ---
 
@@ -119,8 +123,9 @@ Handler Pipeline (Auth → ModelResolve → ... → Proxy / IRProxyStep)
   └── 跨协议 ──→ 协议转换层
                     │
                     ├── IR 通道（IRProxyStep）★ 当前 /v1/responses 在用
-                    │   └── client_body → IRRequest → upstream_body
-                    │   └── upstream SSE → IRStreamEvent → client SSE
+                    │   ├── 同协议 → HTTP 裸透传（仅 model 映射，字节 relay）
+                    │   └── 跨协议 → client_body → IRRequest → upstream_body
+                    │               upstream SSE → IRStreamEvent → client SSE
                     │
                     └── 旧通道（ProxyStep）★ /v1/messages 和 /v1/chat/completions 迁移期使用
                         ├── anthropic_openai：Anthropic ↔ Chat
@@ -192,12 +197,15 @@ curl http://localhost:4000/v1/responses \
 ### Docker（推荐）
 
 ```bash
-# 构建前端
+# 构建前端（Dockerfile 依赖 static/dist 存在）
 cd static && npm ci && npm run build && cd ..
 
-# 启动
-docker-compose up -d
+# 启动（config.json / usage.db / logs 通过 volume 挂载，不能用裸 docker run）
+docker compose up -d --build
 ```
+
+镜像内置健康检查（每 30s 探测 `/api/config`）、非 root 用户；日志由应用统一写入宿主机
+`./logs/llm-proxy.log`。公开部署前务必设置 `LLM_PROXY_ADMIN_KEY`。
 
 ### macOS launchd
 
@@ -225,10 +233,6 @@ docker-compose up -d
     <true/>
     <key>KeepAlive</key>
     <true/>
-    <key>StandardOutPath</key>
-    <string>/path/to/llm-proxy/proxy.log</string>
-    <key>StandardErrorPath</key>
-    <string>/path/to/llm-proxy/proxy.log</string>
 </dict>
 </plist>
 ```
@@ -236,6 +240,8 @@ docker-compose up -d
 ```bash
 launchctl load ~/Library/LaunchAgents/com.llmproxy.plist
 ```
+
+日志由应用内 `logging_config` 统一写入 `logs/llm-proxy.log`，launchd 只负责进程生命周期，无需重定向 stdout。
 
 ### Linux systemd
 
@@ -262,6 +268,19 @@ WantedBy=multi-user.target
 sudo systemctl enable --now llm-proxy
 ```
 
+日志由应用统一写入 `logs/llm-proxy.log`；systemd 只管理进程生命周期。
+
+### 开发（dev server, port 4010）
+
+```bash
+./dev.sh start      # screen + uvicorn --reload，日志 logs/llm-proxy.log
+./dev.sh log        # 实时查看日志
+./dev.sh stop       # 停止
+```
+
+开发环境变量由 `.dev-env` 自动加载（`LLM_PROXY_DEV=true`、`LLM_PROXY_LOG_LEVEL=DEBUG`），
+代码改动由 uvicorn `--reload` 热更新。详细开发流程见 `AGENTS.md`。
+
 ---
 
 ## 配置说明
@@ -272,6 +291,9 @@ sudo systemctl enable --now llm-proxy
 |------|------|
 | `api_base` | 上游 API 地址（不含 `/v1/...`） |
 | `api_key` | 上游 API Key |
+| `context_window` | 上下文窗口大小（用于模型列表展示） |
+| `display_name` | 前端展示名 |
+| `allow_proxy` | 是否允许走系统代理（默认 false，直连为安全默认） |
 | `upstream_model` | 实际发给上游的模型名 |
 | `upstream_protocol` | 标量字段（兼容保留）；建议用 `upstream_protocols` 数组 |
 | `upstream_protocols` | 结构化数组，如 `[{"protocol": "openai", "enabled": true, "path": "/v1/chat/completions"}]`，协议选择根据可达性表自动决定 |
@@ -283,8 +305,15 @@ sudo systemctl enable --now llm-proxy
 
 端点（API Key 认证、模型白名单、family routing）通过管理面板或 API 配置，存储在 SQLite 中，支持运行态热更新。
 
-全局配置还支持 `thinking_effort_mapping` 节（可选），用于配置 effort 预设映射规则。
-缺失时使用内置默认映射，行为与旧版硬编码完全一致。参见 `config.example.json`。
+全局配置还包含：
+- `error_handling` — failover / no-retry 开关
+- `compression` — 输入压缩开关与阈值
+- `thinking_effort_mapping` — effort 预设映射规则（可选；缺失时用内置默认，行为与旧版硬编码一致）
+- `admin_auth` — 管理 API 认证（`enabled` + `key_hash`，密钥只存 SHA-256 哈希）
+
+注意：`GET /api/config` 不会返回任何模型的 `api_key`；`upstream_protocols` 新模型必须使用
+结构化条目 `{"protocol": "...", "enabled": true, "path": "..."}`（旧字符串数组仍兼容）。
+完整模板见 `config.example.json`。
 
 ---
 
@@ -304,16 +333,33 @@ sudo systemctl enable --now llm-proxy
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET/PUT | `/api/config` | 读写配置 |
-| GET/POST/PUT/DEL | `/api/endpoints` | 端点 CRUD |
-| PUT/DEL | `/api/models/{model_id}` | 单个模型配置增量更新 / 删除 |
+| GET/PUT | `/api/admin-auth` | 管理 API 认证状态查询 / 启用-修改-禁用 |
+| GET/PUT | `/api/config` | 读写配置（GET 剥离 api_key；PUT 自动剔除 family_routing/model_map 并热重载） |
+| GET/POST/PUT/DEL | `/api/endpoints` | 端点 CRUD（返回 api_key_hash，不含原始 key） |
+| PUT/DEL | `/api/models/{model_id}` | 单个模型配置增量更新 / 删除（空 api_key 不覆盖已有凭据） |
 | GET | `/api/provider-profiles` | 厂商 thinking/reasoning profile 列表 |
 | GET | `/api/thinking-effort-defaults` | 系统默认 effort mapping 配置 |
 | POST | `/api/providers/{model_id}/detect` | 检测模型所属厂商 |
-| GET | `/api/usage[?days=&group_by=&granularity=&model_id=]` | 用量查询（支持 model_id 筛选和自定义时间范围） |
-| GET | `/api/logs/list` | 日志查询 |
+| GET | `/api/usage[?days=&group_by=&granularity=&endpoint_id=&model_id=&since=&until=&view=]` | 用量查询（端点/模型筛选、自定义时间范围、heatmap 视图） |
+| GET | `/api/usage/summary` | 用量汇总 |
+| GET | `/api/logs/list[?since=&until=&endpoint_id=&model_id=&status=&limit=&offset=]` | 日志查询（limit ≤ 1000，时间跨度 ≤ 90 天） |
+| GET | `/api/logs/summary` | 日志汇总 |
+| GET | `/api/logs/filter-options` | 日志筛选选项 |
 | POST | `/api/latency` | 延迟测试（支持多协议 + proxy 配置） |
-| POST | `/api/detect-protocol` | 检测上游协议 |
+| POST | `/api/detect-protocol` | 检测上游协议（SSRF 防护） |
+
+### 管理 API 安全
+
+所有 `/api/*` 管理路由在启用后需要认证（`X-Admin-Key` 头或 `Authorization: Bearer <key>`），
+按以下优先级：
+
+1. `LLM_PROXY_ADMIN_KEY` 环境变量 — 强制认证（公开部署必须设置）
+2. `config.json` 的 `admin_auth.enabled=true` — 通过前端「高级数据保护」或 `PUT /api/admin-auth`
+   启用，密钥只存 SHA-256 哈希（`key_hash`）
+3. 默认放行（零配置，适合个人本机部署）
+
+启用后未认证请求返回 401。`GET /api/config` / `GET /api/endpoints` 自动脱敏（不返回 `api_key`），
+`POST /api/detect-protocol` 带 SSRF 防护（禁止访问 loopback / 内网 / link-local / 云元数据地址）。
 
 ---
 
@@ -325,6 +371,8 @@ sudo systemctl enable --now llm-proxy
 - 模型用量概览与热力图
 - 请求日志筛选与查看
 - 延迟测试
+- 管理 API 密钥设置（高级数据保护）
+- Thinking Effort 映射与厂商 profile 配置
 - 配置导入导出
 
 ### 前端开发
@@ -345,8 +393,8 @@ npm run test     # 测试
 # 全量测试
 python -m pytest tests/ -v
 
-# 仅 IR 抽象层测试
-python -m pytest tests/test_ir_conversions.py tests/test_ir_streaming.py -v
+# IR 抽象层 / 同协议透传测试
+python -m pytest tests/test_ir_conversions.py tests/test_ir_streaming.py tests/test_ir_proxy_passthrough.py -v
 
 # 冒烟测试
 python tests/smoke_test.py
@@ -363,7 +411,7 @@ llm-proxy/
 │   ├── state.py                   # 运行态管理
 │   ├── config_loader.py           # 配置加载
 │   ├── logging_config.py          # 统一日志格式
-│   ├── routes/                    # HTTP 路由（薄层）
+│   ├── routes/                    # HTTP 路由（薄层：messages/openai/responses/misc + config/endpoints/usage/logs/latency）
 │   ├── handlers/                  # Pipeline 处理管道
 │   │   ├── base.py                # PipelineContext + HandlerStep + Pipeline
 │   │   ├── *_handler.py           # 各路由 Pipeline 组装
@@ -389,7 +437,9 @@ llm-proxy/
 │   │   ├── responses_chat/        # Responses ↔ Chat（旧通道，保留兼容）
 │   │   ├── errors.py              # 错误格式化
 │   │   ├── sse.py                 # SSE 透传
-│   │   └── think_tag.py           # Think 标签检测
+│   │   ├── think_tag.py           # Think 标签检测
+│   │   ├── detector.py            # 上游协议检测
+│   │   └── constants.py           # 常量
 │   ├── services/                  # 业务服务
 │   │   ├── tool_call_fix.py       # Tool call 修复
 │   │   ├── vision_service.py      # 图像→文本降级
@@ -397,18 +447,20 @@ llm-proxy/
 │   ├── infra/                     # 基础设施层
 │   │   ├── db.py                  # SQLite 操作
 │   │   ├── http_client.py         # 全局 HTTP 客户端
-│   │   └── archive.py             # 用量记录
+│   │   ├── archive.py             # 用量记录
+│   │   └── url_utils.py           # URL 工具
 │   └── middleware/                # 中间件
 │       ├── request_id.py
 │       ├── access_log.py
+│       ├── admin_auth.py
 │       └── catch_all_exceptions.py
 ├── static/                        # 前端（Preact + TypeScript + Vite）
 ├── tests/                         # 测试
 ├── docs/                          # 文档
 ├── config.example.json            # 配置模板
 ├── provider_profiles.example.json # 厂商 profile 模板
-├── Dockerfile / docker-compose.yml
-└── start.sh                       # 启动入口
+├── Dockerfile / docker-compose.yml / docker_healthcheck.py
+└── dev.sh / start.sh / restart.sh # 开发（4010）/ 本地启动（4000）/ 重启
 ```
 
 ---

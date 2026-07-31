@@ -14,10 +14,10 @@ Supported protocol conversions:
 | Request Format | Convertible Upstream Formats | Route |
 |----------------|------------------------------|-------|
 | Anthropic Messages | Anthropic Messages / OpenAI Chat Completions | `/v1/messages` |
-| OpenAI Chat Completions | OpenAI Chat Completions / Anthropic Messages | `/v1/chat/completions` |
-| OpenAI Responses | OpenAI Chat Completions / Anthropic Messages | `/v1/responses` |
+| OpenAI Chat Completions | OpenAI Chat Completions / OpenAI Responses | `/v1/chat/completions` |
+| OpenAI Responses | OpenAI Responses / OpenAI Chat Completions / Anthropic Messages | `/v1/responses` |
 
-→ **Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses — all three request formats can route to any upstream model through their respective paths.**
+→ **Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses — all three request formats can route to any upstream format supported by the protocol matrix through their respective paths.**
 
 ## Protocol Matrix
 
@@ -25,9 +25,9 @@ Supported protocol conversions:
 |---------------|----------------------------|-------|--------------------------|
 | Anthropic Messages | Anthropic / Chat | `/v1/messages` | Same-protocol passthrough / `anthropic_openai/` legacy channel |
 | OpenAI Chat Completions | Chat / Responses | `/v1/chat/completions` | Same-protocol passthrough / `responses_chat/` legacy channel |
-| OpenAI Responses API | Responses / Chat / Anthropic | `/v1/responses` | **IR channel** (`protocol/ir/`) |
+| OpenAI Responses API | Responses / Chat / Anthropic | `/v1/responses` | Same-protocol passthrough / **IR channel** (`protocol/ir/`) |
 
-All three request formats can route to any target format. `/v1/responses` already routes directly through the IR abstraction layer (`IRProxyStep`); the other two routes are still being migrated to the IR channel. Any single request between two protocols goes through exactly one IR conversion (`client → IR → upstream`), with no cascading conversion overhead.
+All three request formats can route per the matrix above. `/v1/responses` already routes directly through the IR abstraction layer (`IRProxyStep`); the other two routes are still being migrated to the IR channel. When client and upstream share the same protocol (Responses → Responses), `IRProxyStep` forwards the body with raw HTTP passthrough (model-name mapping only, byte-level relay preserving SSE framing); cross-protocol requests go through exactly one IR conversion (`client → IR → upstream`), with no cascading conversion overhead.
 
 > Migration target: also wire `/v1/messages` and `/v1/chat/completions` into `IRProxyStep`; after full cutover, delete the `anthropic_openai/` and `responses_chat/` legacy channels.
 
@@ -61,6 +61,7 @@ LLM Proxy deeply integrates with Codex Desktop's OpenAI Responses API, with full
 - **SSE event type safety**: Every SSE data payload automatically injects the `type` field (mirroring the `event:` header).
   Codex only reads the `type` field from the data JSON, not the `event:` header; missing `type` causes
   "stream closed before response.completed" errors
+- **Same-protocol passthrough**: When the client and upstream are both OpenAI Responses, the request body is forwarded byte-level as-is (model-name mapping only), preserving SSE `\n\n` framing; apply_patch DSL / namespace tool downgrades only apply during cross-protocol conversion
 - **Protocol conversion**: Automatic bidirectional conversion regardless of upstream format (Chat Completions or Anthropic Messages)
 
 See [`config.toml.example`](config.toml.example) to configure Codex Desktop with this proxy.
@@ -79,7 +80,7 @@ Point your tool's `api_base` to this proxy. **One proxy serves all your tools.**
 
 | Feature | Description |
 |---------|-------------|
-| **Full Protocol Interop** | Anthropic / Chat / Responses — any protocol routes to any upstream. `/v1/responses` already runs through the IR abstraction layer; the other two routes use legacy channels during the migration window |
+| **Full Protocol Interop** | Anthropic / Chat / Responses — interop per the reachability table. `/v1/responses` uses same-protocol passthrough and IR conversion for cross-protocol; the other two routes use legacy channels during the migration window |
 | **Unified IR Abstraction Layer** | `protocol/ir/` — zero-dependency intermediate representation with ProtocolConverter registry pattern; adding a new protocol means implementing a single subclass |
 | **Legacy Channels in Migration** | `anthropic_openai/` serves Anthropic cross-protocol; `responses_chat/` serves Chat→Responses conversion and apply_patch DSL repair |
 | **Multi-Upstream Aggregation** | One proxy for DeepSeek, MiniMax, GLM (iFlytek), OpenCode, and more |
@@ -90,7 +91,8 @@ Point your tool's `api_base` to this proxy. **One proxy serves all your tools.**
 | **Request Tracking** | Unique Request ID per call, structured logging, web admin panel filtering |
 | **Tool Format Compatibility** | apply_patch DSL decomposition + reconstruction; namespace flattened; other custom tools passed through |
 | **Admin Panel** | Preact + Vite web console for endpoint/model/usage/log management |
-| **Enhanced Usage Filtering** | Usage query supports model_id filter and custom time range; frontend extracted as standalone UsageFilterBar component |
+| **Admin API Auth** | With `LLM_PROXY_ADMIN_KEY` or config `admin_auth` enabled, all `/api/*` routes require `X-Admin-Key` / Bearer auth; credential sanitization + SSRF protection |
+| **Enhanced Usage Filtering** | Usage query supports endpoint/model filters and custom time ranges; frontend extracted as standalone UsageFilterBar component |
 
 ---
 
@@ -107,8 +109,9 @@ Handler Pipeline (Auth → ModelResolve → ... → Proxy / IRProxyStep)
   └── Cross-protocol ──→ Protocol conversion layer
                            │
                            ├── IR channel (IRProxyStep) ★ currently used by /v1/responses
-                           │   └── client_body → IRRequest → upstream_body
-                           │   └── upstream SSE → IRStreamEvent → client SSE
+                           │   ├── Same protocol → raw HTTP passthrough (model mapping, byte relay)
+                           │   └── Cross-protocol → client_body → IRRequest → upstream_body
+                           │                       upstream SSE → IRStreamEvent → client SSE
                            │
                            └── Legacy channel (ProxyStep) ★ /v1/messages and /v1/chat/completions during migration
                                ├── anthropic_openai: Anthropic ↔ Chat
@@ -180,14 +183,15 @@ curl http://localhost:4000/v1/responses \
 ### Docker (Recommended)
 
 ```bash
-# Build frontend first
+# Build frontend first (Dockerfile expects static/dist to exist)
 cd static && npm ci && npm run build && cd ..
 
-# Start
-docker-compose up -d
+# Start (config.json / usage.db / logs are volume-mounted; bare docker run is not supported)
+docker compose up -d --build
 ```
 
-The Docker image includes a built-in health check (every 30s via `GET /api/config`), ready to go.
+The Docker image includes a built-in health check (every 30s via `GET /api/config`), a non-root user,
+and writes logs to the host `./logs/llm-proxy.log`. Set `LLM_PROXY_ADMIN_KEY` before public deployment.
 
 ### macOS launchd
 
@@ -215,10 +219,6 @@ Create `~/Library/LaunchAgents/com.llmproxy.plist`:
     <true/>
     <key>KeepAlive</key>
     <true/>
-    <key>StandardOutPath</key>
-    <string>/path/to/llm-proxy/proxy.log</string>
-    <key>StandardErrorPath</key>
-    <string>/path/to/llm-proxy/proxy.log</string>
 </dict>
 </plist>
 ```
@@ -226,6 +226,8 @@ Create `~/Library/LaunchAgents/com.llmproxy.plist`:
 ```bash
 launchctl load ~/Library/LaunchAgents/com.llmproxy.plist
 ```
+
+Logs are written by the app's `logging_config` to `logs/llm-proxy.log`; launchd only manages the process lifecycle, no stdout redirection needed.
 
 ### Linux systemd
 
@@ -252,6 +254,19 @@ WantedBy=multi-user.target
 sudo systemctl enable --now llm-proxy
 ```
 
+Logs are written by the app to `logs/llm-proxy.log`; systemd only manages the process lifecycle.
+
+### Development (dev server, port 4010)
+
+```bash
+./dev.sh start      # screen + uvicorn --reload, logs to logs/llm-proxy.log
+./dev.sh log        # tail live logs
+./dev.sh stop       # stop
+```
+
+Environment variables are loaded automatically from `.dev-env` (`LLM_PROXY_DEV=true`, `LLM_PROXY_LOG_LEVEL=DEBUG`);
+code changes are hot-reloaded by uvicorn `--reload`. See `AGENTS.md` for the full workflow.
+
 ---
 
 ## Configuration
@@ -262,6 +277,9 @@ Models are configured in `config.json`. Each model entry contains:
 |-------|-------------|
 | `api_base` | Upstream API URL (without `/v1/...` suffix) |
 | `api_key` | Upstream API Key |
+| `context_window` | Context window size (used for model list display) |
+| `display_name` | Display name in the frontend |
+| `allow_proxy` | Whether the model may use the system proxy (default `false`; direct connection is the secure default) |
 | `upstream_model` | Actual model name sent to upstream |
 | `upstream_protocol` | Scalar field (legacy compat); prefer `upstream_protocols` array |
 | `upstream_protocols` | Structured array like `[{"protocol": "openai", "enabled": true, "path": "/v1/chat/completions"}]`, protocol selection is automatic via reachability table |
@@ -273,9 +291,15 @@ Models are configured in `config.json`. Each model entry contains:
 
 Endpoints (API key auth, model allowlist, family routing) are configured at runtime via the admin panel or API, stored in SQLite, and support hot reload.
 
-The global config also supports an optional `thinking_effort_mapping` section for effort preset rules.
-When absent, built-in defaults are used with behavior identical to the previous hardcoded version.
-See `config.example.json` for details.
+The global config also includes:
+- `error_handling` — failover / no-retry switches
+- `compression` — input compression toggle and threshold
+- `thinking_effort_mapping` — effort preset rules (optional; built-in defaults when absent, identical to the previous hardcoded version)
+- `admin_auth` — admin API auth (`enabled` + `key_hash`; the key is stored only as a SHA-256 hash)
+
+Note: `GET /api/config` never returns any model's `api_key`; new models must use structured
+`upstream_protocols` entries `{"protocol": "...", "enabled": true, "path": "..."}`
+(legacy string arrays still work). See `config.example.json` for the full template.
 
 ---
 
@@ -295,16 +319,32 @@ See `config.example.json` for details.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET/PUT | `/api/config` | Read/write configuration |
-| GET/POST/PUT/DEL | `/api/endpoints` | Endpoint CRUD |
-| PUT/DEL | `/api/models/{model_id}` | Single model config incremental update / delete |
+| GET/PUT | `/api/admin-auth` | Admin auth status / enable-update-disable |
+| GET/PUT | `/api/config` | Read/write configuration (GET strips api_key; PUT drops family_routing/model_map and hot-reloads) |
+| GET/POST/PUT/DEL | `/api/endpoints` | Endpoint CRUD (returns api_key_hash, never the raw key) |
+| PUT/DEL | `/api/models/{model_id}` | Single model config incremental update / delete (empty api_key keeps existing credentials) |
 | GET | `/api/provider-profiles` | Vendor thinking/reasoning profile list |
 | GET | `/api/thinking-effort-defaults` | System default effort mapping config |
 | POST | `/api/providers/{model_id}/detect` | Detect model vendor |
-| GET | `/api/usage[?days=&group_by=&granularity=&model_id=]` | Usage statistics (supports model_id filter and custom time range) |
-| GET | `/api/logs/list` | Log query |
+| GET | `/api/usage[?days=&group_by=&granularity=&endpoint_id=&model_id=&since=&until=&view=]` | Usage statistics (endpoint/model filters, custom time range, heatmap view) |
+| GET | `/api/usage/summary` | Usage summary |
+| GET | `/api/logs/list[?since=&until=&endpoint_id=&model_id=&status=&limit=&offset=]` | Log query (limit ≤ 1000, time span ≤ 90 days) |
+| GET | `/api/logs/summary` | Log summary |
+| GET | `/api/logs/filter-options` | Log filter options |
 | POST | `/api/latency` | Latency test (supports multi-protocol + proxy config) |
-| POST | `/api/detect-protocol` | Detect upstream protocol |
+| POST | `/api/detect-protocol` | Detect upstream protocol (SSRF-protected) |
+
+### Admin API Security
+
+All `/api/*` admin routes require authentication once enabled (`X-Admin-Key` header or `Authorization: Bearer <key>`), resolved by priority:
+
+1. `LLM_PROXY_ADMIN_KEY` environment variable — mandatory auth (set it for public deployments)
+2. `config.json` `admin_auth.enabled=true` — enabled via the "Advanced data protection" panel or `PUT /api/admin-auth`; the key is stored only as a SHA-256 hash
+3. Default: open (zero-config, suitable for local personal use)
+
+Unauthenticated requests return 401 once enabled. `GET /api/config` / `GET /api/endpoints` sanitize credentials
+(never return `api_key`), and `POST /api/detect-protocol` is SSRF-protected
+(loopback / private / link-local / cloud-metadata addresses are blocked).
 
 ---
 
@@ -316,6 +356,8 @@ Built with Preact + TypeScript + Vite, providing:
 - Model usage overview and heatmap
 - Request log filtering and viewing
 - Latency testing
+- Admin API key management (advanced data protection)
+- Thinking effort mapping and vendor profile configuration
 - Configuration import/export
 
 ### Frontend Development
@@ -336,8 +378,8 @@ npm run test     # Run tests
 # Full test suite
 python -m pytest tests/ -v
 
-# IR abstraction layer tests only
-python -m pytest tests/test_ir_conversions.py tests/test_ir_streaming.py -v
+# IR abstraction layer / same-protocol passthrough tests
+python -m pytest tests/test_ir_conversions.py tests/test_ir_streaming.py tests/test_ir_proxy_passthrough.py -v
 
 # Smoke test
 python tests/smoke_test.py
@@ -354,7 +396,7 @@ llm-proxy/
 │   ├── state.py                   # Runtime state management
 │   ├── config_loader.py           # Configuration loader
 │   ├── logging_config.py          # Unified log format
-│   ├── routes/                    # HTTP routes (thin layer)
+│   ├── routes/                    # HTTP routes (thin: messages/openai/responses/misc + config/endpoints/usage/logs/latency)
 │   ├── handlers/                  # Pipeline processing
 │   │   ├── base.py                # PipelineContext + HandlerStep + Pipeline
 │   │   ├── *_handler.py           # Route-specific pipeline assembly
@@ -380,7 +422,9 @@ llm-proxy/
 │   │   ├── responses_chat/        # Responses ↔ Chat (legacy, retained)
 │   │   ├── errors.py              # Error formatting
 │   │   ├── sse.py                 # SSE passthrough
-│   │   └── think_tag.py           # Think tag detection
+│   │   ├── think_tag.py           # Think tag detection
+│   │   ├── detector.py            # Upstream protocol detection
+│   │   └── constants.py           # Constants
 │   ├── services/                  # Business services
 │   │   ├── tool_call_fix.py       # Tool call repair
 │   │   ├── vision_service.py      # Image→text fallback
@@ -388,18 +432,20 @@ llm-proxy/
 │   ├── infra/                     # Infrastructure layer
 │   │   ├── db.py                  # SQLite operations
 │   │   ├── http_client.py         # Global HTTP client
-│   │   └── archive.py             # Usage recording
+│   │   ├── archive.py             # Usage recording
+│   │   └── url_utils.py           # URL utilities
 │   └── middleware/                # Middleware
 │       ├── request_id.py
 │       ├── access_log.py
+│       ├── admin_auth.py
 │       └── catch_all_exceptions.py
 ├── static/                        # Frontend (Preact + TypeScript + Vite)
 ├── tests/                         # Tests
 ├── docs/                          # Documentation
 ├── config.example.json            # Configuration template
 ├── provider_profiles.example.json # Vendor profile template
-├── Dockerfile / docker-compose.yml
-└── start.sh                       # Startup script
+├── Dockerfile / docker-compose.yml / docker_healthcheck.py
+└── dev.sh / start.sh / restart.sh # Dev (4010) / local (4000) / restart scripts
 ```
 
 ---
