@@ -7,8 +7,9 @@
 
 迁移路径（不在本步骤内）：
 1. Responses 路由已直接使用 IRProxyStep（替代 ProtocolSelect + ResponsesConvert + ProxyStep）
-2. Chat/Anthropic 路由仍用 ProxyStep（待后续迁移）
-3. 全量切换后删除 anthropic_openai/、responses_chat/ 通道
+2. 同协议（client == upstream）时走 HTTP 裸透传，仅做模型名映射；跨协议才走 IR 转换
+3. Chat/Anthropic 路由仍用 ProxyStep（待后续迁移）
+4. 全量切换后删除 anthropic_openai/、responses_chat/ 通道
 """
 
 from __future__ import annotations
@@ -163,9 +164,10 @@ class IRProxyStep(HandlerStep):
     完整实现请求/响应/流式三种模式：
     - 解析 ctx.error_protocol 决定 client_protocol
     - 由 capabilities.select_upstream 选 upstream 协议
-    - client → IR → upstream 转换后转发
+    - 同协议：HTTP 裸透传（仅模型名映射），不走 IR / apply_patch 转换
+    - 跨协议：client → IR → upstream 转换后转发
     - 上游响应 → IR → client 转换后返回
-    - 流式：upstream SSE → IR events → client SSE
+    - 流式：upstream SSE → IR events → client SSE（跨协议）或字节 relay（同协议）
     """
 
     def __init__(self, client_protocol: str):
@@ -210,9 +212,17 @@ class IRProxyStep(HandlerStep):
         target_path = resolve_path(model_paths, path_key)
         target_url = f"{api_base.rstrip('/')}/{target_path.lstrip('/')}"
 
-        # ── IR 转换 ──
         client_proto = _resolve(self.client_protocol)
         upstream_proto = _resolve(upstream_protocol)
+
+        # ── 同协议透传：body 原样转发，仅映射 model ──
+        if client_proto == upstream_proto:
+            await self._proxy_same_protocol(
+                ctx, client_proto, api_base, upstream_api_key, actual_model, model_id,
+            )
+            return
+
+        # ── 跨协议 IR 转换 ──
         try:
             model_effort_mapping = get_state().get_model_effort_mapping(model_id)
             ir_request = REGISTRY[client_proto].to_ir(ctx.body, model_effort_mapping)
@@ -272,6 +282,34 @@ class IRProxyStep(HandlerStep):
                 ctx, ir_request, upstream_body, upstream_protocol, upstream_proto,
                 target_url, req_headers, actual_model, model_id,
             )
+
+    async def _proxy_same_protocol(
+        self,
+        ctx: PipelineContext,
+        client_proto: str,
+        api_base: str,
+        upstream_api_key: str,
+        actual_model: str,
+        model_id: str,
+    ) -> None:
+        """同协议 HTTP 裸透传：不做 IR / 工具降级，仅映射 model 名。"""
+        endpoint_id = ctx.endpoint["endpoint_id"]
+        if client_proto == "openai/responses":
+            from llm_proxy.handlers.shared.proxy import ProxyStep
+
+            logger.debug(
+                "IRProxyStep: same-protocol passthrough (%s), model=%s",
+                client_proto, model_id,
+            )
+            await ProxyStep()._proxy_responses_direct(
+                ctx, api_base, upstream_api_key, actual_model, model_id, endpoint_id,
+            )
+            return
+        logger.error("IRProxyStep: unsupported same-protocol passthrough: %s", client_proto)
+        self._record_usage(ctx, 0, 0, status="error", error_type="unsupported_passthrough")
+        raise RuntimeError(
+            f"IRProxyStep: same-protocol passthrough not implemented for {client_proto!r}"
+        )
 
     # ── 非流式 ───────────────────────────────────────────────────────
 

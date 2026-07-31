@@ -148,7 +148,6 @@ export function ModelModal() {
     const data: Record<string, unknown> = {
       display_name: v.displayName || undefined,
       api_base: v.apiBase,
-      api_key: v.apiKey,
       upstream_model: v.name,
       upstream_protocols: toUpstreamProtocols(pc),
       context_window: v.contextWindow ? Math.round(Number(v.contextWindow) * Number(v.contextWindowUnit)) : undefined,
@@ -156,6 +155,9 @@ export function ModelModal() {
       allow_proxy: v.allowProxy || undefined,
       provider: v.provider || undefined,
     };
+    if (v.apiKey) {
+      data.api_key = v.apiKey;
+    }
 
     // Thinking effort：按模式写入（type 字段已废弃，统一用 'any_to_any'）
     if (v.thinkingEffortMode === 'custom') {

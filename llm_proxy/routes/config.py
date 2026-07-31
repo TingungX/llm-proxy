@@ -155,6 +155,9 @@ async def api_update_model(model_id: str, request: Request):
     for key, value in body.items():
         if value is None:
             model_cfg.pop(key, None)
+        elif key == "api_key" and value == "" and model_cfg.get("api_key"):
+            # GET /api/config 不返回 api_key；前端编辑保存时空串不应覆盖已有凭据
+            continue
         else:
             model_cfg[key] = value
     if body.get("upstream_protocols") is not None:

@@ -696,7 +696,8 @@ class ProxyStep(HandlerStep):
         actual_model: str, model_id: str, endpoint_id: str,
     ) -> None:
         """Responses 同协议透传"""
-        body = ctx.body
+        body = dict(ctx.body)
+        body["model"] = actual_model
         stream = body.get("stream", False)
         model_paths = get_state().paths_map.get(model_id.lower(), {})
         resp_path = resolve_path(model_paths, "openai/responses")

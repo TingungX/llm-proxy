@@ -22,7 +22,7 @@ class ResponsesHandler:
         self.pipeline = Pipeline([
             AuthStep(),
             ModelResolveStep(),
-            # 工具降级逻辑已内置于 IRProxyStep
+            # 同协议裸透传；跨协议走 IR 转换（含工具降级）
             VisionFallbackStep(),
             CompressionStep(),
             IRProxyStep(client_protocol="openai/responses"),
