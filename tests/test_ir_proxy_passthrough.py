@@ -123,7 +123,9 @@ def test_proxy_responses_direct_maps_model_on_request():
 
     with patch("llm_proxy.handlers.shared.proxy.get_client", return_value=mock_client), \
          patch("llm_proxy.handlers.shared.proxy.get_state") as mock_state:
-        mock_state.return_value.paths_map = {"my-model": {}}
+        ms = mock_state.return_value
+        ms.paths_map = {"my-model": {}}
+        ms.should_apply_effort_mapping.return_value = False
         asyncio.run(ProxyStep()._proxy_responses_direct(
             ctx, "https://api.example.com", "key", "upstream-model-name", "my-model", "ep-test",
         ))
@@ -131,6 +133,45 @@ def test_proxy_responses_direct_maps_model_on_request():
     assert captured["json"]["model"] == "upstream-model-name"
     assert captured["json"]["input"] == "hello"
     assert ctx.response is not None
+
+
+def test_proxy_responses_direct_maps_reasoning_effort_by_default():
+    """透传默认映射 reasoning.effort（passthrough_no_map=false）。"""
+    from llm_proxy.handlers.shared.proxy import ProxyStep
+
+    ctx = _make_ctx({
+        "model": "client-model-name",
+        "input": "hello",
+        "stream": False,
+        "reasoning": {"effort": "minimal"},
+    })
+    captured: dict = {}
+
+    async def fake_post(url, json, headers, timeout):
+        captured["json"] = json
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"id": "r1", "usage": {"input_tokens": 1, "output_tokens": 2}}
+        return resp
+
+    mock_client = MagicMock()
+    mock_client.post = AsyncMock(side_effect=fake_post)
+
+    with patch("llm_proxy.handlers.shared.proxy.get_client", return_value=mock_client), \
+         patch("llm_proxy.handlers.shared.proxy.get_state") as mock_state:
+        ms = mock_state.return_value
+        ms.paths_map = {"my-model": {}}
+        ms.should_apply_effort_mapping.return_value = True
+        ms.get_model_effort_mapping.return_value = {
+            "presets": [{"name": "default", "type": "any_to_any",
+                         "rules": {"minimal": "low", "low": "low", "*": "medium"}}],
+            "default_preset": "default",
+        }
+        asyncio.run(ProxyStep()._proxy_responses_direct(
+            ctx, "https://api.example.com", "key", "upstream-model-name", "my-model", "ep-test",
+        ))
+
+    assert captured["json"]["reasoning"]["effort"] == "low"
 
 
 @pytest.mark.asyncio
@@ -143,7 +184,7 @@ async def test_responses_direct_stream_preserves_sse_framing():
         b'data: {"type":"response.created","model":"m"}\n'
         b'\n'
         b'event: response.completed\n'
-        b'data: {"type":"response.completed","usage":{"input_tokens":3,"output_tokens":7}}\n'
+        b'data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":7}}}\n'
         b'\n'
     )
 
@@ -178,5 +219,36 @@ async def test_responses_direct_stream_preserves_sse_framing():
     assert b"data: {\"type\":\"response.created\"" in relayed
     assert b"\n\nevent: response.completed" in relayed
     mock_db.record_usage.assert_called_once()
-    assert mock_db.record_usage.call_args[0][3] == 7  # output_tokens
+    args, kwargs = mock_db.record_usage.call_args
+    assert args[2] == 3  # input_tokens
+    assert args[3] == 7  # output_tokens
+    assert args[4] == "success"
+    assert kwargs.get("error_type") is None
 
+
+@pytest.mark.asyncio
+async def test_responses_direct_stream_connect_error_records_zero_usage():
+    """连接失败不应伪造 input_tokens=1，并应写入 error_type。"""
+    import httpx
+    from llm_proxy.handlers.shared.proxy import ProxyStep
+
+    mock_client = MagicMock()
+    mock_client.stream = MagicMock(side_effect=httpx.ConnectError(""))
+
+    with patch("llm_proxy.handlers.shared.proxy.get_client", return_value=mock_client), \
+         patch("llm_proxy.handlers.shared.proxy.db") as mock_db, \
+         patch("llm_proxy.handlers.shared.proxy.asyncio.sleep", new_callable=AsyncMock):
+        async for _ in ProxyStep()._responses_direct_stream(
+            "https://api.example.com/v1/responses",
+            {"Authorization": "Bearer k"},
+            {"model": "m", "input": "hi", "stream": True},
+            "m", "ep-test", "my-model",
+        ):
+            pass
+
+    mock_db.record_usage.assert_called_once()
+    args, kwargs = mock_db.record_usage.call_args
+    assert args[2] == 0  # input_tokens — 不再 or 1
+    assert args[3] == 0
+    assert args[4] == "error"
+    assert kwargs.get("error_type") == "connect_error"

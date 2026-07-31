@@ -103,10 +103,16 @@ class ResponsesConvertStep(HandlerStep):
         reasoning = body.get("reasoning")
         mapped_effort: str | None = None
         model_effort_mapping = get_state().get_model_effort_mapping(model_id)
+        if not get_state().should_apply_effort_mapping(model_id):
+            model_effort_mapping = {
+                "presets": [{"name": "_identity", "type": "any_to_any", "rules": {}}],
+                "default_preset": "_identity",
+            }
         if isinstance(reasoning, dict) and "effort" in reasoning:
             effort = reasoning["effort"]
             mapped_effort = apply_effort_mapping(effort, model_effort_mapping)
             # 未命中规则且无 "*" 兜底时回退到 "auto"（与旧硬编码 map.get(effort, "auto") 一致）
+            # identity（空 rules）时 apply 返回原值
             chat_body["reasoning_effort"] = mapped_effort if mapped_effort else "auto"
 
         # 按厂商 profile 编码 thinking/reasoning（含 MiniMax reasoning_split）

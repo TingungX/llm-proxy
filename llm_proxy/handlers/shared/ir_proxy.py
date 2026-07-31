@@ -225,6 +225,11 @@ class IRProxyStep(HandlerStep):
         # ── 跨协议 IR 转换 ──
         try:
             model_effort_mapping = get_state().get_model_effort_mapping(model_id)
+            if not get_state().should_apply_effort_mapping(model_id):
+                model_effort_mapping = {
+                    "presets": [{"name": "_identity", "type": "any_to_any", "rules": {}}],
+                    "default_preset": "_identity",
+                }
             ir_request = REGISTRY[client_proto].to_ir(ctx.body, model_effort_mapping)
             upstream_body = REGISTRY[upstream_proto].to_upstream(ir_request, upstream_model=actual_model)
         except Exception as e:

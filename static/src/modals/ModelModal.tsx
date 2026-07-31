@@ -36,6 +36,8 @@ interface ModelFormValues extends Record<string, unknown> {
   thinkingEffortMode: 'default' | 'provider' | 'custom';
   thinkingEffortCustomType: string;
   thinkingEffortCustomRules: Record<string, string>;
+  thinkingEffortMappingEnabled: boolean;
+  thinkingEffortPassthroughNoMap: boolean;
 }
 
 function emptyRules(): Record<string, string> {
@@ -52,6 +54,8 @@ function getInitialValues(name: string | null): ModelFormValues {
     thinkingEffortMode: 'default',
     thinkingEffortCustomType: 'any_to_any',
     thinkingEffortCustomRules: emptyRules(),
+    thinkingEffortMappingEnabled: true,
+    thinkingEffortPassthroughNoMap: false,
   };
   if (name) {
     const m: ModelConfig | undefined = (modelsSignal.value as Record<string, ModelConfig>)[name];
@@ -114,6 +118,8 @@ function getInitialValues(name: string | null): ModelFormValues {
         thinkingEffortMode: mode as 'default' | 'provider' | 'custom',
         thinkingEffortCustomType: customType,
         thinkingEffortCustomRules: customRules,
+        thinkingEffortMappingEnabled: m.thinking_effort_mapping_enabled !== false,
+        thinkingEffortPassthroughNoMap: m.thinking_effort_passthrough_no_map === true,
       };
     }
   }
@@ -173,6 +179,8 @@ export function ModelModal() {
       data.thinking_effort_mode = v.thinkingEffortMode;
       data.thinking_effort_preset = null; // 清理旧的内联值
     }
+    data.thinking_effort_mapping_enabled = v.thinkingEffortMappingEnabled;
+    data.thinking_effort_passthrough_no_map = v.thinkingEffortPassthroughNoMap;
     try {
       await form.handleSubmit(async () => {
         await saveModel(v.name, data);
@@ -300,8 +308,12 @@ export function ModelModal() {
         provider={v.provider || ''}
         customRules={v.thinkingEffortCustomRules}
         profiles={profiles}
+        mappingEnabled={v.thinkingEffortMappingEnabled}
+        passthroughNoMap={v.thinkingEffortPassthroughNoMap}
         onModeChange={(mode) => form.setField('thinkingEffortMode', mode)}
         onRulesChange={(rules) => form.setField('thinkingEffortCustomRules', rules)}
+        onMappingEnabledChange={(enabled) => form.setField('thinkingEffortMappingEnabled', enabled)}
+        onPassthroughNoMapChange={(noMap) => form.setField('thinkingEffortPassthroughNoMap', noMap)}
       />
 
       <div class="modal-actions">

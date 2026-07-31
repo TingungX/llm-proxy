@@ -2,6 +2,7 @@ import { Fragment } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import { configSignal } from '../state/store';
 import { fetchThinkingEffortDefaults } from '../api/providers';
+import { Toggle } from './Toggle';
 import type { ProviderProfileInfo, ThinkingEffortMapping } from '../api/types';
 
 const COMMON_EFFORT_KEYS = ['none', 'auto', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', '*'];
@@ -11,8 +12,12 @@ interface Props {
   provider: string;
   customRules: Record<string, string>;
   profiles: Record<string, ProviderProfileInfo>;
+  mappingEnabled: boolean;
+  passthroughNoMap: boolean;
   onModeChange: (mode: 'default' | 'provider' | 'custom') => void;
   onRulesChange: (rules: Record<string, string>) => void;
+  onMappingEnabledChange: (enabled: boolean) => void;
+  onPassthroughNoMapChange: (noMap: boolean) => void;
 }
 
 /** format 中文标签 */
@@ -44,7 +49,12 @@ function formatAcceptValues(p: ProviderProfileInfo): string {
   return '—';
 }
 
-export function EffortStrategyFieldset({ mode, provider, customRules, profiles, onModeChange, onRulesChange }: Props) {
+export function EffortStrategyFieldset({
+  mode, provider, customRules, profiles,
+  mappingEnabled, passthroughNoMap,
+  onModeChange, onRulesChange,
+  onMappingEnabledChange, onPassthroughNoMapChange,
+}: Props) {
   const [sysDefaults, setSysDefaults] = useState<ThinkingEffortMapping | null>(null);
   const [formatOpen, setFormatOpen] = useState(false);
   const profile = provider ? profiles[provider] : null;
@@ -168,6 +178,35 @@ export function EffortStrategyFieldset({ mode, provider, customRules, profiles, 
     <fieldset style="margin-top: 16px;">
       <legend>Thinking Effort 策略</legend>
 
+      <div style="display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px;">
+        <div>
+          <Toggle
+            checked={mappingEnabled}
+            onChange={onMappingEnabledChange}
+            label="effort 映射开启"
+          />
+          <div class="text-xs text-muted" style="margin-top: 4px;">
+            关闭后该模型任何路径都不做 effort 值映射。
+          </div>
+        </div>
+        <div>
+          <Toggle
+            checked={passthroughNoMap}
+            onChange={onPassthroughNoMapChange}
+            label="透传模式不映射 effort"
+          />
+          <div class="text-xs text-muted" style="margin-top: 4px;">
+            开启后同协议透传保持客户端原始 effort；默认关闭（透传也映射）。
+          </div>
+        </div>
+      </div>
+
+      {!mappingEnabled ? (
+        <div class="text-xs text-muted" style="padding: 12px; border: 1px dashed var(--border); border-radius: 6px; text-align: center;">
+          effort 映射已关闭，策略预设不生效。
+        </div>
+      ) : (
+        <>
       {/* 未指定厂商提示 */}
       {!profile && (
         <div class="model-format-info model-format-info-warn mb-12">
@@ -324,6 +363,8 @@ export function EffortStrategyFieldset({ mode, provider, customRules, profiles, 
             </div>
           )}
         </div>
+      )}
+        </>
       )}
     </fieldset>
   );

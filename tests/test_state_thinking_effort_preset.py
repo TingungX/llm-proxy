@@ -81,3 +81,25 @@ def test_model_override_beats_provider_default():
     assert mapping["default_preset"] == "aggressive"
     assert len(mapping["presets"]) == 1
     assert mapping["presets"][0]["rules"]["*"] == "xhigh"
+
+
+def test_should_apply_effort_mapping_defaults():
+    state = State(_base_config())
+    assert state.should_apply_effort_mapping("model-a") is True
+    assert state.should_apply_effort_mapping("model-a", is_passthrough=True) is True
+
+
+def test_should_apply_effort_mapping_disabled():
+    cfg = _base_config()
+    cfg["models"]["model-a"]["thinking_effort_mapping_enabled"] = False
+    state = State(cfg)
+    assert state.should_apply_effort_mapping("model-a") is False
+    assert state.should_apply_effort_mapping("model-a", is_passthrough=True) is False
+
+
+def test_passthrough_no_map_only_affects_passthrough():
+    cfg = _base_config()
+    cfg["models"]["model-a"]["thinking_effort_passthrough_no_map"] = True
+    state = State(cfg)
+    assert state.should_apply_effort_mapping("model-a") is True
+    assert state.should_apply_effort_mapping("model-a", is_passthrough=True) is False

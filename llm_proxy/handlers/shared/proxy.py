@@ -104,17 +104,23 @@ def _apply_provider_anthropic_thinking(
         apply_thinking_to_anthropic_body(body, effort, profile)
 
 
-def _map_chat_reasoning_effort(body: dict, model_id: str) -> str | None:
+def _map_chat_reasoning_effort(
+    body: dict, model_id: str, *, is_passthrough: bool = False
+) -> str | None:
     """从 Chat 请求体提取并映射 reasoning_effort（按模型 preset）。"""
     effort = body.get("reasoning_effort")
     if effort is None:
         return None
-    return apply_effort_mapping(effort, get_state().get_model_effort_mapping(model_id))
+    return apply_effort_mapping(effort, _effort_mapping_for(model_id, is_passthrough=is_passthrough))
 
 
-def _resolve_reasoning_effort_for_model(body: dict, model_id: str) -> str | None:
+def _resolve_reasoning_effort_for_model(
+    body: dict, model_id: str, *, is_passthrough: bool = False
+) -> str | None:
     """从 Anthropic 请求体提取并映射 reasoning_effort（按模型 preset）。"""
-    return resolve_reasoning_effort(body, get_state().get_model_effort_mapping(model_id))
+    return resolve_reasoning_effort(
+        body, _effort_mapping_for(model_id, is_passthrough=is_passthrough)
+    )
 
 
 def _needs_reasoning_split(model_id: str) -> bool:
@@ -125,8 +131,89 @@ def _needs_reasoning_split(model_id: str) -> bool:
 
 def _estimate_tokens(body: dict) -> dict:
     messages = body.get("messages", [])
-    total_chars = sum(len(str(m.get("content", ""))) for m in messages)
-    return {"input_tokens": max(1, total_chars // 4)}
+    if messages:
+        total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+        return {"input_tokens": max(1, total_chars // 4)}
+    try:
+        return {"input_tokens": max(1, len(json.dumps(body, ensure_ascii=False)) // 4)}
+    except (TypeError, ValueError):
+        return {"input_tokens": 1}
+
+
+_IDENTITY_EFFORT_MAPPING = {
+    "presets": [{"name": "_identity", "type": "any_to_any", "rules": {}}],
+    "default_preset": "_identity",
+}
+
+
+def _effort_mapping_for(model_id: str, *, is_passthrough: bool = False) -> dict | None:
+    """按模型开关决定是否返回 effort mapping（关闭时返回 identity）。"""
+    state = get_state()
+    if not state.should_apply_effort_mapping(model_id, is_passthrough=is_passthrough):
+        return _IDENTITY_EFFORT_MAPPING
+    return state.get_model_effort_mapping(model_id)
+
+
+def _apply_responses_passthrough_effort(body: dict, model_id: str) -> None:
+    """同协议 Responses 透传：按模型 preset 重写 reasoning.effort。"""
+    reasoning = body.get("reasoning")
+    if not isinstance(reasoning, dict):
+        return
+    effort = reasoning.get("effort")
+    if not effort or not isinstance(effort, str):
+        return
+    mapped = apply_effort_mapping(effort, get_state().get_model_effort_mapping(model_id))
+    if mapped is not None:
+        body["reasoning"] = {**reasoning, "effort": mapped}
+
+
+def _extract_responses_usage(data: dict) -> tuple[int, int] | None:
+    """从 Responses SSE/JSON 事件提取 usage。
+
+    兼容：
+    - 顶层 usage（部分事件 / 测试 fixture）
+    - response.completed 内嵌的 response.usage（OpenAI / DeepSeek 规范）
+    """
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        resp = data.get("response")
+        if isinstance(resp, dict):
+            usage = resp.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    return int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0)
+
+
+def _ingest_responses_sse_usage(buf: bytearray, usage: dict) -> None:
+    """从累积的 SSE 字节缓冲中切帧并更新 usage。"""
+    while True:
+        sep = buf.find(b"\n\n")
+        if sep < 0:
+            break
+        frame = bytes(buf[:sep])
+        del buf[: sep + 2]
+        if b'"usage"' not in frame:
+            continue
+        try:
+            text = frame.decode("utf-8", errors="replace")
+        except Exception:
+            continue
+        for line in text.split("\n"):
+            if not line.startswith("data: ") or line.endswith("[DONE]"):
+                continue
+            payload = line[6:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                data = json.loads(payload)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            extracted = _extract_responses_usage(data)
+            if extracted is None:
+                continue
+            usage["input_tokens"], usage["output_tokens"] = extracted
 
 
 def _client_for(model_id: str | None) -> "httpx.AsyncClient":
@@ -293,9 +380,10 @@ class ProxyStep(HandlerStep):
                 out_body["messages"] = await replace_images_in_anthropic_messages(out_body["messages"])
 
         out_body["model"] = actual_model
-        # 按厂商 profile 编码 Anthropic 格式 thinking/reasoning
-        effort = _resolve_reasoning_effort_for_model(out_body, model_id)
-        _apply_provider_anthropic_thinking(out_body, effort, model_id)
+        # 同协议透传：按模型开关决定是否映射 + 厂商编码 thinking
+        if get_state().should_apply_effort_mapping(model_id, is_passthrough=True):
+            effort = _resolve_reasoning_effort_for_model(out_body, model_id, is_passthrough=True)
+            _apply_provider_anthropic_thinking(out_body, effort, model_id)
         stream = out_body.get("stream", False)
         model_paths = get_state().paths_map.get(model_id.lower(), {})
         messages_path = resolve_path(model_paths, "anthropic/messages")
@@ -463,7 +551,7 @@ class ProxyStep(HandlerStep):
         )
 
         # 1. 转换请求
-        model_effort_mapping = get_state().get_model_effort_mapping(model_id)
+        model_effort_mapping = _effort_mapping_for(model_id)
         chat_body = anthropic_to_chat(body, model_effort_mapping)
         chat_body["model"] = actual_model
         # 按厂商 profile 编码 thinking/reasoning（含 MiniMax reasoning_split）
@@ -698,6 +786,8 @@ class ProxyStep(HandlerStep):
         """Responses 同协议透传"""
         body = dict(ctx.body)
         body["model"] = actual_model
+        if get_state().should_apply_effort_mapping(model_id, is_passthrough=True):
+            _apply_responses_passthrough_effort(body, model_id)
         stream = body.get("stream", False)
         model_paths = get_state().paths_map.get(model_id.lower(), {})
         resp_path = resolve_path(model_paths, "openai/responses")
@@ -765,7 +855,10 @@ class ProxyStep(HandlerStep):
         rctx = record_ctx or {}
         usage = {"input_tokens": 0, "output_tokens": 0}
         had_error = False
+        error_type: str | None = None
+        completed_ok = False
         display_model = response_model or model
+        sse_buf = bytearray()
 
         try:
             for attempt in range(_RETRY_MAX + 1):
@@ -774,6 +867,8 @@ class ProxyStep(HandlerStep):
                     async with client.stream("POST", target_url, json=body, headers=headers, timeout=120.0) as resp:
                         logger.debug(f"Direct stream response status: {resp.status_code}")
                         if resp.status_code >= 400:
+                            had_error = True
+                            error_type = f"upstream_{resp.status_code}"
                             error_body = await resp.aread()
                             error_msg = error_body.decode()
                             try:
@@ -794,19 +889,9 @@ class ProxyStep(HandlerStep):
                             if response_model and b'"model"' in chunk:
                                 chunk = _replace_sse_model(chunk, response_model)
                             yield chunk
-                            if b'"usage"' in chunk:
-                                try:
-                                    text = chunk.decode("utf-8", errors="replace")
-                                    for line in text.split("\n"):
-                                        if not line.startswith("data: ") or line.endswith("[DONE]"):
-                                            continue
-                                        data = json.loads(line[6:])
-                                        if "usage" in data:
-                                            u = data["usage"]
-                                            usage["input_tokens"] = u.get("input_tokens", 0)
-                                            usage["output_tokens"] = u.get("output_tokens", 0)
-                                except (json.JSONDecodeError, ValueError):
-                                    pass
+                            sse_buf.extend(chunk)
+                            _ingest_responses_sse_usage(sse_buf, usage)
+                        completed_ok = True
                         return
 
                 except _RETRYABLE_CONNECT_ERRORS as e:
@@ -816,6 +901,7 @@ class ProxyStep(HandlerStep):
                         await asyncio.sleep(wait)
                         continue
                     had_error = True
+                    error_type = "connect_error"
                     logger.error(f"Direct stream connect error after {_RETRY_MAX + 1} attempts: {e}", exc_info=True)
                     yield make_sse_event(
                         {"error": {"code": "proxy_error", "message": str(e) or type(e).__name__}},
@@ -826,6 +912,7 @@ class ProxyStep(HandlerStep):
                     return
                 except Exception as e:
                     had_error = True
+                    error_type = "proxy_error"
                     logger.error(f"Direct stream error: {e}", exc_info=True)
                     yield make_sse_event(
                         {"error": {"code": "proxy_error", "message": str(e) or type(e).__name__}},
@@ -835,13 +922,25 @@ class ProxyStep(HandlerStep):
                     yield b"data: [DONE]\n\n"
                     return
         finally:
+            if not completed_ok and not had_error:
+                had_error = True
+                error_type = error_type or "incomplete"
             status = "error" if had_error else "success"
-            db.record_usage(endpoint_id, model_id,
-                            usage["input_tokens"] or 1,
-                            usage["output_tokens"] or 0, status,
-                            request_id=rctx.get("request_id", ""),
-                            client_ip=rctx.get("client_ip", ""),
-                            user_agent=rctx.get("user_agent", ""))
+            in_tok = usage["input_tokens"]
+            out_tok = usage["output_tokens"]
+            if not had_error and in_tok == 0 and out_tok == 0:
+                in_tok = _estimate_tokens(body).get("input_tokens", 0)
+            try:
+                db.record_usage(
+                    endpoint_id, model_id,
+                    in_tok, out_tok, status,
+                    request_id=rctx.get("request_id", ""),
+                    client_ip=rctx.get("client_ip", ""),
+                    user_agent=rctx.get("user_agent", ""),
+                    error_type=error_type if had_error else None,
+                )
+            except Exception as e:
+                logger.debug(f"db.record_usage failed: {e}")
 
     async def _proxy_to_chat(
         self, ctx: PipelineContext, api_base: str, upstream_api_key: str,
@@ -996,10 +1095,11 @@ class ProxyStep(HandlerStep):
         out_body["model"] = actual_model
         if _needs_reasoning_split(model_id):
             out_body["reasoning_split"] = True
-        # 按厂商 profile 编码 thinking/reasoning
-        _apply_provider_chat_thinking(
-            out_body, _map_chat_reasoning_effort(out_body, model_id), model_id
-        )
+        # 同协议透传：按模型开关决定是否映射 + 厂商编码 thinking
+        if get_state().should_apply_effort_mapping(model_id, is_passthrough=True):
+            _apply_provider_chat_thinking(
+                out_body, _map_chat_reasoning_effort(out_body, model_id, is_passthrough=True), model_id
+            )
         stream = out_body.get("stream", False)
         model_paths = get_state().paths_map.get(model_id.lower(), {})
         chat_path = resolve_path(model_paths, "openai/chat-completions")

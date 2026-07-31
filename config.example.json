@@ -23,6 +23,10 @@
       "upstream_model": "deepseek-v4-flash",
       "context_window": 1000000,
       "display_name": "DeepSeek V4 Flash",
+      "provider": "deepseek",
+      "thinking_effort_mode": "provider",
+      "thinking_effort_mapping_enabled": true,
+      "thinking_effort_passthrough_no_map": false,
       "upstream_paths": {
         "openai/chat-completions": "/v1/chat/completions"
       },

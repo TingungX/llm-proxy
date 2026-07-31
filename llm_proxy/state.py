@@ -255,6 +255,25 @@ class State:
                 return {"presets": [p], "default_preset": preset_name}
         return None
 
+    def _model_cfg(self, model_id: str) -> dict:
+        cfg = self.config.get("models", {}).get(model_id, {})
+        return cfg if isinstance(cfg, dict) else {}
+
+    def should_apply_effort_mapping(
+        self, model_id: str, *, is_passthrough: bool = False
+    ) -> bool:
+        """是否对该模型应用 effort 值映射。
+
+        - thinking_effort_mapping_enabled=false → 任何路径都不映射（默认 true）
+        - thinking_effort_passthrough_no_map=true → 同协议透传不映射（默认 false）
+        """
+        model_cfg = self._model_cfg(model_id)
+        if model_cfg.get("thinking_effort_mapping_enabled", True) is False:
+            return False
+        if is_passthrough and model_cfg.get("thinking_effort_passthrough_no_map", False):
+            return False
+        return True
+
     def get_model_effort_mapping(self, model_id: str) -> dict:
         """返回模型实际生效的 thinking_effort_mapping。
 
@@ -268,8 +287,8 @@ class State:
         if not mapping:
             return mapping
 
-        model_cfg = self.config.get("models", {}).get(model_id, {})
-        if not isinstance(model_cfg, dict):
+        model_cfg = self._model_cfg(model_id)
+        if not model_cfg:
             return mapping
 
         mode = model_cfg.get("thinking_effort_mode")

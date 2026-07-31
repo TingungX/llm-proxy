@@ -17,6 +17,10 @@ export interface ModelConfig {
   provider?: string;
   thinking_effort_mode?: 'default' | 'provider' | 'custom';
   thinking_effort_preset?: string | EffortPreset;
+  /** effort 映射总开关，默认 true */
+  thinking_effort_mapping_enabled?: boolean;
+  /** 同协议透传不映射 effort，默认 false */
+  thinking_effort_passthrough_no_map?: boolean;
 }
 
 export interface ProviderProfileInfo {
