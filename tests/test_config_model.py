@@ -19,10 +19,11 @@ def client(monkeypatch, tmp_path):
     }
     config_path.write_text(json.dumps(config), encoding="utf-8")
 
-    from llm_proxy import config_loader, state
+    from llm_proxy import config_loader
+    from llm_proxy.state import init_state
 
     monkeypatch.setattr(config_loader, "CONFIG_PATH", config_path)
-    state.init_state(config_loader.load_config())
+    init_state(config_loader.load_config())
 
     from llm_proxy.main import app
 
@@ -55,3 +56,13 @@ def test_update_model_allows_empty_api_key_for_new_model(client):
 
     saved = json.loads(config_path.read_text(encoding="utf-8"))
     assert saved["models"]["new-model"]["api_key"] == ""
+
+
+def test_create_model_without_api_key_field_fails_reload(client):
+    """UI 新建模型若省略 api_key 字段，reload 会因 build_model_map KeyError 失败。"""
+    tc, config_path = client
+    r = tc.put("/api/models/new-model", json={"api_base": "https://example.com"})
+    assert r.status_code == 500
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["models"]["new-model"]["api_base"] == "https://example.com"
+    assert "api_key" not in saved["models"]["new-model"]

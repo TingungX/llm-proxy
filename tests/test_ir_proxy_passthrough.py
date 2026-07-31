@@ -131,3 +131,52 @@ def test_proxy_responses_direct_maps_model_on_request():
     assert captured["json"]["model"] == "upstream-model-name"
     assert captured["json"]["input"] == "hello"
     assert ctx.response is not None
+
+
+@pytest.mark.asyncio
+async def test_responses_direct_stream_preserves_sse_framing():
+    """流式透传应 relay 原始字节（含 \\n\\n 分隔），不能用 aiter_lines 拼接。"""
+    from llm_proxy.handlers.shared.proxy import ProxyStep
+
+    raw_sse = (
+        b'event: response.created\n'
+        b'data: {"type":"response.created","model":"m"}\n'
+        b'\n'
+        b'event: response.completed\n'
+        b'data: {"type":"response.completed","usage":{"input_tokens":3,"output_tokens":7}}\n'
+        b'\n'
+    )
+
+    class FakeStreamResponse:
+        status_code = 200
+
+        async def aiter_bytes(self):
+            yield raw_sse
+
+        async def aread(self):
+            return b""
+
+    mock_stream_ctx = AsyncMock()
+    mock_stream_ctx.__aenter__ = AsyncMock(return_value=FakeStreamResponse())
+    mock_stream_ctx.__aexit__ = AsyncMock(return_value=False)
+
+    mock_client = MagicMock()
+    mock_client.stream = MagicMock(return_value=mock_stream_ctx)
+
+    chunks: list[bytes] = []
+    with patch("llm_proxy.handlers.shared.proxy.get_client", return_value=mock_client), \
+         patch("llm_proxy.handlers.shared.proxy.db") as mock_db:
+        async for chunk in ProxyStep()._responses_direct_stream(
+            "https://api.example.com/v1/responses",
+            {"Authorization": "Bearer k"},
+            {"model": "m", "input": "hi", "stream": True},
+            "m", "ep-test", "my-model",
+        ):
+            chunks.append(chunk)
+
+    relayed = b"".join(chunks)
+    assert b"data: {\"type\":\"response.created\"" in relayed
+    assert b"\n\nevent: response.completed" in relayed
+    mock_db.record_usage.assert_called_once()
+    assert mock_db.record_usage.call_args[0][3] == 7  # output_tokens
+

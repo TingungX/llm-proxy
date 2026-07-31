@@ -157,6 +157,9 @@ export function ModelModal() {
     };
     if (v.apiKey) {
       data.api_key = v.apiKey;
+    } else if (!editing) {
+      // 新建模型：必须显式发送空串，否则后端 build_model_map 缺 api_key 会 500
+      data.api_key = '';
     }
 
     // Thinking effort：按模式写入（type 字段已废弃，统一用 'any_to_any'）

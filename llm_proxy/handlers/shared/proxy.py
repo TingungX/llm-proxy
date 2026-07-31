@@ -790,22 +790,23 @@ class ProxyStep(HandlerStep):
                             yield b"data: [DONE]\n\n"
                             return
 
-                        async for line in resp.aiter_lines():
-                            if line:
-                                chunk = line.encode() if isinstance(line, str) else line
-                                if response_model and b'"model"' in chunk:
-                                    chunk = _replace_sse_model(chunk, response_model)
-                                yield chunk
-                                if isinstance(line, str) and line.startswith("data: ") and not line.endswith("[DONE]"):
-
-                                    try:
+                        async for chunk in resp.aiter_bytes():
+                            if response_model and b'"model"' in chunk:
+                                chunk = _replace_sse_model(chunk, response_model)
+                            yield chunk
+                            if b'"usage"' in chunk:
+                                try:
+                                    text = chunk.decode("utf-8", errors="replace")
+                                    for line in text.split("\n"):
+                                        if not line.startswith("data: ") or line.endswith("[DONE]"):
+                                            continue
                                         data = json.loads(line[6:])
                                         if "usage" in data:
                                             u = data["usage"]
                                             usage["input_tokens"] = u.get("input_tokens", 0)
                                             usage["output_tokens"] = u.get("output_tokens", 0)
-                                    except json.JSONDecodeError:
-                                        pass
+                                except (json.JSONDecodeError, ValueError):
+                                    pass
                         return
 
                 except _RETRYABLE_CONNECT_ERRORS as e:
